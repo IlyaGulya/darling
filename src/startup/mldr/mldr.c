@@ -106,6 +106,8 @@ void* __mldr_main_stack_top = NULL;
 static int kernel_major = -1;
 static int kernel_minor = -1;
 
+void __mldr_postfork_child(void);
+
 int main(int argc, char** argv, char** envp)
 {
 	void** sp;
@@ -562,6 +564,10 @@ static socket_bitmap_t socket_bitmap = {
 	.bit_length = 0,
 	.highest = -1,
 };
+
+void __mldr_postfork_child(void) {
+	socket_bitmap.mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+}
 
 static int socket_bitmap_get(socket_bitmap_t* bitmap) {
 	int fd = -1;

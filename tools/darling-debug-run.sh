@@ -8,6 +8,11 @@ usage() {
 
 prefix="${DARLING_PREFIX:-$HOME/work/darling-prefix}"
 log_root="${DARLING_DEBUG_LOG_ROOT:-$HOME/work/darling-debug}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cleanup_script="$script_dir/darling-debug-cleanup.sh"
+if [[ ! -x "$cleanup_script" ]]; then
+	cleanup_script="$HOME/work/darling-debug-cleanup.sh"
+fi
 timeout_seconds=120
 use_xtrace=0
 
@@ -91,7 +96,7 @@ if ((rc == 124 || rc == 137)); then
 fi
 set -e
 
-DARLING_PREFIX="$prefix" "$HOME/work/darling-debug-cleanup.sh" >"$bundle/cleanup.out" 2>"$bundle/cleanup.err" || true
+DARLING_PREFIX="$prefix" "$cleanup_script" >"$bundle/cleanup.out" 2>"$bundle/cleanup.err" || true
 
 cp "$darwin_host_bundle"/xtrace.log* "$bundle"/ 2>/dev/null || true
 

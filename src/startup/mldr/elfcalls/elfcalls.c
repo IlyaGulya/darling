@@ -62,6 +62,7 @@ static const void* __dserver_socket_address(void) {
 	return &__dserver_socket_address_data;
 };
 
+extern void __mldr_postfork_child(void);
 extern void __mldr_close_rpc_socket(int socket);
 
 extern int __mldr_create_process_lifetime_pipe(int* fds);
@@ -107,6 +108,7 @@ void elfcalls_make(struct elf_calls* calls)
 	calls->realloc = realloc;
 
 	calls->sysconf = sysconf;
+	calls->postfork_child = __mldr_postfork_child;
 
 	*((void**)&calls->sem_open) = sem_open;
 	*((void**)&calls->sem_wait) = sem_wait;
