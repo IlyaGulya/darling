@@ -13,3 +13,9 @@ install(FILES man/launchd.8 DESTINATION libexec/darling/usr/share/man/man8)
 
 install(DIRECTORY DESTINATION libexec/darling/Library/LaunchDaemons)
 install(DIRECTORY DESTINATION libexec/darling/Library/LaunchAgents)
+install(DIRECTORY DESTINATION libexec/darling/System/Library/LaunchDaemons
+	DIRECTORY_PERMISSIONS
+		OWNER_READ OWNER_WRITE OWNER_EXECUTE
+		GROUP_READ GROUP_EXECUTE
+		WORLD_READ WORLD_EXECUTE
+)

@@ -25,6 +25,8 @@ function(add_darling_static_library name)
 	endif ()
 
 	if (STATIC_LIB_FAT)
+		add_custom_command(TARGET ${name} PRE_LINK
+			COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE:${name}>)
 		make_fat(${name})
 	endif (STATIC_LIB_FAT)
 

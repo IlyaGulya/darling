@@ -236,7 +236,7 @@ InstallSymlink(/Volumes/SystemRoot/usr/share/zoneinfo ${CMAKE_INSTALL_PREFIX}/li
 install(DIRECTORY DESTINATION libexec/darling/Library/Preferences)
 
 if(NOT DEBIAN_PACKAGING)
-	install(CODE "execute_process(COMMAND bash ${DARLING_TOP_DIRECTORY}/tools/shutdown-user.sh)")
+	install(CODE "execute_process(COMMAND bash ${DARLING_TOP_DIRECTORY}/tools/shutdown-user.sh ${CMAKE_INSTALL_PREFIX}/bin/darling)")
 endif(NOT DEBIAN_PACKAGING)
 
 add_custom_target(uninstall
