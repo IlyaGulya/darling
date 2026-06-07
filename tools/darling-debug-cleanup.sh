@@ -2,6 +2,7 @@
 set -euo pipefail
 
 prefix="${DARLING_PREFIX:-$HOME/work/darling-prefix}"
+dprefix="${DARLING_DPREFIX:-${DPREFIX:-$HOME/.darling}}"
 
 kill_matching() {
 	local pattern="$1"
@@ -10,7 +11,7 @@ kill_matching() {
 
 	while read -r pid; do
 		[[ -n "$pid" ]] || continue
-		kill "-$signal" "$pid" 2>/dev/null || true
+		kill "-$signal" "$pid" 2>/dev/null || sudo kill "-$signal" "$pid" 2>/dev/null || true
 	done < <(pgrep -f "$pattern" 2>/dev/null || true)
 }
 
@@ -23,7 +24,7 @@ kill_tree() {
 		kill_tree "$child"
 	done
 
-	kill -TERM "$pid" 2>/dev/null || true
+	kill -TERM "$pid" 2>/dev/null || sudo kill -TERM "$pid" 2>/dev/null || true
 }
 
 kill_tree_hard() {
@@ -35,7 +36,7 @@ kill_tree_hard() {
 		kill_tree_hard "$child"
 	done
 
-	kill -KILL "$pid" 2>/dev/null || true
+	kill -KILL "$pid" 2>/dev/null || sudo kill -KILL "$pid" 2>/dev/null || true
 }
 
 for pid in "$@"; do
@@ -52,8 +53,8 @@ for pid in "$@"; do
 	fi
 done
 
-"$prefix/bin/darling" shutdown >/dev/null 2>&1 || true
-sudo umount -R "$HOME/.darling/proc" 2>/dev/null || sudo umount -l "$HOME/.darling/proc" 2>/dev/null || true
+timeout -k 3s 10s env DPREFIX="$dprefix" "$prefix/bin/darling" shutdown >/dev/null 2>&1 || true
+timeout -k 3s 10s sudo umount -R "$dprefix/proc" 2>/dev/null || timeout -k 3s 10s sudo umount -l "$dprefix/proc" 2>/dev/null || true
 
 kill_matching "^$prefix/bin/darling shell " TERM
 kill_matching "^/Library/Developer/CommandLineTools/usr/bin/" TERM
@@ -61,7 +62,7 @@ kill_matching "^/usr/libexec/shellspawn$" TERM
 kill_matching "^/usr/sbin/memberd " TERM
 kill_matching "^/usr/sbin/securityd " TERM
 kill_matching "^/sbin/launchd$" TERM
-kill_matching "^darlingserver $HOME/.darling" TERM
+kill_matching "^darlingserver $dprefix" TERM
 
 sleep 1
 
@@ -71,4 +72,4 @@ kill_matching "^/usr/libexec/shellspawn$" KILL
 kill_matching "^/usr/sbin/memberd " KILL
 kill_matching "^/usr/sbin/securityd " KILL
 kill_matching "^/sbin/launchd$" KILL
-kill_matching "^darlingserver $HOME/.darling" KILL
+kill_matching "^darlingserver $dprefix" KILL

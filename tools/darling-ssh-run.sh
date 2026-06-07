@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: $0 [--host HOST] [--workdir DIR] [--darling NAME] [--timeout SECONDS] [--xtrace] [--keep] [script-file]" >&2
+	echo "usage: $0 [--host HOST] [--workdir DIR] [--darling NAME] [--dprefix DIR] [--timeout SECONDS] [--xtrace] [--keep] [script-file]" >&2
 	echo "       script may also be provided on stdin" >&2
 	exit 2
 }
@@ -10,6 +10,7 @@ usage() {
 host="nhs"
 workdir="\$HOME/work/darling"
 darling_name=""
+dprefix=""
 timeout_seconds=120
 use_xtrace=0
 keep_remote=0
@@ -28,6 +29,10 @@ while (($#)); do
 		--darling)
 			shift || usage
 			darling_name="$1"
+			;;
+		--dprefix)
+			shift || usage
+			dprefix="$1"
 			;;
 		--timeout)
 			shift || usage
@@ -78,7 +83,8 @@ if [[ -n "$script_file" ]]; then
 	fi
 	local_script="$script_file"
 else
-	local_script="$(mktemp "${TMPDIR:-/tmp}/darling-ssh-run.XXXXXX.sh")"
+	tmpdir="${TMPDIR:-/tmp}"
+	local_script="$(mktemp "${tmpdir%/}/darling-ssh-run.XXXXXX")"
 	cat >"$local_script"
 fi
 
@@ -95,7 +101,11 @@ if [[ -n "$darling_name" ]]; then
 	if ((use_xtrace)); then
 		xtrace_arg=(--xtrace)
 	fi
-	ssh "$host" "set -euo pipefail; chmod +x '$remote_script'; cd $workdir; ./tools/darling-debug-run.sh --timeout '$timeout_seconds' ${xtrace_arg[*]} '$darling_name' -- '/bin/bash /Volumes/SystemRoot$remote_script'; rc=\$?; $remote_cleanup; exit \$rc"
+	dprefix_arg=()
+	if [[ -n "$dprefix" ]]; then
+		dprefix_arg=(--dprefix "$dprefix")
+	fi
+	ssh -n "$host" "set -euo pipefail; chmod +x '$remote_script'; cd $workdir; ./tools/darling-debug-run.sh --timeout '$timeout_seconds' ${dprefix_arg[*]} ${xtrace_arg[*]} '$darling_name' -- '/bin/bash /Volumes/SystemRoot$remote_script'; rc=\$?; $remote_cleanup; exit \$rc"
 else
-	ssh "$host" "set -euo pipefail; chmod +x '$remote_script'; '$remote_script'; rc=\$?; $remote_cleanup; exit \$rc"
+	ssh -n "$host" "set -euo pipefail; chmod +x '$remote_script'; '$remote_script'; rc=\$?; $remote_cleanup; exit \$rc"
 fi
