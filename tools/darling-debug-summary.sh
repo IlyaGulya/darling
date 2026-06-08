@@ -114,7 +114,8 @@ show_tail "runner" "$bundle/runner-state.log"
 show_tail "stderr" "$bundle/stderr.log"
 show_tail "stdout" "$bundle/stdout.log"
 show_ps_focus "processes at timeout" "$bundle/ps.timeout.txt"
-show_ps_focus "last live processes" "$bundle/ps.live.txt"
+show_ps_focus "last sampled live processes" "$bundle/ps.live.txt"
+show_ps_focus "processes after cleanup" "$bundle/ps.after.txt"
 show_tail "xtrace" "$bundle/xtrace.log"
 for xtrace_file in "$bundle"/xtrace.log.*; do
 	[[ -e "$xtrace_file" ]] || continue
