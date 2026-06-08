@@ -11,6 +11,8 @@ usage() {
 	echo "  --pid PID           capture this PID directly instead of polling" >&2
 	echo "  --timeout SECONDS   polling timeout (default: 60)" >&2
 	echo "  --interval SECONDS  polling interval (default: 1)" >&2
+	echo "  --strace-timeout S  strace attach timeout (default: 8; 0 disables)" >&2
+	echo "  --gdb-timeout S     gdb attach timeout (default: 25; 0 disables)" >&2
 	exit 2
 }
 
@@ -22,6 +24,8 @@ wchan=""
 pid=""
 timeout_seconds=60
 interval_seconds=1
+strace_timeout=8
+gdb_timeout=25
 
 while [ "$#" -gt 0 ]; do
 	case "$1" in
@@ -56,6 +60,14 @@ while [ "$#" -gt 0 ]; do
 		--interval)
 			shift || usage
 			interval_seconds="$1"
+			;;
+		--strace-timeout)
+			shift || usage
+			strace_timeout="$1"
+			;;
+		--gdb-timeout)
+			shift || usage
+			gdb_timeout="$1"
 			;;
 		-h|--help)
 			usage
@@ -116,6 +128,8 @@ fi
 	echo "wchan=$wchan"
 	echo "timeout_seconds=$timeout_seconds"
 	echo "interval_seconds=$interval_seconds"
+	echo "strace_timeout=$strace_timeout"
+	echo "gdb_timeout=$gdb_timeout"
 	echo "pid=$pid"
 } >"$bundle/capture.env"
 
@@ -139,24 +153,28 @@ for proc_file in status cmdline wchan syscall stack maps; do
 	fi
 done
 
-if command -v strace >/dev/null 2>&1; then
+if [ "$strace_timeout" = "0" ]; then
+	echo "strace disabled" >"$bundle/strace.txt"
+elif command -v strace >/dev/null 2>&1; then
 	if [ "${#sudo_cmd[@]}" -gt 0 ]; then
-		run_optional "$bundle/strace.txt" timeout 8s "${sudo_cmd[@]}" strace -f -tt -T -p "$pid"
+		run_optional "$bundle/strace.txt" timeout "${strace_timeout}s" "${sudo_cmd[@]}" strace -f -tt -T -p "$pid"
 	else
-		run_optional "$bundle/strace.txt" timeout 8s strace -f -tt -T -p "$pid"
+		run_optional "$bundle/strace.txt" timeout "${strace_timeout}s" strace -f -tt -T -p "$pid"
 	fi
 else
 	echo "strace not found" >"$bundle/strace.txt"
 fi
 
-if command -v gdb >/dev/null 2>&1; then
+if [ "$gdb_timeout" = "0" ]; then
+	echo "gdb disabled" >"$bundle/gdb.txt"
+elif command -v gdb >/dev/null 2>&1; then
 	if [ "${#sudo_cmd[@]}" -gt 0 ]; then
-		run_optional "$bundle/gdb.txt" timeout 25s "${sudo_cmd[@]}" gdb -q -p "$pid" -batch \
+		run_optional "$bundle/gdb.txt" timeout "${gdb_timeout}s" "${sudo_cmd[@]}" gdb -q -p "$pid" -batch \
 			-ex "set pagination off" \
 			-ex "info threads" \
 			-ex "thread apply all bt"
 	else
-		run_optional "$bundle/gdb.txt" timeout 25s gdb -q -p "$pid" -batch \
+		run_optional "$bundle/gdb.txt" timeout "${gdb_timeout}s" gdb -q -p "$pid" -batch \
 			-ex "set pagination off" \
 			-ex "info threads" \
 			-ex "thread apply all bt"

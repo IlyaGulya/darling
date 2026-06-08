@@ -14,9 +14,14 @@ cleanup_script="$script_dir/darling-debug-cleanup.sh"
 if [[ ! -x "$cleanup_script" ]]; then
 	cleanup_script="$HOME/work/darling-debug-cleanup.sh"
 fi
+capture_script="$script_dir/darling-capture-stuck-process.sh"
+if [[ ! -x "$capture_script" ]]; then
+	capture_script="$HOME/work/darling-capture-stuck-process.sh"
+fi
 timeout_seconds=120
 use_xtrace=0
 name_arg=""
+capture_on_timeout=1
 lock_fd=9
 lock_file=""
 lock_dir=""
@@ -38,6 +43,67 @@ kill_children() {
 		kill_children "$child"
 		send_signal TERM "$child"
 	done < <(pgrep -P "$parent" 2>/dev/null || true)
+}
+
+capture_timeout_target() {
+	local capture_pid
+
+	ps -eLo pid,ppid,pgid,sid,stat,etime,wchan:32,comm,args >"$bundle/ps.timeout.txt" 2>/dev/null || true
+	capture_pid="$(
+		awk '
+			$5 !~ /^Z/ && ($8 == "mldr" || $8 == "system_command.") && $0 ~ /(portable-ruby|\/ruby)/ && $0 !~ /\/bin\/bash/ {
+				print $1
+				exit
+			}
+		' "$bundle/ps.timeout.txt" 2>/dev/null
+	)"
+	if [[ -z "$capture_pid" ]]; then
+		capture_pid="$(
+			awk '
+			$5 !~ /^Z/ && ($8 == "mldr" || $8 == "system_command.") && $0 ~ /(ruby|brew|system_command|curl)/ {
+				print $1
+				exit
+			}
+		' "$bundle/ps.timeout.txt" 2>/dev/null
+	)"
+	if [[ -z "$capture_pid" ]]; then
+		capture_pid="$(
+			awk '
+				$5 !~ /^Z/ && $8 == "mldr" && $0 !~ /(launchd|opendirectoryd|memberd|securityd|shellspawn|iokitd)/ {
+					print $1
+					exit
+				}
+			' "$bundle/ps.timeout.txt" 2>/dev/null
+		)"
+	fi
+	fi
+	if [[ -z "$capture_pid" ]]; then
+		capture_pid="$(
+			awk -v pgid="$darling_pid" '
+				$3 == pgid && $5 !~ /^Z/ && $8 != "bash" && $8 != "darling" && $8 != "darlingserver" {
+					print $1
+					exit
+				}
+			' "$bundle/ps.timeout.txt" 2>/dev/null
+		)"
+	fi
+	if [[ -z "$capture_pid" ]]; then
+		echo "no timeout capture target found" >"$bundle/timeout-capture.txt"
+		return
+	fi
+
+	echo "$capture_pid" >"$bundle/timeout-capture-pid.txt"
+	if [[ -x "$capture_script" ]]; then
+		mkdir -p "$bundle/captures"
+		timeout -k 3s 20s "$capture_script" \
+			--output "$bundle/captures" \
+			--name "$safe_name-timeout" \
+			--pid "$capture_pid" \
+			--strace-timeout 2 \
+			--gdb-timeout 8 >"$bundle/timeout-capture.txt" 2>&1 || true
+	else
+		echo "capture script not found: $capture_script" >"$bundle/timeout-capture.txt"
+	fi
 }
 
 cleanup_lock() {
@@ -101,6 +167,10 @@ while (($#)); do
 			use_xtrace=1
 			shift
 			;;
+		--no-capture)
+			capture_on_timeout=0
+			shift
+			;;
 		--cleanup)
 			# Cleanup is always performed; keep this accepted for older invocations.
 			shift
@@ -155,6 +225,7 @@ fi
 	echo "darwin_bundle=$darwin_bundle"
 	echo "timeout_seconds=$timeout_seconds"
 	echo "xtrace=$use_xtrace"
+	echo "capture_on_timeout=$capture_on_timeout"
 	echo "command=$cmd"
 } >"$bundle/meta.txt"
 
@@ -190,6 +261,10 @@ echo "watchdog woke at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if ps -p "$darling_pid" >/dev/null 2>&1; then
 	echo "watchdog killing darling_pid=$darling_pid"
 	echo "timeout after ${timeout_seconds}s" >"$bundle/timeout.txt"
+	if ((capture_on_timeout)); then
+		echo "watchdog capturing timeout target"
+		capture_timeout_target
+	fi
 	send_signal TERM "-$darling_pid"
 	send_signal TERM "$darling_pid"
 	sleep 3
