@@ -27,29 +27,9 @@ kill_tree() {
 	kill -TERM "$pid" 2>/dev/null || sudo kill -TERM "$pid" 2>/dev/null || true
 }
 
-kill_tree_hard() {
-	local pid="$1"
-	local children child
-
-	children="$(pgrep -P "$pid" 2>/dev/null || true)"
-	for child in $children; do
-		kill_tree_hard "$child"
-	done
-
-	kill -KILL "$pid" 2>/dev/null || sudo kill -KILL "$pid" 2>/dev/null || true
-}
-
 for pid in "$@"; do
 	if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
 		kill_tree "$pid"
-	fi
-done
-
-sleep 2
-
-for pid in "$@"; do
-	if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-		kill_tree_hard "$pid"
 	fi
 done
 
@@ -63,13 +43,3 @@ kill_matching "^/usr/sbin/memberd " TERM
 kill_matching "^/usr/sbin/securityd " TERM
 kill_matching "^/sbin/launchd$" TERM
 kill_matching "^darlingserver $dprefix" TERM
-
-sleep 1
-
-kill_matching "^$prefix/bin/darling shell " KILL
-kill_matching "^/Library/Developer/CommandLineTools/usr/bin/" KILL
-kill_matching "^/usr/libexec/shellspawn$" KILL
-kill_matching "^/usr/sbin/memberd " KILL
-kill_matching "^/usr/sbin/securityd " KILL
-kill_matching "^/sbin/launchd$" KILL
-kill_matching "^darlingserver $dprefix" KILL

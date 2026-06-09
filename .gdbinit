@@ -28,10 +28,11 @@
 set follow-fork-mode child
 
 python sys.path.insert(0, './tools/')
+python import importlib
 python import gdb_maloader
 
 define mreload
-  python reload(gdb_maloader)
+  python importlib.reload(gdb_maloader)
 end
 
 define mbt

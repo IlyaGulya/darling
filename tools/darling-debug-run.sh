@@ -60,12 +60,13 @@ capture_timeout_target() {
 	if [[ -z "$capture_pid" ]]; then
 		capture_pid="$(
 			awk '
-			$5 !~ /^Z/ && ($8 == "mldr" || $8 == "system_command.") && $0 ~ /(ruby|brew|system_command|curl)/ {
-				print $1
-				exit
-			}
-		' "$bundle/ps.timeout.txt" 2>/dev/null
-	)"
+				$5 !~ /^Z/ && ($8 == "mldr" || $8 == "system_command.") && $0 ~ /(ruby|brew|system_command|curl)/ {
+					print $1
+					exit
+				}
+			' "$bundle/ps.timeout.txt" 2>/dev/null
+		)"
+	fi
 	if [[ -z "$capture_pid" ]]; then
 		capture_pid="$(
 			awk '
@@ -75,7 +76,6 @@ capture_timeout_target() {
 				}
 			' "$bundle/ps.timeout.txt" 2>/dev/null
 		)"
-	fi
 	fi
 	if [[ -z "$capture_pid" ]]; then
 		capture_pid="$(
@@ -267,9 +267,6 @@ if ps -p "$darling_pid" >/dev/null 2>&1; then
 	fi
 	send_signal TERM "-$darling_pid"
 	send_signal TERM "$darling_pid"
-	sleep 3
-	send_signal KILL "-$darling_pid"
-	send_signal KILL "$darling_pid"
 else
 	echo "watchdog saw darling_pid=$darling_pid already gone"
 fi) >>"$bundle/runner-state.log" 2>&1 &
@@ -295,8 +292,6 @@ if ((timed_out)); then
 	if ps -p "$darling_pid" >/dev/null 2>&1; then
 		echo "timeout after ${timeout_seconds}s" >"$bundle/timeout.txt"
 	fi
-	send_signal KILL "-$darling_pid"
-	send_signal KILL "$darling_pid"
 	wait "$darling_pid" 2>/dev/null || true
 	rc=124
 fi
