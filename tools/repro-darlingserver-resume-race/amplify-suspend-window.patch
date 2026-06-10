@@ -1,0 +1,20 @@
+diff --git a/duct-tape/src/thread.c b/duct-tape/src/thread.c
+--- a/duct-tape/src/thread.c
++++ b/duct-tape/src/thread.c
+@@ -16,6 +16,8 @@
+ 
+ #include <rtsig.h>
+ 
++extern int usleep(unsigned int usec);
++
+ #define LINUX_ENOSYS 38
+ #define LINUX_EFAULT 14
+ 
+@@ -529,6 +531,7 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
+ 	dtape_log_error("[PH] BLOCK dt=%p waiting=%d cont=%p state=%x", thread, (int)waiting, continuation, thread->xnu_thread.state);
+ 
+ 	if (waiting) {
++		usleep(20000);
+ 		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, NULL);
+ 	}
+ 
