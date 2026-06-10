@@ -1,5 +1,10 @@
 # DarlingServer resume-before-suspend reproducer
 
+For the preferred black-box regression reproducer, which runs one unchanged
+Mach-O client against unmodified server binaries, see [BLACKBOX.md](BLACKBOX.md).
+This document describes the white-box amplifier used to deterministically prove
+the exact resume-before-suspend interleaving.
+
 This harness deterministically widens the race between an XNU semaphore wake
 and `DarlingServer::Thread::suspend()`.
 
