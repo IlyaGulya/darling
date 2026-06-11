@@ -107,6 +107,7 @@ static int kernel_major = -1;
 static int kernel_minor = -1;
 
 void __mldr_postfork_child(void);
+void __mldr_detect_stack_cache_lock(void);
 
 int main(int argc, char** argv, char** envp)
 {
@@ -120,6 +121,10 @@ int main(int argc, char** argv, char** envp)
 	mldr_load_results.kernfd = -1;
 	mldr_load_results.argc = argc;
 	mldr_load_results.argv = argv;
+
+	// Locate glibc's stack-cache lock while still single-threaded, so the fork
+	// child can reset it and avoid an inherited-held-lock deadlock (dar-gwn.5).
+	__mldr_detect_stack_cache_lock();
 
 	while (envp[mldr_load_results.envc] != NULL) {
 		++mldr_load_results.envc;
@@ -565,8 +570,80 @@ static socket_bitmap_t socket_bitmap = {
 	.highest = -1,
 };
 
+// --- Native (glibc) loader stack-cache recovery across raw fork (dar-gwn.5) ---
+//
+// Darling forks via a raw Linux clone (sys_fork), which - unlike a full glibc
+// fork() - does NOT reset glibc's internal GL(_dl_stack_cache_lock). That lock is
+// taken by *every* pthread_create (to add the new thread to GL(_dl_stack_used)),
+// not just by the stack-cache lookup, so a caller-provided stack does not avoid
+// it. If any native thread held the lock at fork time, the child inherits it held
+// and every pthread_create - which __darling_thread_create relies on to back each
+// Darwin thread - deadlocks inside allocate_stack. glibc 2.34+ does not repair
+// this on any fork path (neither _Fork() nor full fork() reset the lock), so the
+// child must reset it itself before creating any thread.
+//
+// We locate the lock once at startup, without hardcoding a glibc-version offset:
+//  - _rtld_global is resolved via dlsym(). Referencing it with `extern` from this
+//    executable would emit an R_X86_64_COPY relocation that snapshots ld.so's live
+//    loader state into mldr's BSS and desyncs it (breaking all threading); dlsym
+//    binds to the real object instead.
+//  - the lock is found by the layout signature of the surrounding stack lists,
+//    which are in a known single-threaded state at startup.
+//
+// g_stack_cache_lock points at GL(_dl_stack_cache_lock); the adjacent cache-list
+// head and bookkeeping fields sit at fixed negative offsets (validated at detect).
+static volatile int* g_stack_cache_lock = NULL;
+static void** g_stack_cache_list = NULL; // &GL(_dl_stack_cache)
+
+void __mldr_detect_stack_cache_lock(void) {
+	if (g_stack_cache_lock)
+		return;
+
+	char* base = (char*) dlsym(RTLD_DEFAULT, "_rtld_global");
+	if (!base)
+		return;
+
+	// struct rtld_global layout (stable across glibc 2.x):
+	//   list_t    _dl_stack_used;          // +0   empty (self-referential) at startup
+	//   list_t    _dl_stack_user;          // +16  one element: the main thread
+	//   list_t    _dl_stack_cache;         // +32  empty (self-referential) at startup
+	//   size_t    _dl_stack_cache_actsize; // +48  0
+	//   uintptr_t _dl_in_flight_stack;     // +56  0
+	//   int       _dl_stack_cache_lock;    // +64  0 (unlocked)
+	for (size_t u = 256; u + 72 <= 16384; u += sizeof(void*)) {
+		void** used  = (void**)(base + u);
+		void** user  = (void**)(base + u + 16);
+		void** cache = (void**)(base + u + 32);
+
+		if ((char*)used[0]  != base + u      || (char*)used[1]  != base + u)      continue; // used: empty
+		if ((char*)cache[0] != base + u + 32 || (char*)cache[1] != base + u + 32) continue; // cache: empty
+		// user: exactly one element (next == prev, not the head itself)
+		if (user[0] == NULL || user[0] != user[1] || (char*)user[0] == base + u + 16) continue;
+		if (*(size_t*)(base + u + 48) != 0)    continue; // _dl_stack_cache_actsize
+		if (*(uintptr_t*)(base + u + 56) != 0) continue; // _dl_in_flight_stack
+		if (*(int*)(base + u + 64) != 0)       continue; // _dl_stack_cache_lock (unlocked)
+
+		g_stack_cache_list = (void**)(base + u + 32);
+		g_stack_cache_lock = (volatile int*)(base + u + 64);
+		return;
+	}
+}
+
 void __mldr_postfork_child(void) {
 	socket_bitmap.mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+
+	// The raw fork left GL(_dl_stack_cache_lock) in whatever state the parent had.
+	// Reset it (and drop the inherited stack cache, whose entries reference threads
+	// that no longer exist) so the child's pthread_create cannot deadlock. Clearing
+	// the cache before unlocking keeps the subsystem self-consistent if the lock was
+	// held mid-mutation in the parent.
+	if (g_stack_cache_lock) {
+		g_stack_cache_list[0] = g_stack_cache_list;            // _dl_stack_cache.next = &head
+		g_stack_cache_list[1] = g_stack_cache_list;            // _dl_stack_cache.prev = &head
+		*(size_t*)((char*)g_stack_cache_lock - 16) = 0;        // _dl_stack_cache_actsize
+		*(uintptr_t*)((char*)g_stack_cache_lock - 8) = 0;      // _dl_in_flight_stack
+		__atomic_store_n(g_stack_cache_lock, 0, __ATOMIC_SEQ_CST); // unlock last
+	}
 }
 
 static int socket_bitmap_get(socket_bitmap_t* bitmap) {
