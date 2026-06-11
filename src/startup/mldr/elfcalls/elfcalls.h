@@ -61,6 +61,9 @@ struct elf_calls
 	// POSIX sysconf
 	long (*sysconf)(int name);
 
+	// mldr process state
+	void (*postfork_child)(void);
+
 	// darlingserver RPC info
 	const void* (*dserver_socket_address)(void);
 	int (*dserver_per_thread_socket)(void);
@@ -74,4 +77,3 @@ struct elf_calls
 };
 
 #endif
-
