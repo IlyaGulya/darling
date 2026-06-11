@@ -34,6 +34,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <endian.h>
 #include "commpage.h"
 #include "loader.h"
+#include "glibc_fork_reset.h"
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -106,6 +107,8 @@ void* __mldr_main_stack_top = NULL;
 static int kernel_major = -1;
 static int kernel_minor = -1;
 
+void __mldr_postfork_child(void);
+
 int main(int argc, char** argv, char** envp)
 {
 	void** sp;
@@ -118,6 +121,10 @@ int main(int argc, char** argv, char** envp)
 	mldr_load_results.kernfd = -1;
 	mldr_load_results.argc = argc;
 	mldr_load_results.argv = argv;
+
+	// Locate glibc's loader/stack-cache locks while still single-threaded, so the
+	// fork child can reset them and avoid an inherited-held-lock deadlock (dar-gwn.5).
+	__mldr_glibc_fork_reset_detect();
 
 	while (envp[mldr_load_results.envc] != NULL) {
 		++mldr_load_results.envc;
@@ -562,6 +569,15 @@ static socket_bitmap_t socket_bitmap = {
 	.bit_length = 0,
 	.highest = -1,
 };
+
+// __mldr_postfork_child() runs in a Darling raw-fork child, invoked from sys_fork
+// via the elfcalls bridge. It re-initializes mldr's own socket-bitmap mutex and
+// then resets the glibc loader/stack locks the raw fork left inherited-held - see
+// glibc_fork_reset.c for the full rationale (dar-gwn.5).
+void __mldr_postfork_child(void) {
+	socket_bitmap.mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+	__mldr_glibc_fork_reset_child();
+}
 
 static int socket_bitmap_get(socket_bitmap_t* bitmap) {
 	int fd = -1;
