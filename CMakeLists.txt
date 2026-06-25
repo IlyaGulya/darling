@@ -195,7 +195,66 @@ cmake_policy(SET CMP0014 NEW)
 
 generate_architecture()
 
+# --- dar-gax: UNCONDITIONAL patchset-drift gate ------------------------------
+# TWICE a fix registered in patches.yml was missing from the committed
+# integration/homebrew tip the binary was built from, silently regressing it
+# (dar-gwn.6 xnu ulock, dar-gwn.1.9 darlingserver assert-wait). A gate that
+# relies on someone remembering to run `west patch status` is no gate. So wire
+# it into the build itself: it cannot be bypassed by a plain `ninja <target>`.
+#
+# Opt out only for packaging/CI that builds outside the patched workspace:
+#   -DDARLING_SKIP_DRIFT_GATE=ON
+option(DARLING_SKIP_DRIFT_GATE "Skip the patchset-drift gate (packaging/CI only)" OFF)
+if(NOT DARLING_SKIP_DRIFT_GATE)
+	# Locate the workspace that owns patches.yml (manifest repo two levels up:
+	# <ws>/darling-dev/darling -> <ws>/darling-dev/darling-workspace).
+	find_program(WEST_PROGRAM west)
+	set(_drift_ws "${CMAKE_CURRENT_SOURCE_DIR}/../darling-workspace")
+	if(WEST_PROGRAM AND EXISTS "${_drift_ws}/patches/homebrew/patches.yml")
+		# (1) configure-time check: fail `cmake`/reconfigure on drift.
+		execute_process(
+			COMMAND ${WEST_PROGRAM} patch status --strict
+			WORKING_DIRECTORY "${_drift_ws}"
+			RESULT_VARIABLE _drift_rc
+			OUTPUT_VARIABLE _drift_out
+			ERROR_VARIABLE  _drift_out)
+		if(NOT _drift_rc EQUAL 0)
+			message(FATAL_ERROR
+				"patchset DRIFT: a patch in patches.yml is MISSING from the build tree.\n"
+				"${_drift_out}\n"
+				"Regenerate first:  cd ${_drift_ws} && west patch verify && west patch apply --roll-back\n"
+				"(stash manual worktree edits first). Override (packaging/CI): -DDARLING_SKIP_DRIFT_GATE=ON")
+		endif()
+		# (2) every-build check: an always-out-of-date target in ALL so a plain
+		#     `ninja` re-runs the gate even when CMake does not reconfigure.
+		add_custom_target(drift_gate ALL
+			COMMAND ${WEST_PROGRAM} patch status --strict
+			WORKING_DIRECTORY "${_drift_ws}"
+			COMMENT "dar-gax: verifying patchset is not drifted from patches.yml"
+			VERBATIM)
+	else()
+		message(WARNING
+			"DARLING_SKIP_DRIFT_GATE is OFF but the drift gate could not run "
+			"(west=${WEST_PROGRAM}, ws=${_drift_ws}); proceeding WITHOUT drift protection.")
+	endif()
+endif()
+# --- end drift gate ----------------------------------------------------------
+
 add_subdirectory(src)
+
+# --- dar-gax: wire the drift gate to the deployable targets ------------------
+# Make the binaries we actually build+deploy DEPEND on the always-out-of-date
+# drift_gate, so a TARGETED `ninja darlingserver` / `ninja system_kernel` runs
+# the gate first and fails on drift -- not only a bare `ninja`. Placed after
+# add_subdirectory(src) so the targets exist; TARGET-guarded for component
+# selections that exclude them.
+if(TARGET drift_gate)
+	foreach(_dg_target darlingserver system_kernel)
+		if(TARGET ${_dg_target})
+			add_dependencies(${_dg_target} drift_gate)
+		endif()
+	endforeach()
+endif()
 
 install(DIRECTORY DESTINATION libexec/darling/private)
 install(DIRECTORY DESTINATION libexec/darling/private/etc)
