@@ -830,16 +830,18 @@ void __mldr_close_process_lifetime_pipe(int fd) {
 static void setup_space(struct load_results* lr, bool is_64_bit) {
 	commpage_setup(is_64_bit);
 
-	// Using the default stack top would cause the stack to be placed just above the commpage
-	// and would collide with it eventually.
-	// Instead, we manually allocate a new stack below the commpage.
+	// Place the guest's main stack just below the commpage. Using the default
+	// (native) stack top would put the stack just *above* the commpage and
+	// eventually collide with it, so we allocate our own stack region instead.
+	unsigned long preferred_top = commpage_address(
 #if __x86_64__
-	lr->stack_top = commpage_address(true);
+		true
 #elif __i386__
-	lr->stack_top = commpage_address(false);
+		false
 #else
 	#error Unsupported architecture
 #endif
+	);
 
 	struct rlimit limit;
 	getrlimit(RLIMIT_STACK, &limit);
@@ -849,10 +851,36 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 		size = limit.rlim_cur;
 	}
 
-	if (compatible_mmap((void*)(lr->stack_top - size), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_GROWSDOWN, -1, 0) == MAP_FAILED) {
+	// dar-stackmmap-eexist-9j9: the preferred fixed range [preferred_top - size,
+	// preferred_top) sits just below the commpage. For some guests the process's
+	// own native Linux [stack] tops out exactly at the commpage base and extends
+	// down across this range, so the fixed mapping overlaps the live native stack
+	// and MAP_FIXED_NOREPLACE returns EEXIST. (Captured live: native [stack]
+	// 0x7fffffde0000-0x7fffffe00000 fully covering the wanted range.) The guest
+	// used to exit(1) on EEXIST -- killing whatever was being launched (e.g. a
+	// clang/test under `make check`) and failing the build.
+	//
+	// We must NOT force this with MAP_FIXED: that would unmap the running native
+	// stack. But the guest stack does not have to live at this exact address --
+	// lr->stack_top is only used as the initial %rsp and reported via
+	// KERN_USRSTACK, both of which work with any valid address. So: try the
+	// preferred spot first (keeps the historical layout in the common case), and
+	// if it is occupied, let the kernel pick any free region for the stack.
+	void* stack = compatible_mmap((void*)(preferred_top - size), size, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_GROWSDOWN, -1, 0);
+	if (stack == MAP_FAILED && errno == EEXIST) {
+		// Fall back to a kernel-chosen address. Pass the preferred top only as a
+		// hint (no MAP_FIXED*), so the kernel relocates around the collision.
+		stack = compatible_mmap((void*)(preferred_top - size), size, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+	}
+	if (stack == MAP_FAILED) {
 		fprintf(stderr, "Failed to allocate stack of %lu bytes: %d (%s)\n", size, errno, strerror(errno));
 		exit(1);
 	}
+
+	// stack_top is the high end of whatever region we actually got.
+	lr->stack_top = (unsigned long)stack + size;
 
 	unset_special_env();
 
