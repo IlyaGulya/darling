@@ -33,11 +33,42 @@ void commpage_setup(bool _64bit)
 	uint8_t *user_page_shift, *kernel_page_shift;
 	struct sysinfo si;
 
-	commpage = (uint8_t*) mmap((void*)(_64bit ? _COMM_PAGE64_BASE_ADDRESS : _COMM_PAGE32_BASE_ADDRESS),
-			_64bit ? _COMM_PAGE64_AREA_LENGTH : _COMM_PAGE32_AREA_LENGTH, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	// The commpage is a fixed-address ABI contract: Apple code (e.g. libmalloc's
+	// __malloc_initialize, which divides by the _COMM_PAGE_PHYSICAL_CPUS byte)
+	// reads the commpage through the absolute hardcoded address
+	// _COMM_PAGE64_BASE_ADDRESS. It MUST be mapped exactly there.
+	//
+	// dar-gwn.6.6: this mmap used MAP_PRIVATE|MAP_ANONYMOUS WITHOUT MAP_FIXED, so
+	// the base was only a hint. That address (0x7fffffe00000) sits in the Linux
+	// ASLR mmap/stack region, and intermittently (~1 in several thousand execs,
+	// depending on ASLR) something already occupied it, so the kernel relocated
+	// the mapping. commpage_setup then wrote the CPU-count bytes to the WRONG
+	// page while libmalloc read the canonical address -- a zero-filled page --
+	// and divided by zero: "Floating point exception: 8" killing random
+	// short-lived guest processes under a fork/exec storm (e.g. brew's
+	// libunistring config.h build). The relocated mapping was harmless on its
+	// own; the bug was that nothing forced the commpage to its required address.
+	//
+	// Fix: map at the canonical address with MAP_FIXED so it always lands there.
+	// At this point in setup_space() the loaded Mach-O image has not been mapped
+	// yet, so the only mappings present are mldr's own loader artifacts, which the
+	// Linux loader places via ASLR and which essentially never legitimately need
+	// this specific high address; replacing a stray mapping there is strictly
+	// better than the guaranteed-later divide-by-zero crash.
+	void* want = (void*)(_64bit ? _COMM_PAGE64_BASE_ADDRESS : _COMM_PAGE32_BASE_ADDRESS);
+	size_t area_len = _64bit ? _COMM_PAGE64_AREA_LENGTH : _COMM_PAGE32_AREA_LENGTH;
+	commpage = (uint8_t*) mmap(want, area_len, PROT_READ|PROT_WRITE,
+			MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
 	if (commpage == MAP_FAILED)
 	{
 		fprintf(stderr, "Cannot mmap commpage: %s\n", strerror(errno));
+		exit(1);
+	}
+	if ((void*)commpage != want)
+	{
+		// MAP_FIXED is supposed to either return the requested address or fail;
+		// anything else is a contract violation we cannot recover from.
+		fprintf(stderr, "Commpage landed at %p, not the required %p\n", (void*)commpage, want);
 		exit(1);
 	}
 
