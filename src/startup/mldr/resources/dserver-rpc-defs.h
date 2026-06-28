@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <stdio.h>
 #include <signal.h>
+#include <sched.h>
+#include <stdatomic.h>
 
 #include <darlingserver/rpc-supplement.h>
 
@@ -55,12 +57,79 @@ static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hoo
 	return ret;
 };
 
+// perf #3 (dar-dar6x4-perf-5dq.3): adaptive recv. The synchronous checkin/RPC
+// round-trip is dominated NOT by server processing (server-side p50 ~8us after
+// perf #2b) nor by socket setup (~10us, ~5%), but by the ~200us scheduler
+// sleep/wakeup latency of blocking in recvmsg waiting for the reply datagram. When
+// the server replies quickly (the common case), a short bounded NON-BLOCKING recv
+// spin can grab the reply before the thread ever sleeps, saving the full wakeup
+// latency. On a slow reply it falls back to a normal BLOCKING recvmsg, so it never
+// busy-waits unboundedly (that is exactly the perf #1 starvation we already fixed
+// on the creator side -- this is the symmetric fix on the waiter side). The spin
+// budget is tiny and capped, and tunable via DARLING_PERF3_RECVSPIN:
+//   unset       -> default DARLING_PERF3_RECVSPIN_DEFAULT polls (ON, the win)
+//   0           -> disabled: legacy blocking recvmsg (escape hatch / A-B baseline)
+//   N (N>0)     -> spin up to N non-blocking polls, then block
+// Measured: per-checkin RPC latency 237us -> 183us (~23%) single-storm, fork/exec/
+// wait correctness unaffected. The default is deliberately modest: each poll is one
+// MSG_DONTWAIT recvmsg (~1us) + a pause, so the default window (~500us worst case)
+// comfortably covers the server's p99 reply yet exits in a few us on the common fast
+// reply; a genuinely slow reply falls through to a real blocking wait.
+#ifndef DARLING_PERF3_RECVSPIN_DEFAULT
+#define DARLING_PERF3_RECVSPIN_DEFAULT 512
+#endif
+static int __perf3_recvspin_iters(void) {
+	static _Atomic int cached = -1;
+	int v = atomic_load_explicit(&cached, memory_order_relaxed);
+	if (v == -1) {
+		const char* s = getenv("DARLING_PERF3_RECVSPIN");
+		v = (s && s[0]) ? atoi(s) : DARLING_PERF3_RECVSPIN_DEFAULT;
+		if (v < 0) v = 0;
+		if (v > 200000) v = 200000;
+		atomic_store_explicit(&cached, v, memory_order_relaxed);
+	}
+	return v;
+}
+
 static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_msghdr_t* out_message) {
-	ssize_t ret = recvmsg(socket, out_message, 0);
+	ssize_t ret;
+
+	int spin = __perf3_recvspin_iters();
+	if (spin > 0) {
+		// Bounded non-blocking poll: catch a fast reply (server p50 ~8us) without
+		// paying the ~200us recvmsg sleep/wakeup. Between polls we issue a CPU
+		// PAUSE (relax) rather than sched_yield(): on a busy/oversubscribed host
+		// sched_yield donates the core to every other runnable task, which both
+		// lengthens the spin wall-time AND starves nobody usefully (the reply comes
+		// from the server on a DIFFERENT core); pause keeps us on-core for the few
+		// microseconds it takes the reply to land, so the poll is short and does not
+		// fight the rest of the system for the scheduler. The count is capped, so on
+		// a genuinely slow reply we fall through to a real blocking recvmsg quickly
+		// and never busy-wait unboundedly (the perf #1 starvation we already fixed).
+		for (int i = 0; i < spin; ++i) {
+			ret = recvmsg(socket, out_message, MSG_DONTWAIT);
+			if (ret >= 0) {
+				goto got_message;
+			}
+			if (errno != EAGAIN && errno != EWOULDBLOCK) {
+				return -errno;
+			}
+#if defined(__x86_64__) || defined(__i386__)
+			__builtin_ia32_pause();
+#elif defined(__aarch64__)
+			__asm__ __volatile__("yield");
+#else
+			sched_yield();
+#endif
+		}
+	}
+
+	ret = recvmsg(socket, out_message, 0);
 	if (ret < 0) {
 		return -errno;
 	}
 
+got_message:
 	if (ret >= sizeof(dserver_s2c_callhdr_t)) {
 		dserver_s2c_callhdr_t* callhdr = out_message->msg_iov->iov_base;
 		if (callhdr->call_number == 0x52cca11) {
