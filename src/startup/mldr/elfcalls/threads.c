@@ -32,6 +32,9 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/socket.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <stdatomic.h>
+#include <linux/futex.h>
+#include <errno.h>
 
 #include "dthreads.h"
 
@@ -67,7 +70,17 @@ struct arg_struct
 	uintptr_t stack_bottom;
 	uintptr_t stack_addr;
 	bool is_workqueue;
+	// perf #1 (dar-dar6x4-perf-5dq.1): completion handshake futex word. The creating
+	// thread FUTEX_WAITs on this instead of busy-spinning sched_yield() until the new
+	// thread has checked in with darlingserver; the new thread stores 1 + FUTEX_WAKEs.
+	// Appended LAST so the hardcoded i386 byte offsets into &args below stay valid.
+	_Atomic int checked_in;
 };
+
+// raw futex syscall wrappers (no glibc wrapper exists)
+static inline long __dthread_futex(_Atomic int* uaddr, int op, int val) {
+	return syscall(SYS_futex, (int*)uaddr, op, val, NULL, NULL, 0);
+}
 
 static void* darling_thread_entry(void* p);
 
@@ -159,6 +172,7 @@ void* __darling_thread_create(unsigned long stack_size, unsigned long pth_obj_si
 		.callbacks        = callbacks,
 		.stack_addr       = 0, // set later on
 		.is_workqueue     = real_entry_point == 0, // our `workq_kernreturn` sets `real_entry_point` to NULL; `bsdthread_create` actually passes a value
+		.checked_in       = 0, // perf #1: cleared before launch, set to 1 by the new thread after checkin
 	};
 	pthread_attr_t attr;
 	pthread_t nativeLibcThread;
@@ -196,8 +210,39 @@ void* __darling_thread_create(unsigned long stack_size, unsigned long pth_obj_si
 	pthread_create(&nativeLibcThread, &attr, darling_thread_entry, &args);
 	pthread_attr_destroy(&attr);
 
-	while (args.pth != NULL)
-		sched_yield();
+	// perf #1 (dar-dar6x4-perf-5dq.1): wait for the new thread to finish its darlingserver
+	// checkin. The original code was an unbounded `while (args.pth != NULL) sched_yield();`
+	// busy-spin: under high thread-creation density (e.g. `make -j` link storms) every
+	// in-flight creator burned a whole core, starving the new threads AND the single-threaded
+	// darlingserver of the CPU they needed to complete the very checkin being waited on.
+	//
+	// But the checkin is usually FAST (p50 ~16-64us on a warm server), faster than a futex
+	// syscall round-trip, so an immediate FUTEX_WAIT regresses the common case. Use an
+	// ADAPTIVE wait: spin a bounded number of times first (wins the fast path with no
+	// syscall), then fall back to FUTEX_WAIT so a slow checkin can never monopolise a core.
+	// This keeps the fast-path throughput of the spin while removing the pathological
+	// starvation of the unbounded spin.
+	{
+		// ~tuned so the spin phase covers a typical fast checkin but bails out quickly
+		// (each iteration is a relaxed load + a sched_yield, i.e. a few hundred ns).
+		const int kSpinIters = 4000;
+		int spins = 0;
+		while (atomic_load_explicit(&args.checked_in, memory_order_acquire) == 0) {
+			if (spins < kSpinIters) {
+				++spins;
+				sched_yield();
+				continue;
+			}
+			// slow checkin: stop burning CPU and block in the kernel.
+			long r = __dthread_futex(&args.checked_in, FUTEX_WAIT_PRIVATE, 0);
+			// EAGAIN => the value already changed (checkin won the race); EINTR => spurious
+			// wakeup. Both just re-check the predicate. Any other error: yield so we can
+			// never hang (defensive; should not happen).
+			if (r != 0 && errno != EAGAIN && errno != EINTR) {
+				sched_yield();
+			}
+		}
+	}
 
 	return pth;
 }
@@ -244,7 +289,14 @@ static void* darling_thread_entry(void* p)
 	dthread->tsd[DTHREAD_TSD_SLOT_MACH_THREAD_SELF] = (void*)(intptr_t)thread_self_port;
 	args.port = thread_self_port;
 
+	// perf #1 (dar-dar6x4-perf-5dq.1): signal the creating thread that we've checked in and
+	// wake it from its FUTEX_WAIT. This is our LAST access to `in_args` (the creator's stack):
+	// once it observes checked_in==1 it may return and reuse that frame, so we must not touch
+	// `in_args` afterward. `pth` is nulled too for backwards-compat with anything inspecting it.
 	in_args->pth = NULL;
+	atomic_store_explicit(&in_args->checked_in, 1, memory_order_release);
+	// exactly one waiter (the creating thread) ever waits on this word
+	__dthread_futex(&in_args->checked_in, FUTEX_WAKE_PRIVATE, 1);
 
 	if (setjmp(t_jmpbuf))
 	{
