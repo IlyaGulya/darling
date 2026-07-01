@@ -51,6 +51,70 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 
 static const char* dyld_path = INSTALL_PREFIX "/libexec/usr/lib/dyld";
 
+// perf#21b: compact protected internal fd band.
+//
+// Darling's internal service fds (per-thread dserver RPC sockets, the process
+// lifetime pipe) used to be allocated downward from RLIMIT_NOFILE-1. Since
+// darlingserver raises RLIMIT_NOFILE to /proc/sys/fs/nr_open (=1048576), a single
+// service fd at index 1048575 forced the kernel to size the process fd table to
+// ~1M slots (~8.4MB). Every fork()/clone() then copied that whole table in
+// dup_fd() -- perf#21a measured this as the #1 on-CPU symbol (~13.3%).
+//
+// Instead we reserve a small band at a compact ceiling. The kernel fd table only
+// needs to span up to the highest live fd, so keeping the ceiling small keeps the
+// per-fork dup_fd() copy tiny. perf#21b measured dup_fd() fall from 13.3% of guest
+// on-CPU to 0.09% with an 8192 ceiling.
+//
+// The guest still sees the historical NOFILE report of (real soft limit - 1) from
+// the emulation's getrlimit -- i.e. exactly the old top-anchored behaviour, just at
+// a low ceiling. A STRICTER guest cap that hides the whole band (report top - BAND
+// so the guest can never even allocate a descriptor number inside the band) was
+// prototyped but broke boot (a guest daemon misbehaves when NOFILE is reported
+// below the real ceiling); that virtual-cap is DEFERRED to D21c. Until then the
+// collision surface is identical to the pre-perf#21b design (guest cap == top-1 ==
+// the highest service fd), and internal fds stay protected by the guard table
+// (prevent_close on close/dup/dup2/fcntl), not by the reported limit.
+//
+// DARLING_INTERNAL_FD_TOP (host fd ceiling, exclusive) is overridable via the
+// environment for experiments (validated at 4096/8192/16384); DARLING_INTERNAL_FD_BAND
+// is how many fds the band reserves. The guest cap is TOP - BAND (used only by the
+// D21c-reserved __mldr_guest_nofile_cap() below).
+#define DARLING_INTERNAL_FD_TOP_DEFAULT  8192
+#define DARLING_INTERNAL_FD_BAND         512
+
+// Resolved once (in socket_bitmap_get) and cached; also consumed by the guest-cap
+// reporting path via __mldr_guest_nofile_cap(). Value is the exclusive host fd
+// ceiling: the band occupies [top - DARLING_INTERNAL_FD_BAND, top).
+static int __mldr_internal_fd_top = -1;
+
+static int mldr_resolve_internal_fd_top(void) {
+	if (__mldr_internal_fd_top > 0) {
+		return __mldr_internal_fd_top;
+	}
+
+	int top = DARLING_INTERNAL_FD_TOP_DEFAULT;
+
+	const char* env = getenv("DARLING_INTERNAL_FD_TOP");
+	if (env && *env) {
+		long v = strtol(env, NULL, 10);
+		// require room for the band plus a minimum usable guest fd space
+		if (v >= DARLING_INTERNAL_FD_BAND * 2 && v <= 1048576) {
+			top = (int)v;
+		}
+	}
+
+	__mldr_internal_fd_top = top;
+	return top;
+}
+
+// The guest-visible RLIMIT_NOFILE cap: the highest fd number the guest may use.
+// Anything at or above this is inside the reserved internal band. RESERVED for the
+// D21c strict-cap work (see the block comment above); not consumed yet because the
+// emulation's getrlimit still uses the compatible (real - 1) report.
+int __mldr_guest_nofile_cap(void) {
+	return mldr_resolve_internal_fd_top() - DARLING_INTERNAL_FD_BAND;
+}
+
 struct sockaddr_un __dserver_socket_address_data = {
 	.sun_family = AF_UNIX,
 	.sun_path = "\0",
@@ -586,19 +650,37 @@ static int socket_bitmap_get(socket_bitmap_t* bitmap) {
 	pthread_mutex_lock(&bitmap->mutex);
 
 	if (bitmap->highest == -1) {
-		// we need to initialize this bitmap
+		// perf#21b: anchor the internal fd band at a compact ceiling instead of
+		// at RLIMIT_NOFILE-1. Lower the host fd limit to that ceiling so the
+		// kernel fd table (and thus the per-fork dup_fd() copy) stays small.
+		int top = mldr_resolve_internal_fd_top();
+
 		struct rlimit limit;
-
-		if (getrlimit(RLIMIT_NOFILE, &limit) < 0) {
-			goto out;
+		if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+			// We want the soft limit to be EXACTLY `top`: the band lives at
+			// [top - BAND, top), so the service fds require rlim_cur >= top, and
+			// keeping rlim_cur == top keeps the kernel fd table compact (~top
+			// slots) so the per-fork dup_fd() copy stays small. The inherited
+			// soft limit may be higher (darlingserver raises it to nr_open) or
+			// lower (e.g. launchd's restored default) than `top`, so set it in
+			// either direction -- not just lower it.
+			rlim_t desired = (rlim_t)top;
+			if (limit.rlim_max != RLIM_INFINITY && desired > limit.rlim_max) {
+				// can't exceed the hard limit; clamp the band to it instead.
+				desired = limit.rlim_max;
+				top = (int)desired;
+				__mldr_internal_fd_top = top;
+			}
+			if (limit.rlim_cur != desired) {
+				struct rlimit newlim = { desired, limit.rlim_max };
+				// best-effort: if this fails we still allocate within [.., top);
+				// a too-low surviving soft limit would only make socket creation
+				// fail (caught by the callers), never corrupt the guest's view.
+				setrlimit(RLIMIT_NOFILE, &newlim);
+			}
 		}
 
-		if (limit.rlim_cur == RLIM_INFINITY) {
-			// just default to 1024
-			limit.rlim_cur = 1024;
-		}
-
-		bitmap->highest = limit.rlim_cur - 1;
+		bitmap->highest = top - 1;
 	}
 
 	if (bitmap->next_index >= bitmap->bit_length) {
