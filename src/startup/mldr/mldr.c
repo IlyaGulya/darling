@@ -35,6 +35,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include "commpage.h"
 #include "loader.h"
 #include "glibc_fork_reset.h"
+#include "stack_mapping.h"
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -866,21 +867,15 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	// KERN_USRSTACK, both of which work with any valid address. So: try the
 	// preferred spot first (keeps the historical layout in the common case), and
 	// if it is occupied, let the kernel pick any free region for the stack.
-	void* stack = compatible_mmap((void*)(preferred_top - size), size, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_GROWSDOWN, -1, 0);
-	if (stack == MAP_FAILED && errno == EEXIST) {
-		// Fall back to a kernel-chosen address. Pass the preferred top only as a
-		// hint (no MAP_FIXED*), so the kernel relocates around the collision.
-		stack = compatible_mmap((void*)(preferred_top - size), size, PROT_READ | PROT_WRITE,
-				MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
-	}
+	unsigned long stack_top = 0;
+	void* stack = mldr_map_guest_stack(compatible_mmap, preferred_top, size, &stack_top);
 	if (stack == MAP_FAILED) {
 		fprintf(stderr, "Failed to allocate stack of %lu bytes: %d (%s)\n", size, errno, strerror(errno));
 		exit(1);
 	}
 
 	// stack_top is the high end of whatever region we actually got.
-	lr->stack_top = (unsigned long)stack + size;
+	lr->stack_top = stack_top;
 
 	unset_special_env();
 
