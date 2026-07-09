@@ -53,6 +53,50 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 
 static const char* dyld_path = INSTALL_PREFIX "/libexec/usr/lib/dyld";
 
+// perf#21b: compact protected internal fd band.
+//
+// Darling's internal service fds (per-thread dserver RPC sockets, the process
+// lifetime pipe) used to be allocated downward from RLIMIT_NOFILE-1. Since
+// darlingserver raises RLIMIT_NOFILE to /proc/sys/fs/nr_open (=1048576), a single
+// service fd at index 1048575 forced the kernel to size the process fd table to
+// ~1M slots. Every fork()/clone() then copied that whole table in dup_fd().
+//
+// Instead we reserve a small band at a compact ceiling. The kernel fd table only
+// needs to span up to the highest live fd, so keeping the ceiling small keeps the
+// per-fork dup_fd() copy tiny.
+#define DARLING_INTERNAL_FD_TOP_DEFAULT  8192
+#define DARLING_INTERNAL_FD_BAND         512
+
+// Resolved once and cached. Value is the exclusive host fd ceiling: the band
+// occupies [top - DARLING_INTERNAL_FD_BAND, top).
+static int __mldr_internal_fd_top = -1;
+
+static int mldr_resolve_internal_fd_top(void) {
+	if (__mldr_internal_fd_top > 0) {
+		return __mldr_internal_fd_top;
+	}
+
+	int top = DARLING_INTERNAL_FD_TOP_DEFAULT;
+
+	const char* env = getenv("DARLING_INTERNAL_FD_TOP");
+	if (env && *env) {
+		long v = strtol(env, NULL, 10);
+		// Require room for the band plus a minimum usable guest fd space.
+		if (v >= DARLING_INTERNAL_FD_BAND * 2 && v <= 1048576) {
+			top = (int)v;
+		}
+	}
+
+	__mldr_internal_fd_top = top;
+	return top;
+}
+
+// Reserved for the stricter guest-visible cap work. The current compatibility
+// path still reports real soft limit - 1 from the emulation's getrlimit.
+int __mldr_guest_nofile_cap(void) {
+	return mldr_resolve_internal_fd_top() - DARLING_INTERNAL_FD_BAND;
+}
+
 struct sockaddr_un __dserver_socket_address_data = {
 	.sun_family = AF_UNIX,
 	.sun_path = "\0",
@@ -627,19 +671,23 @@ static int socket_bitmap_get(socket_bitmap_t* bitmap) {
 	pthread_mutex_lock(&bitmap->mutex);
 
 	if (bitmap->highest == -1) {
-		// we need to initialize this bitmap
+		int top = mldr_resolve_internal_fd_top();
+
 		struct rlimit limit;
-
-		if (getrlimit(RLIMIT_NOFILE, &limit) < 0) {
-			goto out;
+		if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+			rlim_t desired = (rlim_t)top;
+			if (limit.rlim_max != RLIM_INFINITY && desired > limit.rlim_max) {
+				desired = limit.rlim_max;
+				top = (int)desired;
+				__mldr_internal_fd_top = top;
+			}
+			if (limit.rlim_cur != desired) {
+				struct rlimit newlim = { desired, limit.rlim_max };
+				setrlimit(RLIMIT_NOFILE, &newlim);
+			}
 		}
 
-		if (limit.rlim_cur == RLIM_INFINITY) {
-			// just default to 1024
-			limit.rlim_cur = 1024;
-		}
-
-		bitmap->highest = limit.rlim_cur - 1;
+		bitmap->highest = top - 1;
 	}
 
 	if (bitmap->next_index >= bitmap->bit_length) {
