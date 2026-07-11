@@ -34,6 +34,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <signal.h>
 #include "shellspawn.h"
 #include "duct_signals.h"
+#include "wait_status.h"
 
 #define DBG 0
 
@@ -77,11 +78,7 @@ static void closeFd(int* fd)
 
 static int shellExitCode(int status)
 {
-	if (WIFEXITED(status))
-		return WEXITSTATUS(status);
-	if (WIFSIGNALED(status))
-		return 128 + WTERMSIG(status);
-	return EXIT_FAILURE;
+	return shellspawn_exit_code_from_wait_status(status);
 }
 
 static int reapShell(pid_t shell_pid, int* status)
@@ -503,7 +500,7 @@ void spawnShell(int fd)
 	if (wait_result == SHELL_WAIT_EXITED)
 		write(fd, &result, sizeof(result));
 
-	if (DBG) printf("Shell terminated with exit code %d\n", wstatus);
+	if (DBG) printf("Shell terminated with exit code %d\n", result.value);
 	close(fd);
 
 	reapAll();
