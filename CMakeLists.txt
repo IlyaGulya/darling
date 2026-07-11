@@ -205,37 +205,55 @@ generate_architecture()
 # Opt out only for packaging/CI that builds outside the patched workspace:
 #   -DDARLING_SKIP_DRIFT_GATE=ON
 option(DARLING_SKIP_DRIFT_GATE "Skip the patchset-drift gate (packaging/CI only)" OFF)
+set(DARLING_PATCH_PROFILE "" CACHE STRING
+	"Patch profile expected by the drift gate (empty: derive integration/<profile> or homebrew)")
 if(NOT DARLING_SKIP_DRIFT_GATE)
 	# Locate the workspace that owns patches.yml (manifest repo two levels up:
 	# <ws>/darling-dev/darling -> <ws>/darling-dev/darling-workspace).
 	find_program(WEST_PROGRAM west)
 	set(_drift_ws "${CMAKE_CURRENT_SOURCE_DIR}/../darling-workspace")
-	if(WEST_PROGRAM AND EXISTS "${_drift_ws}/patches/homebrew/patches.yml")
+	set(_drift_profile "${DARLING_PATCH_PROFILE}")
+	if(NOT _drift_profile)
+		execute_process(
+			COMMAND git branch --show-current
+			WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+			RESULT_VARIABLE _drift_branch_rc
+			OUTPUT_VARIABLE _drift_branch
+			OUTPUT_STRIP_TRAILING_WHITESPACE
+			ERROR_QUIET)
+		if(_drift_branch_rc EQUAL 0 AND _drift_branch MATCHES "^integration/([A-Za-z0-9_.-]+)$")
+			set(_drift_profile "${CMAKE_MATCH_1}")
+		else()
+			set(_drift_profile "homebrew")
+		endif()
+	endif()
+	set(_drift_profile_manifest "${_drift_ws}/patches/${_drift_profile}/patches.yml")
+	if(WEST_PROGRAM AND EXISTS "${_drift_profile_manifest}")
 		# (1) configure-time check: fail `cmake`/reconfigure on drift.
 		execute_process(
-			COMMAND ${WEST_PROGRAM} patch status --strict
+			COMMAND ${WEST_PROGRAM} patch status --profile ${_drift_profile} --strict
 			WORKING_DIRECTORY "${_drift_ws}"
 			RESULT_VARIABLE _drift_rc
 			OUTPUT_VARIABLE _drift_out
 			ERROR_VARIABLE  _drift_out)
 		if(NOT _drift_rc EQUAL 0)
 			message(FATAL_ERROR
-				"patchset DRIFT: a patch in patches.yml is MISSING from the build tree.\n"
+				"patchset DRIFT in profile ${_drift_profile}: a patch is MISSING from the build tree.\n"
 				"${_drift_out}\n"
-				"Regenerate first:  cd ${_drift_ws} && west patch verify && west patch apply --roll-back\n"
+				"Regenerate first: cd ${_drift_ws} && west patch verify --profile ${_drift_profile} && west patch apply --profile ${_drift_profile} --roll-back\n"
 				"(stash manual worktree edits first). Override (packaging/CI): -DDARLING_SKIP_DRIFT_GATE=ON")
 		endif()
 		# (2) every-build check: an always-out-of-date target in ALL so a plain
 		#     `ninja` re-runs the gate even when CMake does not reconfigure.
 		add_custom_target(drift_gate ALL
-			COMMAND ${WEST_PROGRAM} patch status --strict
+			COMMAND ${WEST_PROGRAM} patch status --profile ${_drift_profile} --strict
 			WORKING_DIRECTORY "${_drift_ws}"
-			COMMENT "dar-gax: verifying patchset is not drifted from patches.yml"
+			COMMENT "dar-gax: verifying ${_drift_profile} patchset is not drifted"
 			VERBATIM)
 	else()
 		message(WARNING
 			"DARLING_SKIP_DRIFT_GATE is OFF but the drift gate could not run "
-			"(west=${WEST_PROGRAM}, ws=${_drift_ws}); proceeding WITHOUT drift protection.")
+			"(west=${WEST_PROGRAM}, profile=${_drift_profile}, ws=${_drift_ws}); proceeding WITHOUT drift protection.")
 	endif()
 endif()
 # --- end drift gate ----------------------------------------------------------
