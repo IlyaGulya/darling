@@ -55,3 +55,15 @@ set_tests_properties(host/glibc_fork_lock_reset PROPERTIES
 	LABELS "env:host;diag:bare;bead:dar-gwn.5;submod:darling"
 	TIMEOUT 20
 	WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+add_executable(darling_host_shellspawn_exit_status
+	shellspawn_exit_status.c)
+target_include_directories(darling_host_shellspawn_exit_status PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/../../src/shellspawn)
+
+add_test(
+	NAME host/shellspawn_exit_status
+	COMMAND darling_host_shellspawn_exit_status)
+set_tests_properties(host/shellspawn_exit_status PROPERTIES
+	LABELS "env:host;diag:bare;bead:dar-mu8f;submod:darling"
+	TIMEOUT 5)
