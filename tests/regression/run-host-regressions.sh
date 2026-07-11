@@ -30,5 +30,6 @@ trap cleanup EXIT
 cmake -S "$suite_root" -B "$build_root" -G Ninja
 cmake --build "$build_root" --target \
 	darling_host_thread_create_checkin_wait \
-	darling_host_glibc_fork_lock_reset
+	darling_host_glibc_fork_lock_reset \
+	darling_host_shellspawn_exit_status
 ctest --test-dir "$build_root" --output-on-failure -L '^env:host$'
