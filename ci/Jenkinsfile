@@ -49,6 +49,34 @@ pipeline {
 			}
 		}
 
+		stage('Host Regression Tests') {
+			agent {
+				docker {
+					image 'registry.git.facekapow.dev/darling-build-image:latest'
+					registryUrl 'https://registry.git.facekapow.dev'
+					alwaysPull true
+					args '-u ci:ci -v ${WORKSPACE}/source:/src/mnt:rw -v ${CCACHE_DIR}:/ccache:rw'
+					label 'darling'
+					reuseNode true
+				}
+			}
+			environment {
+				CCACHE_DIR = '/ccache'
+				CCACHE_BASEDIR = '/src/mnt'
+			}
+			steps {
+				sh '''#!/bin/bash
+					set -euo pipefail
+					cmake -S /src/mnt/tests/regression -B /src/mnt/build-host-regressions -G Ninja
+					cmake --build /src/mnt/build-host-regressions --target \\
+						darling_host_thread_create_checkin_wait \\
+						darling_host_glibc_fork_lock_reset
+					ctest --test-dir /src/mnt/build-host-regressions --output-on-failure \\
+						-L '^env:host$'
+				'''
+			}
+		}
+
 		stage('Build Debian') {
 			when { expression { params.DEB } }
 			agent {
