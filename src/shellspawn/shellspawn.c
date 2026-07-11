@@ -48,6 +48,49 @@ void setupSigchild(void);
 void restoreSigchild(void);
 void reapAll(void);
 
+static void rootlessTestDelaySocketReady(void)
+{
+	const char* rootless = getenv("DARLING_ROOTLESS");
+	const char* value = getenv("DARLING_TEST_SHELLSPAWN_READY_DELAY_MS");
+	if (rootless == NULL || strcmp(rootless, "1") != 0 || value == NULL || *value == '\0')
+		return;
+
+	char* end = NULL;
+	errno = 0;
+	long delay = strtol(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || delay < 0 || delay > 30000)
+	{
+		fprintf(stderr, "Invalid DARLING_TEST_SHELLSPAWN_READY_DELAY_MS: %s\n", value);
+		exit(EXIT_FAILURE);
+	}
+
+	poll(NULL, 0, (int)delay);
+}
+
+static void rootlessTestMarkSocketPending(void)
+{
+	const char* rootless = getenv("DARLING_ROOTLESS");
+	const char* delay = getenv("DARLING_TEST_SHELLSPAWN_READY_DELAY_MS");
+	const char* path = getenv("WEST_ROOTLESS_BOOTSTRAP_READY_FILE");
+	if (rootless == NULL || strcmp(rootless, "1") != 0 || delay == NULL || *delay == '\0'
+		|| path == NULL || *path == '\0')
+		return;
+
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1)
+	{
+		perror("Opening rootless shellspawn readiness marker");
+		exit(EXIT_FAILURE);
+	}
+	const char marker[] = "shellspawn-pending\n";
+	if (write(fd, marker, sizeof(marker) - 1) != (ssize_t)(sizeof(marker) - 1))
+	{
+		perror("Writing rootless shellspawn readiness marker");
+		close(fd);
+		exit(EXIT_FAILURE);
+	}
+	close(fd);
+}
 int main(int argc, const char** argv)
 {
 	// shellspawn (daemon) --fork()--> shellspawn (child) --fork()--> exec /bin/bash
@@ -55,6 +98,8 @@ int main(int argc, const char** argv)
 	// we have to allow it to become a zombie, therefore we need to
 	// restore the sigaction of SIGCHLD of the child shellspawn
 	setupSigchild();
+	rootlessTestDelaySocketReady();
+	rootlessTestMarkSocketPending();
 	setupSocket();
 	listenForConnections();
 
