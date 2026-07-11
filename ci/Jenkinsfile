@@ -67,12 +67,7 @@ pipeline {
 			steps {
 				sh '''#!/bin/bash
 					set -euo pipefail
-					cmake -S /src/mnt/tests/regression -B /src/mnt/build-host-regressions -G Ninja
-					cmake --build /src/mnt/build-host-regressions --target \\
-						darling_host_thread_create_checkin_wait \\
-						darling_host_glibc_fork_lock_reset
-					ctest --test-dir /src/mnt/build-host-regressions --output-on-failure \\
-						-L '^env:host$'
+					bash /src/mnt/tests/regression/run-host-regressions.sh /src/mnt
 				'''
 			}
 		}
