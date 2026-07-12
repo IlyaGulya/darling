@@ -1386,7 +1386,8 @@ do_file_init(void)
 
 	launchd_system_start = runtime_get_wall_time();
 
-	if (getpid() == 1) {
+	const char* rootless = getenv("DARLING_ROOTLESS");
+	if (getpid() == 1 || (rootless != NULL && strcmp(rootless, "1") == 0)) {
 		pid1_magic = true;
 	}
 

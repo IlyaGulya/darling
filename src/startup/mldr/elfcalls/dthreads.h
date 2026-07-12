@@ -5,6 +5,8 @@
 // also: "dwq" stands for "Darwin workqueue"
 
 #include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 
 #define DARWIN_TAILQ_ENTRY(type)      \
 	struct {                            \
@@ -126,5 +128,9 @@ typedef struct _dthread {
 	__attribute__((aligned(16)))
 	void* tsd[DARWIN_EXTERNAL_POSIX_THREAD_KEYS_MAX + DARWIN_INTERNAL_POSIX_THREAD_KEYS_MAX];
 }* dthread_t;
+
+dthread_t __darling_dthread_initialize(dthread_t dthread, size_t guard_size,
+		void* stack_addr, size_t stack_size, void* base_addr, size_t total_size);
+int __darling_dthread_set_tsd_base(void* tsd_base);
 
 #endif // _ELFLOADER_DTHREADS_H_

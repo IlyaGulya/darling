@@ -29,6 +29,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <signal.h>
 #include <stdbool.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -51,6 +52,12 @@ uid_t g_originalUid, g_originalGid;
 bool g_fixPermissions = false;
 char g_workingDirectory[4096];
 
+static bool rootlessModeEnabled(void)
+{
+	const char* value = getenv("DARLING_ROOTLESS");
+	return value != NULL && value[0] == '1' && value[1] == '\0';
+}
+
 int main(int argc, char ** argv)
 {
 	pid_t pidInit;
@@ -61,7 +68,9 @@ int main(int argc, char ** argv)
 		return 1;
 	}
 
-	if (geteuid() != 0)
+	const bool rootless = rootlessModeEnabled();
+
+	if (!rootless && geteuid() != 0)
 	{
 		missingSetuidRoot();
 		return 1;
@@ -70,8 +79,19 @@ int main(int argc, char ** argv)
 	g_originalUid = getuid();
 	g_originalGid = getgid();
 
-	setuid(0);
-	setgid(0);
+	if (!rootless)
+	{
+		setuid(0);
+		setgid(0);
+	}
+	else
+	{
+		if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0)
+		{
+			fprintf(stderr, "Cannot enable rootless child reaping: %s\n", strerror(errno));
+			return 1;
+		}
+	}
 
 	prefix = getenv("DPREFIX");
 	if (!prefix)
@@ -187,10 +207,12 @@ int main(int argc, char ** argv)
 	}
 
 #if USE_LINUX_4_11_HACK
-	joinNamespace(pidInit, CLONE_NEWNS, "mnt");
+	if (!rootless)
+		joinNamespace(pidInit, CLONE_NEWNS, "mnt");
 #endif
 
-	seteuid(g_originalUid);
+	if (!rootless)
+		seteuid(g_originalUid);
 
 	if (strcmp(argv[1], "shell") == 0)
 	{
@@ -789,10 +811,13 @@ pid_t spawnInitProcess(void)
 		exit(1);
 	}
 
-	if (unshare(CLONE_NEWUTS | CLONE_NEWIPC) != 0)
+	if (!rootlessModeEnabled())
 	{
-		fprintf(stderr, "Cannot unshare UTS and IPC namespaces to create darling-init: %s\n", strerror(errno));
-		exit(1);
+		if (unshare(CLONE_NEWUTS | CLONE_NEWIPC) != 0)
+		{
+			fprintf(stderr, "Cannot unshare UTS and IPC namespaces to create darling-init: %s\n", strerror(errno));
+			exit(1);
+		}
 	}
 
 	pid = fork();
