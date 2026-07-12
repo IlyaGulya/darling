@@ -33,6 +33,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <getopt.h>
 #include <termios.h>
 #include <pty.h>
@@ -46,6 +47,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 // created in a different mount namespace or under overlayfs
 // (dunno which one is really responsible for this).
 #define USE_LINUX_4_11_HACK 1
+#define ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS 30000
 
 char *prefix;
 uid_t g_originalUid, g_originalGid;
@@ -58,6 +60,19 @@ static bool rootlessModeEnabled(void)
 	return value != NULL && value[0] == '1' && value[1] == '\0';
 }
 
+static void removeRuntimeStateFiles(void)
+{
+	char initPidPath[4096];
+	char shellspawnSocketPath[4096];
+	char darlingserverSocketPath[4096];
+
+	snprintf(initPidPath, sizeof(initPidPath), "%s/.init.pid", prefix);
+	snprintf(shellspawnSocketPath, sizeof(shellspawnSocketPath), "%s" SHELLSPAWN_SOCKPATH, prefix);
+	snprintf(darlingserverSocketPath, sizeof(darlingserverSocketPath), "%s/.darlingserver.sock", prefix);
+	unlink(initPidPath);
+	unlink(shellspawnSocketPath);
+	unlink(darlingserverSocketPath);
+}
 int main(int argc, char ** argv)
 {
 	pid_t pidInit;
@@ -179,8 +194,18 @@ int main(int argc, char ** argv)
 		}
 		fclose(file);
 
-		kill(launchd_pid, SIGKILL);
+		if (rootless) {
+			int shutdown_result = shutdown_rootless_process_session(launchd_pid);
+			if (shutdown_result != 0) {
+				fprintf(stderr, "Failed to stop rootless Darling session: %s\n",
+					strerror(-shutdown_result));
+				return 1;
+			}
+		} else {
+			kill(launchd_pid, SIGKILL);
+		}
 		kill(pidInit, SIGKILL);
+		removeRuntimeStateFiles();
 		return 0;
 	}
 
@@ -196,13 +221,15 @@ int main(int argc, char ** argv)
 		setupWorkdir();
 		pidInit = spawnInitProcess();
 		putInitPid(pidInit);
-		
-		// Wait until shellspawn starts
-		for (int i = 0; i < 15; i++)
+		if (!rootless)
 		{
-			if (access(socketPath, F_OK) == 0)
-				break;
-			sleep(1);
+			// The namespace-based launcher keeps its existing bounded startup wait.
+			for (int i = 0; i < 15; i++)
+			{
+				if (access(socketPath, F_OK) == 0)
+					break;
+				sleep(1);
+			}
 		}
 	}
 
@@ -218,9 +245,9 @@ int main(int argc, char ** argv)
 	{
 		// Spawn the shell
 		if (argc > 2)
-			spawnShell((const char**) &argv[2]);
+			spawnShell(pidInit, (const char**) &argv[2]);
 		else
-			spawnShell(NULL);
+			spawnShell(pidInit, NULL);
 	}
 	else
 	{
@@ -250,9 +277,9 @@ int main(int argc, char ** argv)
 		argv[argvIndex] = fullPath;
 
 		if (doExec)
-			spawnBinary(argv[argvIndex], (const char**) &argv[argvIndex]);
+			spawnBinary(pidInit, argv[argvIndex], (const char**) &argv[argvIndex]);
 		else
-			spawnShell((const char**) &argv[argvIndex]);
+			spawnShell(pidInit, (const char**) &argv[argvIndex]);
 	}
 
 	return 0;
@@ -459,12 +486,19 @@ static void shellLoop(int sockfd, int master)
 
 		if (pfds[0].revents & (POLLHUP | POLLIN))
 		{
-			int exitStatus;
-			
-			if (read(sockfd, &exitStatus, sizeof(int)) == sizeof(int))
-				exit(exitStatus);
-			else
+			struct shellspawn_result result;
+			if (read(sockfd, &result, sizeof(result)) != sizeof(result))
 				exit(1);
+			if (result.kind == SHELLSPAWN_RESULT_EXIT)
+				exit(result.value);
+			if (result.kind == SHELLSPAWN_RESULT_ERROR)
+			{
+				fprintf(stderr, "shellspawn failed (errno=%d): %s\n", result.value,
+					strerror(result.value));
+				exit(1);
+			}
+		fprintf(stderr, "shellspawn returned an unknown result kind: %u\n", result.kind);
+		exit(1);
 		}
 	}
 }
@@ -569,10 +603,21 @@ static size_t escapeQuotes(char *dest, const char *src)
 	return len;
 }
 
-int connectToShellspawn(void)
+static bool rootlessInitIsRunning(pid_t pidInit)
+{
+	if (pidInit <= 0)
+		return false;
+
+	if (kill(pidInit, 0) == 0)
+		return true;
+
+	return errno == EPERM;
+}
+
+int connectToShellspawn(pid_t pidInit)
 {
 	struct sockaddr_un addr;
-	int sockfd;
+	struct timespec started;
 
 	// Connect to the shellspawn daemon in the container
 	addr.sun_family = AF_UNIX;
@@ -584,21 +629,56 @@ int connectToShellspawn(void)
 #else
 	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s"  SHELLSPAWN_SOCKPATH, prefix);
 #endif
-
-	sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sockfd == -1)
+	if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
 	{
-		fprintf(stderr, "Error creating a unix domain socket: %s\n", strerror(errno));
+		fprintf(stderr, "Unable to start rootless shellspawn readiness timer: %s\n", strerror(errno));
 		exit(1);
 	}
 
-	if (connect(sockfd, (struct sockaddr*) &addr, sizeof(addr)) == -1)
+	for (;;)
 	{
-		fprintf(stderr, "Error connecting to shellspawn in the container (%s): %s\n", addr.sun_path, strerror(errno));
-		exit(1);
-	}
+		int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (sockfd == -1)
+		{
+			fprintf(stderr, "Error creating a unix domain socket: %s\n", strerror(errno));
+			exit(1);
+		}
 
-	return sockfd;
+		if (connect(sockfd, (struct sockaddr*) &addr, sizeof(addr)) == 0)
+		{
+			return sockfd;
+		}
+
+		int error = errno;
+		close(sockfd);
+		if (!rootlessModeEnabled() || (error != ENOENT && error != ECONNREFUSED))
+		{
+			fprintf(stderr, "Error connecting to shellspawn in the container (%s): %s\n", addr.sun_path, strerror(error));
+			exit(1);
+		}
+
+		if (!rootlessInitIsRunning(pidInit))
+		{
+			fprintf(stderr, "Rootless init process %d exited before shellspawn became ready (%s)\n", pidInit, addr.sun_path);
+			exit(1);
+		}
+
+		struct timespec now;
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		{
+			fprintf(stderr, "Unable to read rootless shellspawn readiness timer: %s\n", strerror(errno));
+			exit(1);
+		}
+		long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L
+			+ (now.tv_nsec - started.tv_nsec) / 1000000L;
+		if (elapsed_ms >= ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS)
+		{
+			fprintf(stderr, "Rootless shellspawn did not become ready within %dms (%s)\n",
+				ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS, addr.sun_path);
+			exit(1);
+		}
+		poll(NULL, 0, 100);
+	}
 }
 
 void setupShellspawnEnv(int sockfd)
@@ -698,7 +778,7 @@ void spawnGo(int sockfd, int fds[3], int master)
 	close(sockfd);
 }
 
-void spawnShell(const char** argv)
+void spawnShell(pid_t pidInit, const char** argv)
 {
 	size_t total_len = 0;
 	int count;
@@ -726,7 +806,7 @@ void spawnShell(const char** argv)
 	else
 		buffer = NULL;
 
-	sockfd = connectToShellspawn();
+	sockfd = connectToShellspawn(pidInit);
 
 	setupShellspawnEnv(sockfd);
 
@@ -745,12 +825,12 @@ void spawnShell(const char** argv)
 	spawnGo(sockfd, fds, master);
 }
 
-void spawnBinary(const char* binary, const char** argv)
+void spawnBinary(pid_t pidInit, const char* binary, const char** argv)
 {
 	int fds[3], master;
 	int sockfd;
 
-	sockfd = connectToShellspawn();
+	sockfd = connectToShellspawn(pidInit);
 	setupShellspawnEnv(sockfd);
 
 	pushShellspawnCommand(sockfd, SHELLSPAWN_SETEXEC, binary);

@@ -38,6 +38,11 @@ enum {
 	SHELLSPAWN_SETEXEC, // set the executable to spawn (instead of a shell). must be given before any ADDARG commands.
 };
 
+enum shellspawn_result_kind {
+	SHELLSPAWN_RESULT_EXIT = 1,
+	SHELLSPAWN_RESULT_ERROR,
+};
+
 struct __attribute__((packed)) shellspawn_cmd
 {
 	shellspawn_cmd_type_t cmd;
@@ -45,5 +50,10 @@ struct __attribute__((packed)) shellspawn_cmd
 	char data[];
 };
 
-#endif
+struct __attribute__((packed)) shellspawn_result
+{
+	unsigned short kind;
+	int value;
+};
 
+#endif
