@@ -94,38 +94,6 @@ static inline void *align_16(uintptr_t ptr) {
 	return (void *) ((uintptr_t) ptr & ~(uintptr_t) 15);
 }
 
-static dthread_t dthread_structure_init(dthread_t dthread, size_t guard_size, void* stack_addr, size_t stack_size, void* base_addr, size_t total_size) {
-	// the pthread signature is the address of the pthread XORed with the "pointer munge" token passed in by the kernel
-	// since the LKM doesn't pass in a token, it's always zero, so the signature is equal to just the address
-	dthread->sig = (uintptr_t)dthread;
-
-	dthread->tsd[DTHREAD_TSD_SLOT_PTHREAD_SELF] = dthread;
-	dthread->tsd[DTHREAD_TSD_SLOT_ERRNO] = &dthread->err_no;
-	dthread->tsd[DTHREAD_TSD_SLOT_PTHREAD_QOS_CLASS] = (void*)(uintptr_t)(DTHREAD_DEFAULT_PRIORITY);
-	dthread->tsd[DTHREAD_TSD_SLOT_PTR_MUNGE] = 0;
-	dthread->tl_has_custom_stack = 0;
-	dthread->lock = (darwin_os_unfair_lock){0};
-
-	dthread->stackaddr = stack_addr;
-	dthread->stackbottom = (char*)stack_addr - stack_size;
-	dthread->freeaddr = base_addr;
-	dthread->freesize = total_size;
-	dthread->guardsize = guard_size;
-
-	dthread->cancel_state = DTHREAD_CANCEL_ENABLE | DTHREAD_CANCEL_DEFERRED;
-
-	// technically, these next values are defaults; we don't have a way to get more info from the user
-	//
-	// it's not too important since the only cases where we initialize the dthread structure ourselves is when we're working with workqueues,
-	// and those initialize their own dthread structures when they get them
-
-	dthread->tl_joinable = 1;
-	dthread->inherit = DTHREAD_INHERIT_SCHED;
-	dthread->tl_policy = DARWIN_POLICY_TIMESHARE;
-
-	return dthread;
-};
-
 static dthread_t dthread_structure_allocate(size_t stack_size, size_t guard_size, void** stack_addr) {
 	size_t total_size = guard_size + stack_size + sizeof(struct _dthread);
 
@@ -152,8 +120,20 @@ static dthread_t dthread_structure_allocate(size_t stack_size, size_t guard_size
 	// zero-out the entrire dthread structure
 	memset(dthread, 0, sizeof(struct _dthread));
 
-	return dthread_structure_init(dthread, guard_size, *stack_addr, stack_size, base_addr, total_size);
+	return __darling_dthread_initialize(dthread, guard_size, *stack_addr, stack_size, base_addr, total_size);
 };
+
+static struct _dthread main_dthread;
+
+int __darling_thread_initialize_main(void* stack_top, size_t stack_size,
+		uint32_t mach_thread_self)
+{
+	memset(&main_dthread, 0, sizeof(main_dthread));
+	__darling_dthread_initialize(&main_dthread, 0, stack_top, stack_size, NULL, 0);
+	main_dthread.tsd[DTHREAD_TSD_SLOT_MACH_THREAD_SELF] =
+		(void*)(uintptr_t)mach_thread_self;
+	return __darling_dthread_set_tsd_base(&main_dthread.tsd[0]);
+}
 
 void* __darling_thread_create(unsigned long stack_size, unsigned long pth_obj_size,
 				void* entry_point, uintptr_t real_entry_point,

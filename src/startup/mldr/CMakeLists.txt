@@ -21,6 +21,7 @@ set(mldr_sources
 	glibc_fork_reset.c
 	commpage.c
 	elfcalls/elfcalls.c
+	elfcalls/dthreads.c
 	elfcalls/threads.c
 )
 
