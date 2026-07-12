@@ -256,6 +256,49 @@ if(TARGET drift_gate)
 	endforeach()
 endif()
 
+# Rootless bootstrap is a source-owned component, not a list maintained by
+# external test runners. Keep each guest entrypoint paired with the CMake target
+# that produces it; the runtime runner consumes the generated manifest and
+# resolves its Mach-O library closure from the resulting build tree.
+set(DARLING_ROOTLESS_BOOTSTRAP_TARGETS
+	darling
+	mldr
+	launchd
+	launchctl
+	shellspawn
+	vchroot
+	system_loader
+	darlingserver
+	system_kernel
+	objc
+	resolv-darwin
+	CoreFoundation
+)
+foreach(_bootstrap_target IN LISTS DARLING_ROOTLESS_BOOTSTRAP_TARGETS)
+	if(NOT TARGET ${_bootstrap_target})
+		message(FATAL_ERROR "rootless bootstrap target is unavailable: ${_bootstrap_target}")
+	endif()
+endforeach()
+add_custom_target(rootless_bootstrap DEPENDS ${DARLING_ROOTLESS_BOOTSTRAP_TARGETS})
+file(GENERATE
+	OUTPUT "${CMAKE_BINARY_DIR}/darling-rootless-bootstrap.json"
+	CONTENT [=[
+{
+  "schema": 1,
+  "entrypoints": [
+    {"target": "darling", "guest_path": "/bin/darling", "host_path": "$<TARGET_FILE:darling>"},
+    {"target": "mldr", "guest_path": "/usr/libexec/darling/mldr", "host_path": "$<TARGET_FILE:mldr>"},
+    {"target": "launchd", "guest_path": "/sbin/launchd", "host_path": "$<TARGET_FILE:launchd>"},
+    {"target": "launchctl", "guest_path": "/bin/launchctl", "host_path": "$<TARGET_FILE:launchctl>"},
+    {"target": "shellspawn", "guest_path": "/usr/libexec/shellspawn", "host_path": "$<TARGET_FILE:shellspawn>"},
+    {"target": "vchroot", "guest_path": "/usr/libexec/darling/vchroot", "host_path": "$<TARGET_FILE:vchroot>"},
+    {"target": "system_loader", "guest_path": "/usr/lib/dyld", "host_path": "$<TARGET_FILE:system_loader>"},
+    {"target": "darlingserver", "guest_path": "/bin/darlingserver", "host_path": "$<TARGET_FILE:darlingserver>"}
+  ]
+}
+]=]
+)
+
 install(DIRECTORY DESTINATION libexec/darling/private)
 install(DIRECTORY DESTINATION libexec/darling/private/etc)
 install(DIRECTORY DESTINATION libexec/darling/private/var)

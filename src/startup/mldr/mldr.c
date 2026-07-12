@@ -36,6 +36,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include "loader.h"
 #include "glibc_fork_reset.h"
 #include "stack_mapping.h"
+#include "elfcalls/threads.h"
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -281,6 +282,17 @@ int main(int argc, char** argv, char** envp)
 		exit(1);
 	}
 
+	uint32_t main_thread_port = 0;
+	if (dserver_rpc_explicit_thread_self_trap(mldr_load_results.kernfd,
+			&main_thread_port) < 0) {
+		fprintf(stderr, "Failed to get main thread port from darlingserver\n");
+		exit(1);
+	}
+	if (__darling_thread_initialize_main((void*)mldr_load_results.stack_top,
+			mldr_load_results.stack_size, main_thread_port) < 0) {
+		fprintf(stderr, "Failed to initialize main thread TSD\n");
+		exit(1);
+	}
 	__mldr_main_stack_top = (void*)mldr_load_results.stack_top;
 
 	start_thread(&mldr_load_results);
@@ -543,12 +555,18 @@ static void process_special_env(struct load_results* lr) {
 		lr->root_path = root_path;
 		lr->root_path_length = strlen(lr->root_path);
 	}
+
+	str = getenv("__mldr_rootless_pid1");
+	if (str != NULL && strcmp(str, "1") == 0) {
+		lr->rootless_init = true;
+	}
 };
 
 static void unset_special_env() {
 	unsetenv("__mldr_bprefs");
 	unsetenv("__mldr_sockpath");
 	unsetenv("__mldr_lifetime_pipe");
+	unsetenv("__mldr_rootless_pid1");
 };
 
 typedef struct socket_bitmap {

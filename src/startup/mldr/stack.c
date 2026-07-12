@@ -42,6 +42,7 @@
 #define __user
 
 #define EXECUTABLE_PATH "executable_path="
+#define ROOTLESS_INIT_ENV "DARLING_ROOTLESS=1"
 
 #define __put_user(value, pointer) ({ \
 		__typeof__(value) _tmpval = (value); \
@@ -70,6 +71,7 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	char __user* elfcalls_user;
 	char elfcalls[27];
 	char __user* applep_contents[4];
+	const size_t rootless_envc = lr->rootless_init ? 1 : 0;
 
 #define user_long_count(_val) (((_val) + (sizeof(user_long_t) - 1)) / sizeof(user_long_t))
 
@@ -110,10 +112,11 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	// 1 pointer for the mach header
 	// 1 user_long_t for the argument count
 	// `argc`-count pointers for arguments (+1 for NULL)
-	// `envc`-count pointers for env vars (+1 for NULL)
+	// `envc`-count pointers for env vars, plus the rootless-init marker when
+	// mldr was invoked by the rootless bootstrap (+1 for NULL)
 	// `sizeof(applep_contents) / sizeof(*applep_contents)`-count pointers for applep arguments (already includes NULL)
 	// space for exepath, kernfd, and elfcalls
-	sp -= 1 + 1 + (lr->argc + 1) + (lr->envc + 1) + (sizeof(applep_contents) / sizeof(*applep_contents)) + user_long_count(exepath_len + sizeof(EXECUTABLE_PATH) + sizeof(kernfd) + sizeof(elfcalls));
+	sp -= 1 + 1 + (lr->argc + 1) + (lr->envc + rootless_envc + 1) + (sizeof(applep_contents) / sizeof(*applep_contents)) + user_long_count(exepath_len + sizeof(EXECUTABLE_PATH) + sizeof(kernfd) + sizeof(elfcalls));
 
 	exepath_user = (char __user*) lr->stack_top - exepath_len - sizeof(EXECUTABLE_PATH);
 	memcpy(exepath_user, EXECUTABLE_PATH, sizeof(EXECUTABLE_PATH)-1);
@@ -184,6 +187,12 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 		if (__put_user((user_long_t) lr->envp[i], envp++))
 		{
 			fprintf(stderr, "Failed to copy an environment variable pointer to stack\n");
+			exit(1);
+		}
+	}
+	if (lr->rootless_init) {
+		if (__put_user((user_long_t) ROOTLESS_INIT_ENV, envp++)) {
+			fprintf(stderr, "Failed to add the rootless init environment variable to the stack\n");
 			exit(1);
 		}
 	}

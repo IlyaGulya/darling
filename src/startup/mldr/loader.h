@@ -15,6 +15,7 @@ struct load_results {
 
 	unsigned long vm_addr_max;
 	bool _32on64;
+	bool rootless_init;
 	unsigned long base;
 	uint32_t bprefs[4];
 	char* root_path;
