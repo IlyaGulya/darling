@@ -300,6 +300,7 @@ bool darling_rootless = rootless_mode_enabled();
 	jobmgr_init(sflag);
 
 	launchd_runtime_init2();
+	jobmgr_schedule_rootless_bootstrapper();
 	launchd_runtime();
 }
 
