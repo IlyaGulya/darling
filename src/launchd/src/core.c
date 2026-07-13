@@ -436,6 +436,7 @@ struct jobmgr_s {
 static jobmgr_t _s_xpc_system_domain;
 static LIST_HEAD(, jobmgr_s) _s_xpc_user_domains;
 static LIST_HEAD(, jobmgr_s) _s_xpc_session_domains;
+static job_t _rootless_system_bootstrapper;
 
 #define jobmgr_assumes(jm, e) os_assumes_ctx(jobmgr_log_bug, jm, (e))
 #define jobmgr_assumes_zero(jm, e) os_assumes_zero_ctx(jobmgr_log_bug, jm, (e))
@@ -4309,6 +4310,12 @@ jobmgr_callback(void *obj, struct kevent *kev)
 	case EVFILT_TIMER:
 		if (kev->ident == (uintptr_t)&sorted_calendar_events) {
 			calendarinterval_callback();
+		} else if (kev->ident == (uintptr_t)&_rootless_system_bootstrapper) {
+			job_t bootstrapper = _rootless_system_bootstrapper;
+			_rootless_system_bootstrapper = NULL;
+			if (bootstrapper != NULL) {
+				(void)jobmgr_assumes(jm, job_dispatch(bootstrapper, true) != NULL);
+			}
 		} else if (kev->ident == (uintptr_t)jm) {
 			jobmgr_log(jm, LOG_DEBUG, "Shutdown timer firing.");
 			jobmgr_still_alive_with_check(jm);
@@ -6926,7 +6933,13 @@ jobmgr_new(jobmgr_t jm, mach_port_t requestorport, mach_port_t transfer_port, bo
 		bootstrapper->asport = asport;
 
 		jobmgr_log(jmr, LOG_DEBUG, "Bootstrapping new job manager with audit session %u", asport);
-		(void)jobmgr_assumes(jmr, job_dispatch(bootstrapper, true) != NULL);
+		if (darling_rootless && jmr == root_jobmgr &&
+			name != NULL && strcmp(name, VPROCMGR_SESSION_SYSTEM) == 0) {
+			/* The rootless system manager is still assembling its runtime here. */
+			_rootless_system_bootstrapper = bootstrapper;
+		} else {
+			(void)jobmgr_assumes(jmr, job_dispatch(bootstrapper, true) != NULL);
+		}
 	} else {
 		jmr->req_asport = asport;
 	}
@@ -11796,6 +11809,19 @@ jobmgr_init(bool sflag)
 		}
 	}
 	s_no_hang_fd = _fd(s_no_hang_fd);
+}
+
+void
+jobmgr_schedule_rootless_bootstrapper(void)
+{
+	if (!darling_rootless || _rootless_system_bootstrapper == NULL) {
+		return;
+	}
+
+	/* Let launchd finish runtime setup before the bootstrapper can submit jobs. */
+	(void)jobmgr_assumes_zero_p(root_jobmgr, kevent_mod(
+			(uintptr_t)&_rootless_system_bootstrapper,
+			EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS, 1, root_jobmgr));
 }
 
 size_t
