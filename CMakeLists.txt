@@ -280,23 +280,35 @@ foreach(_bootstrap_target IN LISTS DARLING_ROOTLESS_BOOTSTRAP_TARGETS)
 	endif()
 endforeach()
 add_custom_target(rootless_bootstrap DEPENDS ${DARLING_ROOTLESS_BOOTSTRAP_TARGETS})
+set(_rootless_bootstrap_resource_dir "${CMAKE_BINARY_DIR}/rootless-bootstrap-resources")
+file(MAKE_DIRECTORY
+	"${_rootless_bootstrap_resource_dir}/System/Library/LaunchDaemons"
+)
+configure_file(
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/shellspawn/org.darlinghq.shellspawn.plist"
+	"${_rootless_bootstrap_resource_dir}/System/Library/LaunchDaemons/org.darlinghq.shellspawn.plist"
+	COPYONLY
+)
 file(GENERATE
 	OUTPUT "${CMAKE_BINARY_DIR}/darling-rootless-bootstrap.json"
-	CONTENT [=[
-{
-  "schema": 1,
-  "entrypoints": [
-    {"target": "darling", "guest_path": "/bin/darling", "host_path": "$<TARGET_FILE:darling>"},
-    {"target": "mldr", "guest_path": "/usr/libexec/darling/mldr", "host_path": "$<TARGET_FILE:mldr>"},
-    {"target": "launchd", "guest_path": "/sbin/launchd", "host_path": "$<TARGET_FILE:launchd>"},
-    {"target": "launchctl", "guest_path": "/bin/launchctl", "host_path": "$<TARGET_FILE:launchctl>"},
-    {"target": "shellspawn", "guest_path": "/usr/libexec/shellspawn", "host_path": "$<TARGET_FILE:shellspawn>"},
-    {"target": "vchroot", "guest_path": "/usr/libexec/darling/vchroot", "host_path": "$<TARGET_FILE:vchroot>"},
-    {"target": "system_loader", "guest_path": "/usr/lib/dyld", "host_path": "$<TARGET_FILE:system_loader>"},
-    {"target": "darlingserver", "guest_path": "/bin/darlingserver", "host_path": "$<TARGET_FILE:darlingserver>"}
+	CONTENT
+"{
+  \"schema\": 1,
+  \"entrypoints\": [
+    {\"target\": \"darling\", \"guest_path\": \"/bin/darling\", \"host_path\": \"$<TARGET_FILE:darling>\"},
+    {\"target\": \"mldr\", \"guest_path\": \"/usr/libexec/darling/mldr\", \"host_path\": \"$<TARGET_FILE:mldr>\"},
+    {\"target\": \"launchd\", \"guest_path\": \"/sbin/launchd\", \"host_path\": \"$<TARGET_FILE:launchd>\"},
+    {\"target\": \"launchctl\", \"guest_path\": \"/bin/launchctl\", \"host_path\": \"$<TARGET_FILE:launchctl>\"},
+    {\"target\": \"shellspawn\", \"guest_path\": \"/usr/libexec/shellspawn\", \"host_path\": \"$<TARGET_FILE:shellspawn>\"},
+    {\"target\": \"vchroot\", \"guest_path\": \"/usr/libexec/darling/vchroot\", \"host_path\": \"$<TARGET_FILE:vchroot>\"},
+    {\"target\": \"system_loader\", \"guest_path\": \"/usr/lib/dyld\", \"host_path\": \"$<TARGET_FILE:system_loader>\"},
+    {\"target\": \"darlingserver\", \"guest_path\": \"/bin/darlingserver\", \"host_path\": \"$<TARGET_FILE:darlingserver>\"}
+  ],
+  \"resources\": [
+    {\"target\": \"shellspawn_launchd_plist\", \"guest_path\": \"/System/Library/LaunchDaemons/org.darlinghq.shellspawn.plist\", \"host_path\": \"${_rootless_bootstrap_resource_dir}/System/Library/LaunchDaemons/org.darlinghq.shellspawn.plist\"}
   ]
 }
-]=]
+"
 )
 
 install(DIRECTORY DESTINATION libexec/darling/private)
