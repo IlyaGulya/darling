@@ -60,6 +60,23 @@ static bool rootlessModeEnabled(void)
 	return value != NULL && value[0] == '1' && value[1] == '\0';
 }
 
+static long rootlessShellspawnReadyTimeoutMs(void)
+{
+	const char* value = getenv("DARLING_ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS");
+	if (value == NULL || *value == '\0')
+		return ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS;
+
+	char* end = NULL;
+	errno = 0;
+	long timeout_ms = strtol(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || timeout_ms < 1000 || timeout_ms > 300000)
+	{
+		fprintf(stderr, "Invalid DARLING_ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS: %s\n", value);
+		exit(1);
+	}
+	return timeout_ms;
+}
+
 static void removeRuntimeStateFiles(void)
 {
 	char initPidPath[4096];
@@ -618,6 +635,7 @@ int connectToShellspawn(pid_t pidInit)
 {
 	struct sockaddr_un addr;
 	struct timespec started;
+	const long ready_timeout_ms = rootlessShellspawnReadyTimeoutMs();
 
 	// Connect to the shellspawn daemon in the container
 	addr.sun_family = AF_UNIX;
@@ -671,10 +689,10 @@ int connectToShellspawn(pid_t pidInit)
 		}
 		long elapsed_ms = (now.tv_sec - started.tv_sec) * 1000L
 			+ (now.tv_nsec - started.tv_nsec) / 1000000L;
-		if (elapsed_ms >= ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS)
+		if (elapsed_ms >= ready_timeout_ms)
 		{
-			fprintf(stderr, "Rootless shellspawn did not become ready within %dms (%s)\n",
-				ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS, addr.sun_path);
+			fprintf(stderr, "Rootless shellspawn did not become ready within %ldms (%s)\n",
+				ready_timeout_ms, addr.sun_path);
 			exit(1);
 		}
 		poll(NULL, 0, 100);
