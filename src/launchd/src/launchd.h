@@ -31,6 +31,7 @@ struct kevent;
 struct conncb;
 
 extern bool pid1_magic;
+extern bool darling_rootless;
 extern bool launchd_shutting_down;
 extern bool fake_launchd_shutting_down;
 extern bool network_up;
