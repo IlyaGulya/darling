@@ -335,6 +335,8 @@ file(GENERATE
 # component. It may be expensive, but it must not enlarge the ordinary
 # rootless regression provider. Keep binary entrypoints and non-Mach-O data in
 # this manifest so West never has to duplicate install rules by hand.
+option(DARLING_ROOTLESS_TOOLCHAIN
+	"Build the source-owned rootless guest-toolchain component" OFF)
 set(DARLING_ROOTLESS_TOOLCHAIN_TARGETS
 	installer
 	installer_archive_path_test
@@ -343,16 +345,21 @@ set(DARLING_ROOTLESS_TOOLCHAIN_TARGETS
 	perl5.28
 	CFNetwork
 	CoreFoundation_x86_64
-	security
+	securitytool_macos
 	coretls_cfhelpers
 )
-set(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE TRUE)
-foreach(_toolchain_target IN LISTS DARLING_ROOTLESS_TOOLCHAIN_TARGETS)
-	if(NOT TARGET ${_toolchain_target})
-		set(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE FALSE)
+if(DARLING_ROOTLESS_TOOLCHAIN)
+	set(_missing_toolchain_targets)
+	foreach(_toolchain_target IN LISTS DARLING_ROOTLESS_TOOLCHAIN_TARGETS)
+		if(NOT TARGET ${_toolchain_target})
+			list(APPEND _missing_toolchain_targets ${_toolchain_target})
+		endif()
+	endforeach()
+	if(_missing_toolchain_targets)
+		message(FATAL_ERROR
+			"rootless toolchain component requested but source targets are unavailable: "
+			"${_missing_toolchain_targets}")
 	endif()
-endforeach()
-if(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE)
 	add_custom_target(rootless_toolchain DEPENDS ${DARLING_ROOTLESS_TOOLCHAIN_TARGETS})
 	set(_rootless_toolchain_resource_dir "${CMAKE_BINARY_DIR}/rootless-toolchain-resources")
 	file(MAKE_DIRECTORY
@@ -379,7 +386,8 @@ if(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE)
     {\"target\": \"installer_archive_path_test\", \"guest_path\": \"/usr/libexec/installer_archive_path_test\", \"host_path\": \"$<TARGET_FILE:installer_archive_path_test>\"},
     {\"target\": \"perl\", \"guest_path\": \"/usr/bin/perl\", \"host_path\": \"$<TARGET_FILE:perl>\"},
     {\"target\": \"perl5.18\", \"guest_path\": \"/usr/bin/perl5.18\", \"host_path\": \"$<TARGET_FILE:perl5.18>\"},
-    {\"target\": \"perl5.28\", \"guest_path\": \"/usr/bin/perl5.28\", \"host_path\": \"$<TARGET_FILE:perl5.28>\"}
+    {\"target\": \"perl5.28\", \"guest_path\": \"/usr/bin/perl5.28\", \"host_path\": \"$<TARGET_FILE:perl5.28>\"},
+    {\"target\": \"security\", \"guest_path\": \"/usr/bin/security\", \"host_path\": \"$<TARGET_FILE:securitytool_macos>\"}
   ],
   \"resources\": [
     {\"target\": \"installer_man\", \"guest_path\": \"/usr/share/man/man8/installer.8\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/share/man/man8/installer.8\"},
@@ -388,8 +396,6 @@ if(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE)
 }
 "
 	)
-else()
-	message(STATUS "rootless toolchain component disabled: source targets are unavailable")
 endif()
 
 install(DIRECTORY DESTINATION libexec/darling/private)
