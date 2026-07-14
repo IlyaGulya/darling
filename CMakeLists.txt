@@ -321,7 +321,6 @@ option(DARLING_ROOTLESS_TOOLCHAIN
 	"Build the source-owned rootless guest-toolchain component" OFF)
 set(DARLING_ROOTLESS_TOOLCHAIN_TARGETS
 	installer
-	installer_archive_path_test
 	perl
 	perl5.18
 	perl5.28
@@ -365,7 +364,6 @@ if(DARLING_ROOTLESS_TOOLCHAIN)
   \"schema\": 1,
   \"entrypoints\": [
     {\"target\": \"installer\", \"guest_path\": \"/usr/bin/installer\", \"host_path\": \"$<TARGET_FILE:installer>\"},
-    {\"target\": \"installer_archive_path_test\", \"guest_path\": \"/usr/libexec/installer_archive_path_test\", \"host_path\": \"$<TARGET_FILE:installer_archive_path_test>\"},
     {\"target\": \"perl\", \"guest_path\": \"/usr/bin/perl\", \"host_path\": \"$<TARGET_FILE:perl>\"},
     {\"target\": \"perl5.18\", \"guest_path\": \"/usr/bin/perl5.18\", \"host_path\": \"$<TARGET_FILE:perl5.18>\"},
     {\"target\": \"perl5.28\", \"guest_path\": \"/usr/bin/perl5.28\", \"host_path\": \"$<TARGET_FILE:perl5.28>\"},
