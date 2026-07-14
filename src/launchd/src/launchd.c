@@ -81,6 +81,7 @@
 #include "runtime.h"
 #include "core.h"
 #include "ipc.h"
+#include "rootless_runtime.h"
 
 #define LAUNCHD_CONF ".launchd.conf"
 
@@ -145,6 +146,11 @@ main(int argc, char *const *argv)
 	bool sflag = false;
 	int ch;
 	rootless_bootstrap_environment();
+	if (getenv("DARLING_ROOTLESS") != NULL &&
+		strcmp(getenv("DARLING_ROOTLESS"), "1") == 0 &&
+		rootless_runtime_prepare() != 0) {
+		return EXIT_FAILURE;
+	}
 
 	/* This needs to be cleaned up. Currently, we risk tripping assumes() macros
 	 * before we've properly set things like launchd's log database paths, the

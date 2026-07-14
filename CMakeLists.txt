@@ -291,6 +291,7 @@ set(DARLING_ROOTLESS_BOOTSTRAP_TARGETS
 	objc
 	resolv-darwin
 	CoreFoundation
+	bash
 )
 foreach(_bootstrap_target IN LISTS DARLING_ROOTLESS_BOOTSTRAP_TARGETS)
 	if(NOT TARGET ${_bootstrap_target})
@@ -320,7 +321,8 @@ file(GENERATE
     {\"target\": \"shellspawn\", \"guest_path\": \"/usr/libexec/shellspawn\", \"host_path\": \"$<TARGET_FILE:shellspawn>\"},
     {\"target\": \"vchroot\", \"guest_path\": \"/usr/libexec/darling/vchroot\", \"host_path\": \"$<TARGET_FILE:vchroot>\"},
     {\"target\": \"system_loader\", \"guest_path\": \"/usr/lib/dyld\", \"host_path\": \"$<TARGET_FILE:system_loader>\"},
-    {\"target\": \"darlingserver\", \"guest_path\": \"/bin/darlingserver\", \"host_path\": \"$<TARGET_FILE:darlingserver>\"}
+    {\"target\": \"darlingserver\", \"guest_path\": \"/bin/darlingserver\", \"host_path\": \"$<TARGET_FILE:darlingserver>\"},
+    {\"target\": \"bash\", \"guest_path\": \"/bin/bash\", \"host_path\": \"$<TARGET_FILE:bash>\"}
   ],
   \"resources\": [
     {\"target\": \"shellspawn_launchd_plist\", \"guest_path\": \"/System/Library/LaunchDaemons/org.darlinghq.shellspawn.plist\", \"host_path\": \"${_rootless_bootstrap_resource_dir}/System/Library/LaunchDaemons/org.darlinghq.shellspawn.plist\"}
@@ -328,6 +330,67 @@ file(GENERATE
 }
 "
 )
+
+# Guest toolchain provisioning is deliberately a separate source-owned
+# component. It may be expensive, but it must not enlarge the ordinary
+# rootless regression provider. Keep binary entrypoints and non-Mach-O data in
+# this manifest so West never has to duplicate install rules by hand.
+set(DARLING_ROOTLESS_TOOLCHAIN_TARGETS
+	installer
+	installer_archive_path_test
+	perl
+	perl5.18
+	perl5.28
+	CFNetwork
+	CoreFoundation_x86_64
+	security
+	coretls_cfhelpers
+)
+set(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE TRUE)
+foreach(_toolchain_target IN LISTS DARLING_ROOTLESS_TOOLCHAIN_TARGETS)
+	if(NOT TARGET ${_toolchain_target})
+		set(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE FALSE)
+	endif()
+endforeach()
+if(DARLING_ROOTLESS_TOOLCHAIN_AVAILABLE)
+	add_custom_target(rootless_toolchain DEPENDS ${DARLING_ROOTLESS_TOOLCHAIN_TARGETS})
+	set(_rootless_toolchain_resource_dir "${CMAKE_BINARY_DIR}/rootless-toolchain-resources")
+	file(MAKE_DIRECTORY
+		"${_rootless_toolchain_resource_dir}/usr/share/man/man8"
+		"${_rootless_toolchain_resource_dir}/usr/bin"
+	)
+	configure_file(
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/external/installer/installer.8"
+		"${_rootless_toolchain_resource_dir}/usr/share/man/man8/installer.8"
+		COPYONLY
+	)
+	configure_file(
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/external/perl/fix/dummy.pl"
+		"${_rootless_toolchain_resource_dir}/usr/bin/c2ph"
+		COPYONLY
+	)
+	file(GENERATE
+		OUTPUT "${CMAKE_BINARY_DIR}/darling-rootless-toolchain.json"
+		CONTENT
+"{
+  \"schema\": 1,
+  \"entrypoints\": [
+    {\"target\": \"installer\", \"guest_path\": \"/usr/bin/installer\", \"host_path\": \"$<TARGET_FILE:installer>\"},
+    {\"target\": \"installer_archive_path_test\", \"guest_path\": \"/usr/libexec/installer_archive_path_test\", \"host_path\": \"$<TARGET_FILE:installer_archive_path_test>\"},
+    {\"target\": \"perl\", \"guest_path\": \"/usr/bin/perl\", \"host_path\": \"$<TARGET_FILE:perl>\"},
+    {\"target\": \"perl5.18\", \"guest_path\": \"/usr/bin/perl5.18\", \"host_path\": \"$<TARGET_FILE:perl5.18>\"},
+    {\"target\": \"perl5.28\", \"guest_path\": \"/usr/bin/perl5.28\", \"host_path\": \"$<TARGET_FILE:perl5.28>\"}
+  ],
+  \"resources\": [
+    {\"target\": \"installer_man\", \"guest_path\": \"/usr/share/man/man8/installer.8\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/share/man/man8/installer.8\"},
+    {\"target\": \"perl_c2ph\", \"guest_path\": \"/usr/bin/c2ph\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/bin/c2ph\"}
+  ]
+}
+"
+	)
+else()
+	message(STATUS "rootless toolchain component disabled: source targets are unavailable")
+endif()
 
 install(DIRECTORY DESTINATION libexec/darling/private)
 install(DIRECTORY DESTINATION libexec/darling/private/etc)

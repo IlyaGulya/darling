@@ -40,6 +40,7 @@ set(launchd_sources
 	launchd.c
 	log.c
 	runtime.c
+	rootless_runtime.c
 	${CMAKE_CURRENT_BINARY_DIR}/jobServer.c
 	${CMAKE_CURRENT_BINARY_DIR}/helperUser.c
 	${CMAKE_CURRENT_BINARY_DIR}/internalServer.c
@@ -56,4 +57,3 @@ add_darling_executable(launchd ${launchd_sources})
 target_link_libraries(launchd bsm.0)
 
 install(TARGETS launchd DESTINATION libexec/darling/sbin)
-
