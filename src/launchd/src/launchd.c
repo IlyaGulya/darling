@@ -137,6 +137,7 @@ bool network_up;
 uid_t launchd_uid;
 FILE *launchd_console = NULL;
 int32_t launchd_sync_frequency = 30;
+bool darling_rootless;
 
 int
 main(int argc, char *const *argv)
@@ -184,7 +185,7 @@ main(int argc, char *const *argv)
 		}
 	}
 
-bool darling_rootless = rootless_mode_enabled();
+darling_rootless = rootless_mode_enabled();
 
 	if (!darling_rootless && getpid() != 1 && getppid() != 1) {
 		fprintf(stderr, "%s: This program is not meant to be run directly.\n", getprogname());
