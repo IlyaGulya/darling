@@ -36,6 +36,16 @@ target_link_options(mldr PRIVATE -pthread)
 
 target_link_libraries(mldr PRIVATE -lrt -ldl mldr_dserver_rpc -lm)
 
+# This is deliberately separate from mldr: it executes the same private hook
+# implementation that generated RPC wrappers include, without adding a public
+# mldr API or a second disconnect classifier.
+add_executable(mldr_dserver_rpc_disconnect_status_test EXCLUDE_FROM_ALL
+	tests/rpc_disconnect_status.c)
+add_dependencies(mldr_dserver_rpc_disconnect_status_test rtsig_h)
+target_include_directories(mldr_dserver_rpc_disconnect_status_test PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}
+	${CMAKE_CURRENT_BINARY_DIR}/..)
+
 install(TARGETS mldr DESTINATION libexec/darling/usr/libexec/darling)
 
 configure_file(darling.conf.in darling.conf @ONLY)

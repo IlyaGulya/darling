@@ -149,6 +149,21 @@ got_message:
 
 #define dserver_rpc_hooks_get_broken_pipe_status() (-EPIPE)
 
+/*
+ * The RPC generator asks each consumer to classify transport disconnects.
+ * mldr's send hook returns negative host errno values, so retain the same
+ * Linux-side disconnect set used by libsystem_kernel in its errno domain.
+ * These statuses are only special for generated interruptible/quiet sends;
+ * every other negative send result remains an ordinary RPC failure.
+ */
+static int dserver_rpc_hooks_is_disconnect_status(long int status) {
+	return status == -EBADF
+		|| status == -EPIPE
+		|| status == -ECONNRESET
+		|| status == -ENOTCONN
+		|| status == -ECONNREFUSED;
+}
+
 #define dserver_rpc_hooks_close_fd close
 
 extern int __dserver_main_thread_socket_fd;
