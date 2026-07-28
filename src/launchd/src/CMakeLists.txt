@@ -14,6 +14,7 @@ add_definitions(
 include_directories(
 	${CMAKE_CURRENT_BINARY_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR}/../liblaunch
+	${CMAKE_SOURCE_DIR}/src/startup
 )
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fblocks -include ${CMAKE_SOURCE_DIR}/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/sys/fileport.h")
@@ -41,6 +42,7 @@ set(launchd_sources
 	log.c
 	runtime.c
 	rootless_runtime.c
+	${CMAKE_SOURCE_DIR}/src/startup/runtime_mode.c
 	${CMAKE_CURRENT_BINARY_DIR}/jobServer.c
 	${CMAKE_CURRENT_BINARY_DIR}/helperUser.c
 	${CMAKE_CURRENT_BINARY_DIR}/internalServer.c
@@ -54,6 +56,9 @@ set(launchd_sources
 
 include(darling_exe)
 add_darling_executable(launchd ${launchd_sources})
+target_compile_definitions(launchd PRIVATE
+	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
+)
 target_link_libraries(launchd bsm.0)
 
 install(TARGETS launchd DESTINATION libexec/darling/sbin)

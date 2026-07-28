@@ -34,11 +34,13 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <signal.h>
 #include "shellspawn.h"
 #include "duct_signals.h"
+#include "../startup/runtime_mode.h"
 
 #define DBG 0
 
 int g_serverSocket = -1;
 struct sigaction sigchld_oldaction;
+static bool g_rootlessRuntime;
 
 void setupSocket(void);
 void listenForConnections(void);
@@ -166,9 +168,8 @@ static enum shell_wait_result waitForShell(pid_t shell_pid, int fd, const int sh
 }
 static void rootlessTestDelaySocketReady(void)
 {
-	const char* rootless = getenv("DARLING_ROOTLESS");
 	const char* value = getenv("DARLING_TEST_SHELLSPAWN_READY_DELAY_MS");
-	if (rootless == NULL || strcmp(rootless, "1") != 0 || value == NULL || *value == '\0')
+	if (!g_rootlessRuntime || value == NULL || *value == '\0')
 		return;
 
 	char* end = NULL;
@@ -185,10 +186,9 @@ static void rootlessTestDelaySocketReady(void)
 
 static void rootlessTestMarkSocketPending(void)
 {
-	const char* rootless = getenv("DARLING_ROOTLESS");
 	const char* delay = getenv("DARLING_TEST_SHELLSPAWN_READY_DELAY_MS");
 	const char* path = getenv("WEST_ROOTLESS_BOOTSTRAP_READY_FILE");
-	if (rootless == NULL || strcmp(rootless, "1") != 0 || delay == NULL || *delay == '\0'
+	if (!g_rootlessRuntime || delay == NULL || *delay == '\0'
 		|| path == NULL || *path == '\0')
 		return;
 
@@ -209,6 +209,20 @@ static void rootlessTestMarkSocketPending(void)
 }
 int main(int argc, const char** argv)
 {
+	enum darling_runtime_mode runtime_mode = DARLING_RUNTIME_MODE_INVALID;
+	char runtime_mode_error[256] = {0};
+	if (darling_runtime_mode_require_canonical_process(
+			DARLING_RUNTIME_EUNION_CAPABLE != 0,
+			&runtime_mode,
+			runtime_mode_error,
+			sizeof(runtime_mode_error)
+		) != 0) {
+		fprintf(stderr, "shellspawn runtime mode rejected: %s\n",
+			runtime_mode_error);
+		return EXIT_FAILURE;
+	}
+	g_rootlessRuntime = darling_runtime_mode_is_rootless(runtime_mode);
+
 	// shellspawn (daemon) --fork()--> shellspawn (child) --fork()--> exec /bin/bash
 	// in order to read the exit status of the shell process,
 	// we have to allow it to become a zombie, therefore we need to

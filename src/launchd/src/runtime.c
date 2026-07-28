@@ -76,6 +76,7 @@
 #include "vproc_internal.h"
 #include "jobServer.h"
 #include "job_reply.h"
+#include "runtime_mode.h"
 
 #include <xpc/launchd.h>
 
@@ -117,6 +118,10 @@ static const int sigigns[] = { SIGHUP, SIGINT, SIGPIPE, SIGALRM, SIGTERM,
 	SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGINFO, SIGUSR1, SIGUSR2
 };
 static sigset_t sigign_set;
+static enum darling_runtime_mode launchd_runtime_mode =
+	DARLING_RUNTIME_MODE_INVALID;
+static int launchd_runtime_mode_status;
+static char launchd_runtime_mode_error[256];
 bool pid1_magic;
 bool launchd_apple_internal;
 bool launchd_flat_mach_namespace = true;
@@ -139,6 +144,31 @@ bool launchd_appletv = false;
 #endif
 pid_t launchd_wsp = 0;
 size_t runtime_busy_cnt;
+
+static void
+launchd_runtime_mode_initialize(void)
+{
+	launchd_runtime_mode_status =
+		darling_runtime_mode_require_canonical_process(
+			DARLING_RUNTIME_EUNION_CAPABLE != 0,
+			&launchd_runtime_mode,
+			launchd_runtime_mode_error,
+			sizeof(launchd_runtime_mode_error)
+		);
+	if (launchd_runtime_mode_status == 0) {
+		darling_rootless =
+			darling_runtime_mode_is_rootless(launchd_runtime_mode);
+	}
+}
+
+int
+launchd_runtime_mode_preflight(const char **error_out)
+{
+	if (error_out != NULL) {
+		*error_out = launchd_runtime_mode_error;
+	}
+	return launchd_runtime_mode_status;
+}
 
 #if TARGET_OS_EMBEDDED
 #define LAUNCHD_CONFIG_PREFIX "/"
@@ -1379,6 +1409,13 @@ do_file_init(void)
 {
 	struct stat sb;
 
+	/*
+	 * This constructor runs before main(). Parse the canonical process mode
+	 * exactly once here so PID-1 semantics are selected before job manager
+	 * construction. main() only reports this cached preflight result.
+	 */
+	launchd_runtime_mode_initialize();
+
 	os_assert_zero(mach_timebase_info(&tbi));
 	tbi_float_val = tbi.numer;
 	tbi_float_val /= tbi.denom;
@@ -1386,8 +1423,7 @@ do_file_init(void)
 
 	launchd_system_start = runtime_get_wall_time();
 
-	const char* rootless = getenv("DARLING_ROOTLESS");
-	if (getpid() == 1 || (rootless != NULL && strcmp(rootless, "1") == 0)) {
+	if (getpid() == 1 || darling_rootless) {
 		pid1_magic = true;
 	}
 

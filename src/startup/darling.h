@@ -35,11 +35,6 @@ void setupWorkdir(void);
 
 void setupPrefix(void);
 
-int checkPrefixDir(void);
-
-// Creates the given directory, exit()ing if not possible
-void createDir(const char* path);
-
 int connectToShellspawn(pid_t pidInit);
 void setupShellspawnEnv(int shellspawnFD);
 void setupWorkingDir(int shellspawnFD);

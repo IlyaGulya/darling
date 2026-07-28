@@ -42,7 +42,7 @@
 #define __user
 
 #define EXECUTABLE_PATH "executable_path="
-#define ROOTLESS_INIT_ENV "DARLING_ROOTLESS=1"
+#define RUNTIME_MODE_ENV_PREFIX DARLING_RUNTIME_MODE_ENV "="
 
 #define __put_user(value, pointer) ({ \
 		__typeof__(value) _tmpval = (value); \
@@ -71,7 +71,23 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	char __user* elfcalls_user;
 	char elfcalls[27];
 	char __user* applep_contents[4];
-	const size_t rootless_envc = lr->rootless_init ? 1 : 0;
+	const size_t runtime_mode_envc =
+		lr->init_runtime_mode != DARLING_RUNTIME_MODE_INVALID ? 1 : 0;
+	char runtime_mode_env[128];
+	char __user* runtime_mode_env_user = NULL;
+	size_t runtime_mode_env_size = 0;
+	if (runtime_mode_envc != 0) {
+		const char* mode_name =
+			darling_runtime_mode_name(lr->init_runtime_mode);
+		if (mode_name == NULL ||
+			snprintf(runtime_mode_env, sizeof(runtime_mode_env),
+				RUNTIME_MODE_ENV_PREFIX "%s", mode_name) >=
+				(int)sizeof(runtime_mode_env)) {
+			fprintf(stderr, "Cannot construct typed runtime mode environment\n");
+			exit(1);
+		}
+		runtime_mode_env_size = strlen(runtime_mode_env) + 1;
+	}
 
 #define user_long_count(_val) (((_val) + (sizeof(user_long_t) - 1)) / sizeof(user_long_t))
 
@@ -112,11 +128,15 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	// 1 pointer for the mach header
 	// 1 user_long_t for the argument count
 	// `argc`-count pointers for arguments (+1 for NULL)
-	// `envc`-count pointers for env vars, plus the rootless-init marker when
-	// mldr was invoked by the rootless bootstrap (+1 for NULL)
+	// `envc`-count pointers for env vars, plus the typed runtime mode when
+	// mldr was invoked for launchd bootstrap (+1 for NULL)
 	// `sizeof(applep_contents) / sizeof(*applep_contents)`-count pointers for applep arguments (already includes NULL)
 	// space for exepath, kernfd, and elfcalls
-	sp -= 1 + 1 + (lr->argc + 1) + (lr->envc + rootless_envc + 1) + (sizeof(applep_contents) / sizeof(*applep_contents)) + user_long_count(exepath_len + sizeof(EXECUTABLE_PATH) + sizeof(kernfd) + sizeof(elfcalls));
+	sp -= 1 + 1 + (lr->argc + 1) +
+		(lr->envc + runtime_mode_envc + 1) +
+		(sizeof(applep_contents) / sizeof(*applep_contents)) +
+		user_long_count(exepath_len + sizeof(EXECUTABLE_PATH) +
+			sizeof(kernfd) + sizeof(elfcalls) + runtime_mode_env_size);
 
 	exepath_user = (char __user*) lr->stack_top - exepath_len - sizeof(EXECUTABLE_PATH);
 	memcpy(exepath_user, EXECUTABLE_PATH, sizeof(EXECUTABLE_PATH)-1);
@@ -135,6 +155,10 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	snprintf(elfcalls, sizeof(elfcalls), "elf_calls=" POINTER_FORMAT, (unsigned long)(uintptr_t)&_elfcalls);
 	elfcalls_user = kernfd_user - sizeof(elfcalls);
 	memcpy(elfcalls_user, elfcalls, sizeof(elfcalls));
+	if (runtime_mode_env_size != 0) {
+		runtime_mode_env_user = elfcalls_user - runtime_mode_env_size;
+		memcpy(runtime_mode_env_user, runtime_mode_env, runtime_mode_env_size);
+	}
 
 	applep_contents[0] = exepath_user;
 	applep_contents[1] = kernfd_user;
@@ -190,9 +214,10 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 			exit(1);
 		}
 	}
-	if (lr->rootless_init) {
-		if (__put_user((user_long_t) ROOTLESS_INIT_ENV, envp++)) {
-			fprintf(stderr, "Failed to add the rootless init environment variable to the stack\n");
+	if (runtime_mode_envc != 0) {
+		if (__put_user((user_long_t) runtime_mode_env_user, envp++)) {
+			fprintf(stderr,
+				"Failed to add the typed runtime mode to the stack\n");
 			exit(1);
 		}
 	}
