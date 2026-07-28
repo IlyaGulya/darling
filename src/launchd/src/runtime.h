@@ -86,6 +86,7 @@ void runtime_remove_timer(void);
 void launchd_runtime_init(void);
 void launchd_runtime_init2(void);
 void launchd_runtime(void) __attribute__((noreturn));
+int launchd_runtime_mode_preflight(const char **error_out);
 
 void launchd_log_vm_stats(void);
 

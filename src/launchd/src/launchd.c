@@ -82,6 +82,7 @@
 #include "core.h"
 #include "ipc.h"
 #include "rootless_runtime.h"
+#include "runtime_mode.h"
 
 #define LAUNCHD_CONF ".launchd.conf"
 
@@ -104,29 +105,6 @@ static bool do_pid1_crash_diagnosis_mode2(const char *msg);
 
 static void *update_thread(void *nothing);
 
-static bool
-rootless_mode_enabled(void)
-{
-	const char *value = getenv("DARLING_ROOTLESS");
-	if (value != NULL && strcmp(value, "1") == 0) {
-		return true;
-	}
-
-	value = getenv("__mldr_rootless_pid1");
-	return value != NULL && strcmp(value, "1") == 0;
-}
-
-static void
-rootless_bootstrap_environment(void)
-{
-	const char *marker = getenv("__mldr_rootless_pid1");
-	if (marker == NULL || strcmp(marker, "1") != 0) {
-		return;
-	}
-
-	setenv("DARLING_ROOTLESS", "1", 1);
-	unsetenv("__mldr_rootless_pid1");
-}
 static void *crash_addr;
 static pid_t crash_pid;
 
@@ -145,10 +123,13 @@ main(int argc, char *const *argv)
 {
 	bool sflag = false;
 	int ch;
-	rootless_bootstrap_environment();
-	if (getenv("DARLING_ROOTLESS") != NULL &&
-		strcmp(getenv("DARLING_ROOTLESS"), "1") == 0 &&
-		rootless_runtime_prepare() != 0) {
+	const char *runtime_mode_error = NULL;
+	if (launchd_runtime_mode_preflight(&runtime_mode_error) != 0) {
+		fprintf(stderr, "launchd runtime mode rejected: %s\n",
+			runtime_mode_error);
+		return EXIT_FAILURE;
+	}
+	if (darling_rootless && rootless_runtime_prepare() != 0) {
 		return EXIT_FAILURE;
 	}
 
@@ -190,8 +171,6 @@ main(int argc, char *const *argv)
 			break;
 		}
 	}
-
-darling_rootless = rootless_mode_enabled();
 
 	if (!darling_rootless && getpid() != 1 && getppid() != 1) {
 		fprintf(stderr, "%s: This program is not meant to be run directly.\n", getprogname());

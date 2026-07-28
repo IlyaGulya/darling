@@ -230,7 +230,8 @@ int main(int argc, char** argv, char** envp)
 		// Don't pass these special env vars down to userland
 		if (
 			ENV_VAR_MATCHES("__mldr_bprefs=")   ||
-			ENV_VAR_MATCHES("__mldr_sockpath=")
+			ENV_VAR_MATCHES("__mldr_sockpath=") ||
+			ENV_VAR_MATCHES("__mldr_runtime_mode=")
 		) {
 			size_t len_after = 0;
 			const char* orig_envp_i_plus_one = mldr_load_results.envp[i + 1];
@@ -557,8 +558,28 @@ static void process_special_env(struct load_results* lr) {
 	}
 
 	str = getenv("__mldr_rootless_pid1");
-	if (str != NULL && strcmp(str, "1") == 0) {
-		lr->rootless_init = true;
+	if (str != NULL) {
+		fprintf(stderr,
+			"obsolete __mldr_rootless_pid1 marker crossed the typed runtime boundary\n");
+		exit(1);
+	}
+	if (getenv("DARLING_ROOTLESS") != NULL ||
+		getenv("DARLING_NOOVERLAYFS") != NULL ||
+		getenv("DARLING_EUNION") != NULL) {
+		fprintf(stderr,
+			"legacy runtime flags crossed the launcher compatibility boundary\n");
+		exit(1);
+	}
+
+	str = getenv("__mldr_runtime_mode");
+	if (str != NULL) {
+		lr->init_runtime_mode = darling_runtime_mode_parse(str);
+		if (lr->init_runtime_mode == DARLING_RUNTIME_MODE_INVALID ||
+			(darling_runtime_mode_uses_eunion(lr->init_runtime_mode) &&
+				DARLING_RUNTIME_EUNION_CAPABLE == 0)) {
+			fprintf(stderr, "invalid typed runtime mode for launchd bootstrap\n");
+			exit(1);
+		}
 	}
 };
 
@@ -567,6 +588,7 @@ static void unset_special_env() {
 	unsetenv("__mldr_sockpath");
 	unsetenv("__mldr_lifetime_pipe");
 	unsetenv("__mldr_rootless_pid1");
+	unsetenv("__mldr_runtime_mode");
 };
 
 typedef struct socket_bitmap {
