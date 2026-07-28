@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "../runtime_mode.h"
 
 struct load_results {
 	unsigned long mh;
@@ -15,7 +16,7 @@ struct load_results {
 
 	unsigned long vm_addr_max;
 	bool _32on64;
-	bool rootless_init;
+	enum darling_runtime_mode init_runtime_mode;
 	unsigned long base;
 	uint32_t bprefs[4];
 	char* root_path;

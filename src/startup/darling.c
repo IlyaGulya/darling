@@ -34,13 +34,16 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
-#include <getopt.h>
 #include <termios.h>
 #include <pty.h>
 #include <pwd.h>
+#include <dirent.h>
 #include "../shellspawn/shellspawn.h"
 #include "darling.h"
 #include "darling-config.h"
+#include "runtime_credentials.h"
+#include "runtime_mode.h"
+#include "runtime_mode_prefix.h"
 
 // Between Linux 4.9 and 4.11, a strange bug has been introduced
 // which prevents connecting to Unix sockets if the socket was
@@ -50,14 +53,23 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #define ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS 30000
 
 char *prefix;
-uid_t g_originalUid, g_originalGid;
+uid_t g_originalUid;
+gid_t g_originalGid;
 bool g_fixPermissions = false;
 char g_workingDirectory[4096];
 
+static enum darling_runtime_mode g_runtimeMode = DARLING_RUNTIME_MODE_INVALID;
+static struct darling_runtime_prefix g_runtimePrefix =
+	DARLING_RUNTIME_PREFIX_INITIALIZER;
+
+static void closeRuntimePrefix(void)
+{
+	darling_runtime_mode_close_prefix(&g_runtimePrefix);
+}
+
 static bool rootlessModeEnabled(void)
 {
-	const char* value = getenv("DARLING_ROOTLESS");
-	return value != NULL && value[0] == '1' && value[1] == '\0';
+	return darling_runtime_mode_is_rootless(g_runtimeMode);
 }
 
 static long rootlessShellspawnReadyTimeoutMs(void)
@@ -79,17 +91,24 @@ static long rootlessShellspawnReadyTimeoutMs(void)
 
 static void removeRuntimeStateFiles(void)
 {
-	char initPidPath[4096];
-	char shellspawnSocketPath[4096];
-	char darlingserverSocketPath[4096];
-
-	snprintf(initPidPath, sizeof(initPidPath), "%s/.init.pid", prefix);
-	snprintf(shellspawnSocketPath, sizeof(shellspawnSocketPath), "%s" SHELLSPAWN_SOCKPATH, prefix);
-	snprintf(darlingserverSocketPath, sizeof(darlingserverSocketPath), "%s/.darlingserver.sock", prefix);
-	unlink(initPidPath);
-	unlink(shellspawnSocketPath);
-	unlink(darlingserverSocketPath);
+	char error[512] = {0};
+	static const char* entries[] = {
+		".init.pid",
+		"var/run/shellspawn.sock",
+		".darlingserver.sock",
+	};
+	for (size_t index = 0;
+			index < sizeof(entries) / sizeof(entries[0]);
+			index++) {
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				entries[index], 0, true, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove Darling runtime state %s: %s\n",
+				entries[index], error);
+			exit(1);
+		}
+	}
 }
+
 int main(int argc, char ** argv)
 {
 	pid_t pidInit;
@@ -97,6 +116,44 @@ int main(int argc, char ** argv)
 	if (argc <= 1)
 	{
 		showHelp(argv[0]);
+		return 1;
+	}
+
+	char runtimeModeError[512] = {0};
+	struct darling_runtime_cli cli;
+	if (darling_runtime_mode_parse_cli(
+			argc,
+			argv,
+			&cli,
+			runtimeModeError,
+			sizeof(runtimeModeError)
+		) != 0) {
+		fprintf(stderr, "Cannot parse Darling launcher options: %s\n",
+			runtimeModeError);
+		return 1;
+	}
+	if (cli.show_help) {
+		showHelp(argv[0]);
+		return 0;
+	}
+	if (cli.show_version) {
+		showVersion(argv[0]);
+		return 0;
+	}
+	if (cli.command_index < 0 || cli.command_index >= argc) {
+		showHelp(argv[0]);
+		return 1;
+	}
+
+	if (darling_runtime_mode_select_process(
+			&cli,
+			DARLING_RUNTIME_EUNION_CAPABLE != 0,
+			&g_runtimeMode,
+			runtimeModeError,
+			sizeof(runtimeModeError)
+		) != 0) {
+		fprintf(stderr, "Cannot select Darling runtime mode: %s\n",
+			runtimeModeError);
 		return 1;
 	}
 
@@ -118,11 +175,30 @@ int main(int argc, char ** argv)
 	}
 	else
 	{
+		if (darling_runtime_drop_rootless_credentials(
+				g_originalUid,
+				g_originalGid,
+				runtimeModeError,
+				sizeof(runtimeModeError)
+			) != 0) {
+			fprintf(stderr, "Cannot enter rootless runtime mode: %s\n",
+				runtimeModeError);
+			return 1;
+		}
 		if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0)
 		{
 			fprintf(stderr, "Cannot enable rootless child reaping: %s\n", strerror(errno));
 			return 1;
 		}
+	}
+	if (darling_runtime_mode_publish(
+			g_runtimeMode,
+			runtimeModeError,
+			sizeof(runtimeModeError)
+		) != 0) {
+		fprintf(stderr, "Cannot publish Darling runtime mode: %s\n",
+			runtimeModeError);
+		return 1;
 	}
 
 	prefix = getenv("DPREFIX");
@@ -138,55 +214,68 @@ int main(int argc, char ** argv)
 	unsetenv("DPREFIX");
 	getcwd(g_workingDirectory, sizeof(g_workingDirectory));
 
-	if (!checkPrefixDir())
+	if (darling_runtime_mode_open_prefix(
+			prefix,
+			&g_runtimePrefix,
+			runtimeModeError,
+			sizeof(runtimeModeError)
+		) != 0) {
+		fprintf(stderr, "Cannot use Darling prefix: %s\n",
+			runtimeModeError);
+		return 1;
+	}
+	if (atexit(closeRuntimePrefix) != 0) {
+		fprintf(stderr, "Cannot register Darling prefix fd cleanup\n");
+		return 1;
+	}
+	const bool freshPrefix =
+		!g_runtimePrefix.existed || g_runtimePrefix.empty;
+	if (!freshPrefix)
+	{
+		if (darling_runtime_mode_validate_prefix_marker(
+				&g_runtimePrefix,
+				g_runtimeMode,
+				runtimeModeError,
+				sizeof(runtimeModeError)
+			) != 0) {
+			fprintf(stderr, "Cannot use Darling prefix: %s\n",
+				runtimeModeError);
+			return 1;
+		}
+		int initialization = darling_runtime_mode_prefix_needs_initialization(
+			&g_runtimePrefix, runtimeModeError, sizeof(runtimeModeError));
+		if (initialization < 0) {
+			fprintf(stderr, "Cannot use Darling prefix: %s\n",
+				runtimeModeError);
+			return 1;
+		}
+		if (initialization > 0) {
+			setupPrefix();
+			g_fixPermissions = true;
+		}
+	}
+	else
 	{
 		setupPrefix();
+		if (darling_runtime_mode_initialize_prefix_marker(
+				&g_runtimePrefix,
+				g_runtimeMode,
+				runtimeModeError,
+				sizeof(runtimeModeError)
+			) != 0) {
+			fprintf(stderr, "Cannot initialize Darling prefix: %s\n",
+				runtimeModeError);
+			return 1;
+		}
 		g_fixPermissions = true;
 	}
 	checkPrefixOwner();
 
-	int c;
-	while (1)
-	{
-		static struct option long_options[] =
-		{
-			{"help", 	no_argument, 0, 0},
-			{"version", no_argument, 0, 0},
-			{0, 		0, 			 0, 0}
-		};
-		int option_index = 0;
-
-		c = getopt_long(argc, argv, "+", long_options, &option_index);
-
-		if (c == -1)
-		{
-			break;
-		}
-
-		switch (c)
-		{
-			case 0:
-			if (strcmp(long_options[option_index].name, "help") == 0)
-			{
-				showHelp(argv[0]);
-				exit(EXIT_SUCCESS);
-			}
-			else if (strcmp(long_options[option_index].name, "version") == 0)
-			{
-				showVersion(argv[0]);
-				exit(EXIT_SUCCESS);
-			}
-			break;
-			case '?':
-			break;
-			default:
-			abort();
-		}
-	}
+	const int commandIndex = cli.command_index;
 
 	pidInit = getInitProcess();
 
-	if (strcmp(argv[1], "shutdown") == 0)
+	if (strcmp(argv[commandIndex], "shutdown") == 0)
 	{
 		if (pidInit == 0)
 		{
@@ -229,12 +318,13 @@ int main(int argc, char ** argv)
 	// If prefix's init is not running, start it up
 	if (pidInit == 0)
 	{
-		char socketPath[4096];
-		
-		snprintf(socketPath, sizeof(socketPath), "%s"  SHELLSPAWN_SOCKPATH, prefix);
-		
-		unlink(socketPath);
-		
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				"var/run/shellspawn.sock", 0, true,
+				runtimeModeError, sizeof(runtimeModeError)) != 0) {
+			fprintf(stderr, "Cannot clear stale shellspawn socket: %s\n",
+				runtimeModeError);
+			return 1;
+		}
 		setupWorkdir();
 		pidInit = spawnInitProcess();
 		putInitPid(pidInit);
@@ -243,8 +333,26 @@ int main(int argc, char ** argv)
 			// The namespace-based launcher keeps its existing bounded startup wait.
 			for (int i = 0; i < 15; i++)
 			{
-				if (access(socketPath, F_OK) == 0)
+				struct stat socketStatus;
+				errno = 0;
+				int statusResult =
+					darling_runtime_mode_stat_relative(&g_runtimePrefix,
+						"var/run/shellspawn.sock", &socketStatus,
+						runtimeModeError, sizeof(runtimeModeError));
+				if (statusResult == 0) {
+					if (!S_ISSOCK(socketStatus.st_mode)) {
+						fprintf(stderr,
+							"Shellspawn endpoint is not a socket\n");
+						return 1;
+					}
 					break;
+				}
+				if (errno != ENOENT) {
+					fprintf(stderr,
+						"Cannot inspect shellspawn endpoint safely: %s\n",
+						runtimeModeError);
+					return 1;
+				}
 				sleep(1);
 			}
 		}
@@ -258,20 +366,20 @@ int main(int argc, char ** argv)
 	if (!rootless)
 		seteuid(g_originalUid);
 
-	if (strcmp(argv[1], "shell") == 0)
+	if (strcmp(argv[commandIndex], "shell") == 0)
 	{
 		// Spawn the shell
-		if (argc > 2)
-			spawnShell(pidInit, (const char**) &argv[2]);
+		if (argc > commandIndex + 1)
+			spawnShell(pidInit, (const char**) &argv[commandIndex + 1]);
 		else
 			spawnShell(pidInit, NULL);
 	}
 	else
 	{
-		bool doExec = strcmp(argv[1], "exec") == 0;
-		int argvIndex = doExec ? 2 : 1;
+		bool doExec = strcmp(argv[commandIndex], "exec") == 0;
+		int argvIndex = doExec ? commandIndex + 1 : commandIndex;
 
-		if (doExec && argc <= 2)
+		if (doExec && argc <= commandIndex + 1)
 		{
 			printf("'exec' subcommand requires a binary to execute.\n");
 			return 1;
@@ -636,34 +744,62 @@ int connectToShellspawn(pid_t pidInit)
 	struct sockaddr_un addr;
 	struct timespec started;
 	const long ready_timeout_ms = rootlessShellspawnReadyTimeoutMs();
+	char error[512] = {0};
+	int socketDirectoryFD = darling_runtime_mode_open_relative_directory(
+		&g_runtimePrefix, "var/run", false, error, sizeof(error));
+	if (socketDirectoryFD < 0) {
+		fprintf(stderr, "Cannot retain shellspawn socket directory: %s\n",
+			error);
+		exit(1);
+	}
 
 	// Connect to the shellspawn daemon in the container
+	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-#if USE_LINUX_4_11_HACK
-	addr.sun_path[0] = '\0';
-	
-	strcpy(addr.sun_path, prefix);
-	strcat(addr.sun_path, SHELLSPAWN_SOCKPATH);
-#else
-	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s"  SHELLSPAWN_SOCKPATH, prefix);
-#endif
+	if (snprintf(addr.sun_path, sizeof(addr.sun_path),
+			"/proc/self/fd/%d/shellspawn.sock",
+			socketDirectoryFD) >= (int)sizeof(addr.sun_path)) {
+		close(socketDirectoryFD);
+		fprintf(stderr, "Retained shellspawn socket path is too long\n");
+		exit(1);
+	}
 	if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
 	{
+		close(socketDirectoryFD);
 		fprintf(stderr, "Unable to start rootless shellspawn readiness timer: %s\n", strerror(errno));
 		exit(1);
 	}
 
 	for (;;)
 	{
+		struct stat socketStatus;
+		if (fstatat(socketDirectoryFD, "shellspawn.sock", &socketStatus,
+				AT_SYMLINK_NOFOLLOW) == 0) {
+			if (S_ISLNK(socketStatus.st_mode) ||
+				!S_ISSOCK(socketStatus.st_mode)) {
+				close(socketDirectoryFD);
+				fprintf(stderr,
+					"Shellspawn endpoint is a symlink or non-socket\n");
+				exit(1);
+			}
+		} else if (errno != ENOENT) {
+			int saved_errno = errno;
+			close(socketDirectoryFD);
+			fprintf(stderr, "Cannot inspect shellspawn endpoint: %s\n",
+				strerror(saved_errno));
+			exit(1);
+		}
 		int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (sockfd == -1)
 		{
+			close(socketDirectoryFD);
 			fprintf(stderr, "Error creating a unix domain socket: %s\n", strerror(errno));
 			exit(1);
 		}
 
 		if (connect(sockfd, (struct sockaddr*) &addr, sizeof(addr)) == 0)
 		{
+			close(socketDirectoryFD);
 			return sockfd;
 		}
 
@@ -671,12 +807,14 @@ int connectToShellspawn(pid_t pidInit)
 		close(sockfd);
 		if (!rootlessModeEnabled() || (error != ENOENT && error != ECONNREFUSED))
 		{
+			close(socketDirectoryFD);
 			fprintf(stderr, "Error connecting to shellspawn in the container (%s): %s\n", addr.sun_path, strerror(error));
 			exit(1);
 		}
 
 		if (!rootlessInitIsRunning(pidInit))
 		{
+			close(socketDirectoryFD);
 			fprintf(stderr, "Rootless init process %d exited before shellspawn became ready (%s)\n", pidInit, addr.sun_path);
 			exit(1);
 		}
@@ -684,6 +822,7 @@ int connectToShellspawn(pid_t pidInit)
 		struct timespec now;
 		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		{
+			close(socketDirectoryFD);
 			fprintf(stderr, "Unable to read rootless shellspawn readiness timer: %s\n", strerror(errno));
 			exit(1);
 		}
@@ -691,6 +830,7 @@ int connectToShellspawn(pid_t pidInit)
 			+ (now.tv_nsec - started.tv_nsec) / 1000000L;
 		if (elapsed_ms >= ready_timeout_ms)
 		{
+			close(socketDirectoryFD);
 			fprintf(stderr, "Rootless shellspawn did not become ready within %ldms (%s)\n",
 				ready_timeout_ms, addr.sun_path);
 			exit(1);
@@ -868,13 +1008,18 @@ void showHelp(const char* argv0)
 	fprintf(stderr, "Copyright (C) 2012-2023 Lubos Dolezel\n\n");
 
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "\t%s <program-path> [arguments...]\n", argv0);
-	fprintf(stderr, "\t%s shell [arguments...]\n", argv0);
-	fprintf(stderr, "\t%s exec <program-path> [arguments...]\n", argv0);
-	fprintf(stderr, "\t%s shutdown\n", argv0);
+	fprintf(stderr, "\t%s [--rootless] <program-path> [arguments...]\n", argv0);
+	fprintf(stderr, "\t%s [--rootless] shell [arguments...]\n", argv0);
+	fprintf(stderr, "\t%s [--rootless] exec <program-path> [arguments...]\n", argv0);
+	fprintf(stderr, "\t%s [--rootless] shutdown\n", argv0);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "Options:\n"
+		"--rootless - select rootless-eunion (exact spelling; requires an E-UNION-capable build)\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Environment variables:\n"
-		"DPREFIX - specifies the location of Darling prefix, defaults to ~/.darling\n");
+		"DPREFIX - specifies the location of Darling prefix, defaults to ~/.darling\n"
+		"DARLING_RUNTIME_MODE - canonical internal runtime mode; prefer --rootless\n"
+		"DARLING_ROOTLESS, DARLING_NOOVERLAYFS, DARLING_EUNION - launcher-only compatibility inputs\n");
 }
 
 void showVersion(const char* argv0) {
@@ -902,6 +1047,16 @@ pid_t spawnInitProcess(void)
 	pid_t pid;
 	int pipefd[2];
 	char buffer[1];
+	char error[512] = {0};
+
+	if (darling_runtime_mode_verify_prefix_name(&g_runtimePrefix,
+			error, sizeof(error)) != 0 ||
+		g_runtimePrefix.workdir_fd < 0) {
+		fprintf(stderr,
+			"Cannot hand the retained Darling prefix to darlingserver: %s\n",
+			error[0] == '\0' ? "runtime workdir fd is missing" : error);
+		exit(1);
+	}
 
 	if (pipe(pipefd) == -1)
 	{
@@ -933,14 +1088,37 @@ pid_t spawnInitProcess(void)
 		char uid_str[21];
 		char gid_str[21];
 		char pipefd_str[21];
+		char prefixfd_str[21];
+		char parentfd_str[21];
+		char workdirfd_str[21];
 
 		snprintf(uid_str, sizeof(uid_str), "%d", g_originalUid);
 		snprintf(gid_str, sizeof(gid_str), "%d", g_originalGid);
 		snprintf(pipefd_str, sizeof(pipefd_str), "%d", pipefd[1]);
+		snprintf(prefixfd_str, sizeof(prefixfd_str), "%d",
+			g_runtimePrefix.directory_fd);
+		snprintf(parentfd_str, sizeof(parentfd_str), "%d",
+			g_runtimePrefix.parent_fd);
+		snprintf(workdirfd_str, sizeof(workdirfd_str), "%d",
+			g_runtimePrefix.workdir_fd);
 
 		close(pipefd[0]);
+		if (darling_runtime_mode_make_fd_inheritable(
+				g_runtimePrefix.directory_fd, error, sizeof(error)) != 0 ||
+			darling_runtime_mode_make_fd_inheritable(
+				g_runtimePrefix.parent_fd, error, sizeof(error)) != 0 ||
+			darling_runtime_mode_make_fd_inheritable(
+				g_runtimePrefix.workdir_fd, error, sizeof(error)) != 0) {
+			fprintf(stderr,
+				"Cannot preserve Darling prefix descriptors for darlingserver: %s\n",
+				error);
+			_exit(1);
+		}
 
-		execl(INSTALL_PREFIX "/bin/darlingserver", "darlingserver", prefix, uid_str, gid_str, pipefd_str, g_fixPermissions ? "1" : "0", NULL);
+		execl(INSTALL_PREFIX "/bin/darlingserver", "darlingserver",
+			prefixfd_str, parentfd_str, g_runtimePrefix.leaf,
+			workdirfd_str, uid_str, gid_str, pipefd_str,
+			g_fixPermissions ? "1" : "0", NULL);
 
 		fprintf(stderr, "Failed to start darlingserver\n");
 		exit(1);
@@ -987,29 +1165,33 @@ pid_t spawnInitProcess(void)
 
 void putInitPid(pid_t pidInit)
 {
-	const char pidFile[] = "/.init.pid";
-	char* pidPath;
-	FILE *fp;
-
-	pidPath = (char*) alloca(strlen(prefix) + sizeof(pidFile));
-	strcpy(pidPath, prefix);
-	strcat(pidPath, pidFile);
-
-	seteuid(g_originalUid);
-	setegid(g_originalGid);
-
-	fp = fopen(pidPath, "w");
-
-	seteuid(0);
-	setegid(0);
-
-	if (fp == NULL)
-	{
-		fprintf(stderr, "Cannot write out PID of the init process: %s\n", strerror(errno));
+	char content[64];
+	char error[512] = {0};
+	int length = snprintf(content, sizeof(content), "%d\n", (int)pidInit);
+	if (length < 0 || (size_t)length >= sizeof(content)) {
+		fprintf(stderr, "Cannot format init PID\n");
 		return;
 	}
-	fprintf(fp, "%d", (int) pidInit);
-	fclose(fp);
+
+	if (!rootlessModeEnabled()) {
+		seteuid(g_originalUid);
+		setegid(g_originalGid);
+	}
+
+	int result = darling_runtime_mode_write_relative_atomic(
+		&g_runtimePrefix, ".init.pid", content, 0644,
+		error, sizeof(error));
+
+	if (!rootlessModeEnabled()) {
+		seteuid(0);
+		setegid(0);
+	}
+
+	if (result != 0) {
+		fprintf(stderr, "Cannot write out PID of the init process: %s\n",
+			error);
+		return;
+	}
 }
 
 char* defaultPrefixPath(void)
@@ -1031,117 +1213,28 @@ char* defaultPrefixPath(void)
 	return buf;
 }
 
-void createDir(const char* path)
-{
-	struct stat st;
-
-	if (stat(path, &st) == 0)
-	{
-		if (!S_ISDIR(st.st_mode))
-		{
-			fprintf(stderr, "%s already exists and is a file. Remove the file.\n", path);
-			exit(1);
-		}
-	}
-	else
-	{
-		if (errno == ENOENT)
-		{
-			if (mkdir(path, 0755) != 0)
-			{
-				fprintf(stderr, "Cannot create %s: %s\n", path, strerror(errno));
-				exit(1);
-			}
-		}
-		else
-		{
-			fprintf(stderr, "Cannot access %s: %s\n", path, strerror(errno));
-			exit(1);
-		}
-	}
-}
-
 void setupWorkdir()
 {
-	char* workdir;
-	const char suffix[] = ".workdir";
-	size_t len;
-
-	len = strlen(prefix);
-	workdir = (char*) alloca(len + sizeof(suffix));
-	strcpy(workdir, prefix);
-
-	// Remove trailing /
-	while (workdir[len-1] == '/')
-		len--;
-	workdir[len] = '\0';
-
-	strcat(workdir, suffix);
-
-	createDir(workdir);
-}
-
-int checkPrefixDir()
-{
-	struct stat st;
-
-	if (stat(prefix, &st) == 0)
-	{
-		if (!S_ISDIR(st.st_mode))
-		{
-			fprintf(stderr, "%s is a file. Remove the file.\n", prefix);
-			exit(1);
-		}
-		return 1; // OK
+	char error[512] = {0};
+	if (darling_runtime_mode_prepare_workdir(&g_runtimePrefix,
+			error, sizeof(error)) != 0) {
+		fprintf(stderr, "Cannot prepare Darling runtime workdir: %s\n",
+			error);
+		exit(1);
 	}
-	if (errno == ENOENT)
-		return 0; // not found
-	fprintf(stderr, "Cannot access %s: %s\n", prefix, strerror(errno));
-	exit(1);
 }
 
 void setupPrefix()
 {
-	char path[4096];
-	size_t plen;
-	FILE* file;
 	struct passwd* passwd_entry;
-	
-	const char* dirs[] = {
-		"/Volumes",
-		"/Applications",
-		"/usr",
-		"/usr/local",
-		"/usr/local/share",
-		"/private",
-		"/private/var",
-		"/private/var/log",
-		"/private/var/db",
-		"/private/etc",
-		"/var",
-		"/var/run",
-		"/var/tmp",
-		"/var/log"
-	};
+	char error[512] = {0};
 
 	fprintf(stderr, "Setting up a new Darling prefix at %s\n", prefix);
 
-	seteuid(g_originalUid);
-	setegid(g_originalGid);
-
-	createDir(prefix);
-	strcpy(path, prefix);
-	strcat(path, "/");
-	plen = strlen(path);
-
-	for (size_t i = 0; i < sizeof(dirs)/sizeof(dirs[0]); i++)
-	{
-		path[plen] = '\0';
-		strcat(path, dirs[i]);
-		createDir(path);
+	if (!rootlessModeEnabled()) {
+		seteuid(g_originalUid);
+		setegid(g_originalGid);
 	}
-
-	// create passwd, master.passwd, and group
 
 	passwd_entry = getpwuid(g_originalUid);
 	if (!passwd_entry) {
@@ -1149,96 +1242,92 @@ void setupPrefix()
 		exit(1);
 	}
 
-	path[plen] = '\0';
-	strcat(path, "/private/etc/passwd");
-	file = fopen(path, "w");
-	if (!file) {
-		fprintf(stderr, "Failed to open /private/etc/passwd within the prefix\n");
+	if (darling_runtime_mode_setup_prefix(
+			&g_runtimePrefix,
+			passwd_entry->pw_name,
+			passwd_entry->pw_uid,
+			passwd_entry->pw_gid,
+			error,
+			sizeof(error)
+		) != 0) {
+		fprintf(stderr, "Failed to initialize Darling prefix safely: %s\n",
+			error);
 		exit(1);
 	}
-
-	fprintf(file,
-		"root:*:0:0:System Administrator:/var/root:/bin/sh\n"
-		"%s:*:%d:%d:Darling User:/Users/%s:/bin/bash\n",
-		passwd_entry->pw_name,
-		passwd_entry->pw_uid,
-		passwd_entry->pw_gid,
-		passwd_entry->pw_name
-	);
-	fclose(file);
-
-	path[plen] = '\0';
-	strcat(path, "/private/etc/master.passwd");
-	file = fopen(path, "w");
-	if (!file) {
-		fprintf(stderr, "Failed to open /private/etc/master.passwd within the prefix\n");
-		exit(1);
-	}
-
-	fprintf(file,
-		"root:*:0:0::0:0:System Administrator:/var/root:/bin/sh\n"
-		"%s:*:%d:%d::0:0:Darling User:/Users/%s:/bin/bash\n",
-		passwd_entry->pw_name,
-		passwd_entry->pw_uid,
-		passwd_entry->pw_gid,
-		passwd_entry->pw_name
-	);
-	fclose(file);
-
-	path[plen] = '\0';
-	strcat(path, "/private/etc/group");
-	file = fopen(path, "w");
-	if (!file) {
-		fprintf(stderr, "Failed to open /private/etc/group within the prefix\n");
-		exit(1);
-	}
-
-	fprintf(file,
-		"wheel:*:0:root,%s\n"
-		"%s:*:%d:%s\n",
-		passwd_entry->pw_name,
-		passwd_entry->pw_name,
-		passwd_entry->pw_gid,
-		passwd_entry->pw_name
-	);
-	fclose(file);
 	
-	seteuid(0);
-	setegid(0);
+	if (!rootlessModeEnabled()) {
+		seteuid(0);
+		setegid(0);
+	}
 }
 
 pid_t getInitProcess()
 {
-	const char pidFile[] = "/.init.pid";
-	char* pidPath;
 	pid_t pid;
-	int pid_i;
-	FILE *fp;
+	long parsed_pid;
+	char pidBuffer[64];
+	char* pidEnd = NULL;
+	char error[512] = {0};
 	char procBuf[100];
+	FILE *fp;
 	char *exeBuf, *statusBuf;
 	int uidMatch = 0, gidMatch = 0;
 
-	pidPath = (char*) alloca(strlen(prefix) + sizeof(pidFile));
-	strcpy(pidPath, prefix);
-	strcat(pidPath, pidFile);
-
-	fp = fopen(pidPath, "r");
-	if (fp == NULL)
-		return 0;
-
-	if (fscanf(fp, "%d", &pid_i) != 1)
-	{
-		fclose(fp);
-		unlink(pidPath);
+	int pidFD = darling_runtime_mode_open_relative_file(
+		&g_runtimePrefix, ".init.pid", O_RDONLY, 0,
+		error, sizeof(error));
+	if (pidFD < 0) {
+		if (errno == ENOENT)
+			return 0;
+		fprintf(stderr, "Cannot safely read prefix init PID: %s\n", error);
+		exit(1);
+	}
+	struct stat pidStatus;
+	ssize_t pidLength;
+	if (fstat(pidFD, &pidStatus) != 0 ||
+		!S_ISREG(pidStatus.st_mode) ||
+		pidStatus.st_size <= 0 ||
+		pidStatus.st_size >= (off_t)sizeof(pidBuffer) ||
+		(pidLength = read(pidFD, pidBuffer,
+			(size_t)pidStatus.st_size)) != pidStatus.st_size ||
+		close(pidFD) != 0) {
+		int saved_errno = errno;
+		close(pidFD);
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove invalid prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
+		errno = saved_errno;
 		return 0;
 	}
-	fclose(fp);
-	pid = (pid_t) pid_i;
+	pidBuffer[pidLength] = '\0';
+	errno = 0;
+	parsed_pid = strtol(pidBuffer, &pidEnd, 10);
+	while (pidEnd != NULL && (*pidEnd == '\n' || *pidEnd == '\r'))
+		pidEnd++;
+	if (errno != 0 || pidEnd == pidBuffer || pidEnd == NULL ||
+		*pidEnd != '\0' || parsed_pid <= 0 || (pid_t)parsed_pid != parsed_pid) {
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove malformed prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
+		return 0;
+	}
+	pid = (pid_t)parsed_pid;
 
 	// Does the process exist?
 	if (kill(pid, 0) == -1)
 	{
-		unlink(pidPath);
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove stale prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
 		return 0;
 	}
 
@@ -1247,21 +1336,36 @@ pid_t getInitProcess()
 	fp = fopen(procBuf, "r");
 	if (fp == NULL)
 	{
-		unlink(pidPath);
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove unverifiable prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
 		return 0;
 	}
 
 	if (fscanf(fp, "%ms", &exeBuf) != 1)
 	{
 		fclose(fp);
-		unlink(pidPath);
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove unreadable prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
 		return 0;
 	}
 	fclose(fp);
 
 	if (strcmp(exeBuf, "darlingserver") != 0)
 	{
-		unlink(pidPath);
+		if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove foreign prefix init PID: %s\n",
+				error);
+			exit(1);
+		}
 		return 0;
 	}
 	free(exeBuf);
@@ -1273,7 +1377,14 @@ pid_t getInitProcess()
 		fp = fopen(procBuf, "r");
 		if (fp == NULL)
 		{
-			unlink(pidPath);
+			if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+					".init.pid", 0, false,
+					error, sizeof(error)) != 0) {
+				fprintf(stderr,
+					"Cannot remove unowned prefix init PID: %s\n",
+					error);
+				exit(1);
+			}
 			return 0;
 		}
 
@@ -1306,7 +1417,14 @@ pid_t getInitProcess()
 
 		if (!uidMatch || !gidMatch)
 		{
-			unlink(pidPath);
+			if (darling_runtime_mode_unlink_relative(&g_runtimePrefix,
+					".init.pid", 0, false,
+					error, sizeof(error)) != 0) {
+				fprintf(stderr,
+					"Cannot remove mismatched prefix init PID: %s\n",
+					error);
+				exit(1);
+			}
 			return 0;
 		}
 	}
@@ -1318,7 +1436,12 @@ void checkPrefixOwner()
 {
 	struct stat st;
 
-	if (stat(prefix, &st) == 0)
+	if (g_runtimePrefix.directory_fd < 0)
+	{
+		fprintf(stderr, "Darling prefix lifecycle fd is not open.\n");
+		exit(1);
+	}
+	if (fstat(g_runtimePrefix.directory_fd, &st) == 0)
 	{
 		if (g_originalUid != 0 && st.st_uid != g_originalUid)
 		{
@@ -1326,9 +1449,10 @@ void checkPrefixOwner()
 			exit(1);
 		}
 	}
-	else if (errno == EACCES)
+	else
 	{
-		fprintf(stderr, "You do not own the prefix directory.\n");
+		fprintf(stderr, "Cannot inspect the retained prefix directory: %s\n",
+			strerror(errno));
 		exit(1);
 	}
 }

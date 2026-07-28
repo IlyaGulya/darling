@@ -53,6 +53,9 @@ if (NOT DEFINED CMAKE_CXX_COMPILER)
 endif(NOT DEFINED CMAKE_CXX_COMPILER)
 
 option(DARLING_NO_CCACHE "Disable ccache usage" OFF)
+option(DARLING_EUNION
+	"Enable E-UNION union-in-vchroot prefix assembly (experimental)"
+	OFF)
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM AND NOT DARLING_NO_CCACHE)
