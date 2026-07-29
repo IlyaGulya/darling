@@ -36,6 +36,8 @@ add_executable(darling_runtime_mode_test EXCLUDE_FROM_ALL
 	tests/runtime_mode_test.c runtime_credentials.c runtime_mode.c runtime_mode_prefix.c)
 target_include_directories(darling_runtime_mode_test PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(darling_runtime_mode_test PRIVATE
+	DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING=1)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/src/external/darlingserver/include ${CMAKE_SOURCE_DIR}/src/external/darlingserver/include)
 
