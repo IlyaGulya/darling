@@ -17,6 +17,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
+const char* darling_runtime_prefix_test_mountinfo_path;
+#endif
+
 #define DARLING_RUNTIME_PREFIX_PATH_MAX 4096
 
 static unsigned long directory_sequence;
@@ -41,8 +45,11 @@ static void reset_handle_to(
 	handle->directory_fd = -1;
 	handle->parent_fd = -1;
 	handle->workdir_fd = -1;
+	handle->sidecar_fd = -1;
+	handle->lifecycle_lock_fd = -1;
 	handle->leaf[0] = '\0';
 	handle->workdir_leaf[0] = '\0';
+	handle->sidecar_leaf[0] = '\0';
 	handle->anchor_state = state;
 }
 
@@ -63,6 +70,10 @@ void darling_runtime_mode_close_prefix(
 		close(handle->parent_fd);
 	if (handle->workdir_fd >= 0)
 		close(handle->workdir_fd);
+	if (handle->sidecar_fd >= 0)
+		close(handle->sidecar_fd);
+	if (handle->lifecycle_lock_fd >= 0)
+		close(handle->lifecycle_lock_fd);
 	reset_handle(handle);
 }
 
@@ -78,6 +89,8 @@ int darling_runtime_prefix_move(
 			DARLING_RUNTIME_PREFIX_ANCHOR_UNINITIALIZED ||
 		destination->directory_fd >= 0 || destination->parent_fd >= 0 ||
 		destination->workdir_fd >= 0 ||
+		destination->sidecar_fd >= 0 ||
+		destination->lifecycle_lock_fd >= 0 ||
 		source->anchor_state ==
 			DARLING_RUNTIME_PREFIX_ANCHOR_UNINITIALIZED ||
 		source->anchor_state == DARLING_RUNTIME_PREFIX_ANCHOR_MOVED)
@@ -234,7 +247,9 @@ int darling_runtime_mode_open_prefix(
 			DARLING_RUNTIME_PREFIX_ANCHOR_UNINITIALIZED ||
 		handle->directory_fd >= 0 || handle->parent_fd >= 0 ||
 		handle->workdir_fd >= 0 || handle->leaf[0] != '\0' ||
-		handle->workdir_leaf[0] != '\0')
+		handle->sidecar_fd >= 0 || handle->workdir_leaf[0] != '\0' ||
+		handle->lifecycle_lock_fd >= 0 ||
+		handle->sidecar_leaf[0] != '\0')
 		return prefix_error(error, error_size,
 			"runtime prefix capability already owns an anchor: %s",
 			"invalid");
@@ -287,6 +302,16 @@ int darling_runtime_mode_open_prefix(
 				handle->parent_fd = current;
 				memcpy(handle->leaf, components[index],
 					strlen(components[index]) + 1);
+				if (snprintf(handle->sidecar_leaf,
+						sizeof(handle->sidecar_leaf), "%s%s",
+						handle->leaf,
+						DARLING_RUNTIME_PREFIX_SIDECAR_SUFFIX) >=
+					(int)sizeof(handle->sidecar_leaf)) {
+					darling_runtime_mode_close_prefix(handle);
+					return prefix_error(error, error_size,
+						"runtime prefix sidecar name is too long: %s",
+						components[index]);
+				}
 				handle->anchor_state =
 					DARLING_RUNTIME_PREFIX_ANCHOR_MISSING;
 				return 0;
@@ -326,6 +351,16 @@ int darling_runtime_mode_open_prefix(
 			handle->directory_fd = next;
 			memcpy(handle->leaf, components[index],
 				strlen(components[index]) + 1);
+			if (snprintf(handle->sidecar_leaf,
+					sizeof(handle->sidecar_leaf), "%s%s",
+					handle->leaf,
+					DARLING_RUNTIME_PREFIX_SIDECAR_SUFFIX) >=
+				(int)sizeof(handle->sidecar_leaf)) {
+				darling_runtime_mode_close_prefix(handle);
+				return prefix_error(error, error_size,
+					"runtime prefix sidecar name is too long: %s",
+					components[index]);
+			}
 			bool empty = false;
 			if (inspect_empty(next, &empty, error, error_size) != 0) {
 				darling_runtime_mode_close_prefix(handle);
@@ -1216,7 +1251,6 @@ int darling_runtime_mode_prefix_needs_initialization(
 enum lifecycle_transaction_operation {
 	LIFECYCLE_TRANSACTION_INVALID,
 	LIFECYCLE_TRANSACTION_CREATE,
-	LIFECYCLE_TRANSACTION_UPGRADE,
 	LIFECYCLE_TRANSACTION_RECREATE,
 	LIFECYCLE_TRANSACTION_DELETE,
 };
@@ -1230,8 +1264,7 @@ enum lifecycle_transaction_phase {
 	LIFECYCLE_PHASE_INVALID,
 	LIFECYCLE_PHASE_PREPARED,
 	LIFECYCLE_PHASE_REPLACEMENT_STAGED,
-	LIFECYCLE_PHASE_STATE_STAGED,
-	LIFECYCLE_PHASE_STATE_PUBLISHED,
+	LIFECYCLE_PHASE_SIDECAR_PUBLISHED,
 	LIFECYCLE_PHASE_PREFIX_PUBLISHED,
 	LIFECYCLE_PHASE_CLEANUP,
 };
@@ -1239,8 +1272,8 @@ enum lifecycle_transaction_phase {
 enum lifecycle_stable_kind {
 	LIFECYCLE_STABLE_MISSING,
 	LIFECYCLE_STABLE_EMPTY,
-	LIFECYCLE_STABLE_LEGACY_V1,
-	LIFECYCLE_STABLE_CURRENT_V2,
+	LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED,
+	LIFECYCLE_STABLE_CURRENT_V3,
 };
 
 struct lifecycle_stable_snapshot {
@@ -1265,6 +1298,7 @@ struct lifecycle_names {
 	char lock[DARLING_PREFIX_LIFECYCLE_NAME_MAX];
 	char transaction[DARLING_PREFIX_LIFECYCLE_NAME_MAX];
 	char stage[DARLING_PREFIX_LIFECYCLE_NAME_MAX];
+	char sidecar_stage[DARLING_PREFIX_LIFECYCLE_NAME_MAX];
 };
 
 struct lifecycle_transaction {
@@ -1277,6 +1311,10 @@ struct lifecycle_transaction {
 	uint64_t new_generation;
 	dev_t old_device;
 	ino_t old_inode;
+	dev_t old_sidecar_device;
+	ino_t old_sidecar_inode;
+	dev_t new_sidecar_device;
+	ino_t new_sidecar_inode;
 	uid_t owner_uid;
 	gid_t owner_gid;
 };
@@ -1341,11 +1379,14 @@ static int format_lifecycle_names(
 			".darling-prefix-lock-v2-%016" PRIx64, hash) >=
 			(int)sizeof(names->lock) ||
 		snprintf(names->transaction, sizeof(names->transaction),
-			".darling-prefix-transaction-v2-%016" PRIx64, hash) >=
+			".darling-prefix-transaction-v3-%016" PRIx64, hash) >=
 			(int)sizeof(names->transaction) ||
 		snprintf(names->stage, sizeof(names->stage),
-			".darling-prefix-stage-v2-%016" PRIx64, hash) >=
-			(int)sizeof(names->stage))
+			".darling-prefix-stage-v3-%016" PRIx64, hash) >=
+			(int)sizeof(names->stage) ||
+		snprintf(names->sidecar_stage, sizeof(names->sidecar_stage),
+			".darling-prefix-sidecar-stage-v1-%016" PRIx64, hash) >=
+			(int)sizeof(names->sidecar_stage))
 		return prefix_error(error, error_size,
 			"runtime prefix lifecycle metadata name is too long: %s",
 			handle->leaf);
@@ -1353,7 +1394,7 @@ static int format_lifecycle_names(
 }
 
 static int acquire_lifecycle_lock(
-	const darling_runtime_prefix handle,
+	darling_runtime_prefix handle,
 	const struct lifecycle_names* names,
 	uid_t owner_uid,
 	gid_t owner_gid,
@@ -1362,13 +1403,17 @@ static int acquire_lifecycle_lock(
 )
 {
 	bool created = false;
-	int fd = openat(handle->parent_fd, names->lock,
-		O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+	int fd = handle->lifecycle_lock_fd;
 	if (fd >= 0) {
-		created = true;
-	} else if (errno == EEXIST) {
+		handle->lifecycle_lock_fd = -1;
+	} else {
 		fd = openat(handle->parent_fd, names->lock,
-			O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+			O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (fd >= 0)
+			created = true;
+		else if (errno == EEXIST)
+			fd = openat(handle->parent_fd, names->lock,
+				O_RDWR | O_CLOEXEC | O_NOFOLLOW);
 	}
 	if (fd < 0)
 		return prefix_error(error, error_size,
@@ -1584,17 +1629,20 @@ static int format_prefix_state(
 	if (mode == NULL ||
 		state->schema_version != DARLING_RUNTIME_PREFIX_STATE_SCHEMA_VERSION ||
 		state->generation == 0 ||
+		state->sidecar_inode == 0 ||
 		strcmp(state->provenance,
 			DARLING_RUNTIME_PREFIX_PROVENANCE) != 0)
 		return prefix_error(error, error_size,
 			"runtime prefix state input is invalid: %s", "invalid");
 	int length = snprintf(content, capacity,
-		"DARLING_PREFIX_STATE_V2\n"
+		"DARLING_PREFIX_STATE_V3\n"
 		"schema_version=%u\n"
 		"runtime_mode=%s\n"
 		"generation=%" PRIu64 "\n"
 		"prefix_device=%" PRIuMAX "\n"
 		"prefix_inode=%" PRIuMAX "\n"
+		"sidecar_device=%" PRIuMAX "\n"
+		"sidecar_inode=%" PRIuMAX "\n"
 		"owner_uid=%" PRIuMAX "\n"
 		"owner_gid=%" PRIuMAX "\n"
 		"provenance=%s\n",
@@ -1603,6 +1651,8 @@ static int format_prefix_state(
 		state->generation,
 		(uintmax_t)state->prefix_device,
 		(uintmax_t)state->prefix_inode,
+		(uintmax_t)state->sidecar_device,
+		(uintmax_t)state->sidecar_inode,
 		(uintmax_t)state->owner_uid,
 		(uintmax_t)state->owner_gid,
 		state->provenance);
@@ -1619,10 +1669,10 @@ static int parse_prefix_state(
 	size_t error_size
 )
 {
-	char* lines[9];
+	char* lines[11];
 	if (split_exact_lines(content, lines,
 			sizeof(lines) / sizeof(lines[0])) != 0 ||
-		strcmp(lines[0], "DARLING_PREFIX_STATE_V2") != 0)
+		strcmp(lines[0], "DARLING_PREFIX_STATE_V3") != 0)
 		return prefix_error(error, error_size,
 			"runtime prefix state schema is malformed: %s", "invalid");
 	static const char* keys[] = {
@@ -1631,6 +1681,8 @@ static int parse_prefix_state(
 		"generation=",
 		"prefix_device=",
 		"prefix_inode=",
+		"sidecar_device=",
+		"sidecar_inode=",
 		"owner_uid=",
 		"owner_gid=",
 		"provenance=",
@@ -1648,14 +1700,20 @@ static int parse_prefix_state(
 	uintmax_t generation;
 	uintmax_t device;
 	uintmax_t inode;
+	uintmax_t sidecar_device;
+	uintmax_t sidecar_inode;
 	uintmax_t uid;
 	uintmax_t gid;
 	if (parse_uintmax_value(lines[1] + strlen(keys[0]), &schema) != 0 ||
 		parse_uintmax_value(lines[3] + strlen(keys[2]), &generation) != 0 ||
 		parse_uintmax_value(lines[4] + strlen(keys[3]), &device) != 0 ||
 		parse_uintmax_value(lines[5] + strlen(keys[4]), &inode) != 0 ||
-		parse_uintmax_value(lines[6] + strlen(keys[5]), &uid) != 0 ||
-		parse_uintmax_value(lines[7] + strlen(keys[6]), &gid) != 0 ||
+		parse_uintmax_value(lines[6] + strlen(keys[5]),
+			&sidecar_device) != 0 ||
+		parse_uintmax_value(lines[7] + strlen(keys[6]),
+			&sidecar_inode) != 0 ||
+		parse_uintmax_value(lines[8] + strlen(keys[7]), &uid) != 0 ||
+		parse_uintmax_value(lines[9] + strlen(keys[8]), &gid) != 0 ||
 		schema > UINT_MAX || generation > UINT64_MAX ||
 		uid > (uintmax_t)(uid_t)-1 || gid > (uintmax_t)(gid_t)-1)
 		return prefix_error(error, error_size,
@@ -1668,9 +1726,11 @@ static int parse_prefix_state(
 	state->generation = (uint64_t)generation;
 	state->prefix_device = (dev_t)device;
 	state->prefix_inode = (ino_t)inode;
+	state->sidecar_device = (dev_t)sidecar_device;
+	state->sidecar_inode = (ino_t)sidecar_inode;
 	state->owner_uid = (uid_t)uid;
 	state->owner_gid = (gid_t)gid;
-	const char* provenance = lines[8] + strlen(keys[7]);
+	const char* provenance = lines[10] + strlen(keys[9]);
 	if (strlen(provenance) >= sizeof(state->provenance))
 		return prefix_error(error, error_size,
 			"runtime prefix state provenance is too long: %s",
@@ -1750,6 +1810,77 @@ static int read_prefix_state_fd(
 	return 0;
 }
 
+static int validate_bound_sidecar(
+	const darling_runtime_prefix handle,
+	const struct darling_runtime_prefix_state* state,
+	struct stat* named_out,
+	char* error,
+	size_t error_size
+)
+{
+	if (handle == NULL || handle->parent_fd < 0 ||
+		handle->sidecar_leaf[0] == '\0' || state == NULL)
+		return prefix_error(error, error_size,
+			"runtime prefix sidecar binding is incomplete: %s",
+			"invalid");
+	struct stat named;
+	if (fstatat(handle->parent_fd, handle->sidecar_leaf, &named,
+			AT_SYMLINK_NOFOLLOW) != 0 ||
+		S_ISLNK(named.st_mode) || !S_ISDIR(named.st_mode) ||
+		(named.st_mode & 07777) != 0700 ||
+		named.st_uid != state->owner_uid ||
+		named.st_gid != state->owner_gid ||
+		named.st_dev != state->sidecar_device ||
+		named.st_ino != state->sidecar_inode)
+		return prefix_error(error, error_size,
+			"runtime prefix sidecar identity is missing or hostile: %s",
+			handle->sidecar_leaf);
+	if (named_out != NULL)
+		*named_out = named;
+	if (handle->sidecar_fd >= 0) {
+		struct stat opened;
+		if (fstat(handle->sidecar_fd, &opened) != 0 ||
+			opened.st_dev != state->sidecar_device ||
+			opened.st_ino != state->sidecar_inode ||
+			!S_ISDIR(opened.st_mode)) {
+			int saved_errno = errno == 0 ? EAGAIN : errno;
+			errno = saved_errno;
+			return prefix_error(error, error_size,
+				"retained sidecar no longer matches prefix state: %s",
+				handle->sidecar_leaf);
+		}
+	}
+	return 0;
+}
+
+static int anchor_bound_sidecar(
+	darling_runtime_prefix handle,
+	const struct darling_runtime_prefix_state* state,
+	char* error,
+	size_t error_size
+)
+{
+	struct stat named;
+	if (validate_bound_sidecar(handle, state, &named,
+			error, error_size) != 0)
+		return -1;
+	if (handle->sidecar_fd < 0) {
+		int fd = openat(handle->parent_fd, handle->sidecar_leaf,
+			O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (fd < 0)
+			return prefix_error(error, error_size,
+				"cannot retain runtime prefix sidecar: %s",
+				strerror(errno));
+		if (compare_opened_directory(fd, &named,
+				handle->sidecar_leaf, error, error_size) != 0) {
+			close(fd);
+			return -1;
+		}
+		handle->sidecar_fd = fd;
+	}
+	return 0;
+}
+
 int darling_runtime_prefix_read_state(
 	const darling_runtime_prefix handle,
 	enum darling_runtime_mode mode,
@@ -1766,8 +1897,12 @@ int darling_runtime_prefix_read_state(
 	if (darling_runtime_mode_verify_prefix_name(handle,
 			error, error_size) != 0)
 		return -1;
-	return read_prefix_state_fd(handle->directory_fd, mode,
-		owner_uid, owner_gid, state, false, error, error_size);
+	if (read_prefix_state_fd(handle->directory_fd, mode,
+			owner_uid, owner_gid, state, false,
+			error, error_size) != 0)
+		return -1;
+	return validate_bound_sidecar(handle, state, NULL,
+		error, error_size);
 }
 
 static int stage_new_prefix_state(
@@ -1781,7 +1916,7 @@ static int stage_new_prefix_state(
 	if (format_prefix_state(state, content, sizeof(content),
 			error, error_size) != 0)
 		return -1;
-	static const char temporary[] = ".darling-prefix-state-v2.tmp";
+	static const char temporary[] = ".darling-prefix-state-v3.tmp";
 	struct stat appeared;
 	if (fstatat(prefix_fd, temporary, &appeared,
 			AT_SYMLINK_NOFOLLOW) == 0) {
@@ -1840,7 +1975,7 @@ static int publish_staged_prefix_state(
 	size_t error_size
 )
 {
-	static const char temporary[] = ".darling-prefix-state-v2.tmp";
+	static const char temporary[] = ".darling-prefix-state-v3.tmp";
 	int rename_result = publish_mode == LIFECYCLE_PUBLISH_REPLACE
 		? renameat(prefix_fd, temporary, prefix_fd,
 			DARLING_RUNTIME_PREFIX_STATE_NAME)
@@ -1884,8 +2019,6 @@ static const char* transaction_operation_name(
 			return NULL;
 		case LIFECYCLE_TRANSACTION_CREATE:
 			return "create";
-		case LIFECYCLE_TRANSACTION_UPGRADE:
-			return "upgrade";
 		case LIFECYCLE_TRANSACTION_RECREATE:
 			return "recreate";
 		case LIFECYCLE_TRANSACTION_DELETE:
@@ -1900,8 +2033,6 @@ static enum lifecycle_transaction_operation transaction_operation_from_name(
 {
 	if (strcmp(name, "create") == 0)
 		return LIFECYCLE_TRANSACTION_CREATE;
-	if (strcmp(name, "upgrade") == 0)
-		return LIFECYCLE_TRANSACTION_UPGRADE;
 	if (strcmp(name, "recreate") == 0)
 		return LIFECYCLE_TRANSACTION_RECREATE;
 	if (strcmp(name, "delete") == 0)
@@ -1920,10 +2051,8 @@ static const char* transaction_phase_name(
 			return "prepared";
 		case LIFECYCLE_PHASE_REPLACEMENT_STAGED:
 			return "replacement-staged";
-		case LIFECYCLE_PHASE_STATE_STAGED:
-			return "state-staged";
-		case LIFECYCLE_PHASE_STATE_PUBLISHED:
-			return "state-published";
+		case LIFECYCLE_PHASE_SIDECAR_PUBLISHED:
+			return "sidecar-published";
 		case LIFECYCLE_PHASE_PREFIX_PUBLISHED:
 			return "prefix-published";
 		case LIFECYCLE_PHASE_CLEANUP:
@@ -1940,10 +2069,8 @@ static enum lifecycle_transaction_phase transaction_phase_from_name(
 		return LIFECYCLE_PHASE_PREPARED;
 	if (strcmp(name, "replacement-staged") == 0)
 		return LIFECYCLE_PHASE_REPLACEMENT_STAGED;
-	if (strcmp(name, "state-staged") == 0)
-		return LIFECYCLE_PHASE_STATE_STAGED;
-	if (strcmp(name, "state-published") == 0)
-		return LIFECYCLE_PHASE_STATE_PUBLISHED;
+	if (strcmp(name, "sidecar-published") == 0)
+		return LIFECYCLE_PHASE_SIDECAR_PUBLISHED;
 	if (strcmp(name, "prefix-published") == 0)
 		return LIFECYCLE_PHASE_PREFIX_PUBLISHED;
 	if (strcmp(name, "cleanup") == 0)
@@ -1969,7 +2096,7 @@ static int format_transaction(
 		return prefix_error(error, error_size,
 			"runtime prefix transaction input is invalid: %s", "invalid");
 	int length = snprintf(content, capacity,
-		"DARLING_PREFIX_TRANSACTION_V2\n"
+		"DARLING_PREFIX_TRANSACTION_V3\n"
 		"operation=%s\n"
 		"phase=%s\n"
 		"target=%s\n"
@@ -1979,6 +2106,10 @@ static int format_transaction(
 		"new_generation=%" PRIu64 "\n"
 		"old_device=%" PRIuMAX "\n"
 		"old_inode=%" PRIuMAX "\n"
+		"old_sidecar_device=%" PRIuMAX "\n"
+		"old_sidecar_inode=%" PRIuMAX "\n"
+		"new_sidecar_device=%" PRIuMAX "\n"
+		"new_sidecar_inode=%" PRIuMAX "\n"
 		"owner_uid=%" PRIuMAX "\n"
 		"owner_gid=%" PRIuMAX "\n"
 		"provenance=%s\n",
@@ -1991,6 +2122,10 @@ static int format_transaction(
 		transaction->new_generation,
 		(uintmax_t)transaction->old_device,
 		(uintmax_t)transaction->old_inode,
+		(uintmax_t)transaction->old_sidecar_device,
+		(uintmax_t)transaction->old_sidecar_inode,
+		(uintmax_t)transaction->new_sidecar_device,
+		(uintmax_t)transaction->new_sidecar_inode,
 		(uintmax_t)transaction->owner_uid,
 		(uintmax_t)transaction->owner_gid,
 		DARLING_RUNTIME_PREFIX_PROVENANCE);
@@ -2007,10 +2142,10 @@ static int parse_transaction(
 	size_t error_size
 )
 {
-	char* lines[13];
+	char* lines[17];
 	if (split_exact_lines(content, lines,
 			sizeof(lines) / sizeof(lines[0])) != 0 ||
-		strcmp(lines[0], "DARLING_PREFIX_TRANSACTION_V2") != 0)
+		strcmp(lines[0], "DARLING_PREFIX_TRANSACTION_V3") != 0)
 		return prefix_error(error, error_size,
 			"runtime prefix transaction schema is malformed: %s",
 			"invalid");
@@ -2024,6 +2159,10 @@ static int parse_transaction(
 		"new_generation=",
 		"old_device=",
 		"old_inode=",
+		"old_sidecar_device=",
+		"old_sidecar_inode=",
+		"new_sidecar_device=",
+		"new_sidecar_inode=",
 		"owner_uid=",
 		"owner_gid=",
 		"provenance=",
@@ -2063,6 +2202,10 @@ static int parse_transaction(
 	uintmax_t new_generation;
 	uintmax_t old_device;
 	uintmax_t old_inode;
+	uintmax_t old_sidecar_device;
+	uintmax_t old_sidecar_inode;
+	uintmax_t new_sidecar_device;
+	uintmax_t new_sidecar_inode;
 	uintmax_t uid;
 	uintmax_t gid;
 	if (parse_uintmax_value(lines[6] + strlen(keys[5]),
@@ -2073,13 +2216,21 @@ static int parse_transaction(
 			&old_device) != 0 ||
 		parse_uintmax_value(lines[9] + strlen(keys[8]),
 			&old_inode) != 0 ||
-		parse_uintmax_value(lines[10] + strlen(keys[9]), &uid) != 0 ||
-		parse_uintmax_value(lines[11] + strlen(keys[10]), &gid) != 0 ||
+		parse_uintmax_value(lines[10] + strlen(keys[9]),
+			&old_sidecar_device) != 0 ||
+		parse_uintmax_value(lines[11] + strlen(keys[10]),
+			&old_sidecar_inode) != 0 ||
+		parse_uintmax_value(lines[12] + strlen(keys[11]),
+			&new_sidecar_device) != 0 ||
+		parse_uintmax_value(lines[13] + strlen(keys[12]),
+			&new_sidecar_inode) != 0 ||
+		parse_uintmax_value(lines[14] + strlen(keys[13]), &uid) != 0 ||
+		parse_uintmax_value(lines[15] + strlen(keys[14]), &gid) != 0 ||
 		old_generation > UINT64_MAX ||
 		new_generation > UINT64_MAX ||
 		uid > (uintmax_t)(uid_t)-1 ||
 		gid > (uintmax_t)(gid_t)-1 ||
-		strcmp(lines[12] + strlen(keys[11]),
+		strcmp(lines[16] + strlen(keys[15]),
 			DARLING_RUNTIME_PREFIX_PROVENANCE) != 0)
 		return prefix_error(error, error_size,
 			"runtime prefix transaction value is invalid: %s",
@@ -2088,6 +2239,10 @@ static int parse_transaction(
 	transaction->new_generation = (uint64_t)new_generation;
 	transaction->old_device = (dev_t)old_device;
 	transaction->old_inode = (ino_t)old_inode;
+	transaction->old_sidecar_device = (dev_t)old_sidecar_device;
+	transaction->old_sidecar_inode = (ino_t)old_sidecar_inode;
+	transaction->new_sidecar_device = (dev_t)new_sidecar_device;
+	transaction->new_sidecar_inode = (ino_t)new_sidecar_inode;
 	transaction->owner_uid = (uid_t)uid;
 	transaction->owner_gid = (gid_t)gid;
 	if (transaction->mode == DARLING_RUNTIME_MODE_INVALID)
@@ -2477,7 +2632,7 @@ static int cleanup_transaction_metadata(
 {
 	if (handle->directory_fd >= 0) {
 		if (unlink_private_regular_at(handle->directory_fd,
-				".darling-prefix-state-v2.tmp", true,
+				".darling-prefix-state-v3.tmp", true,
 				error, error_size) != 0)
 			return -1;
 		if (cleanup_legacy &&
@@ -2513,7 +2668,10 @@ static int validate_transaction_identity(
 		transaction->owner_uid != owner_uid ||
 		transaction->owner_gid != owner_gid ||
 		transaction->new_generation == 0 ||
-		transaction->new_generation <= transaction->old_generation)
+		transaction->new_generation <= transaction->old_generation ||
+		(transaction->operation != LIFECYCLE_TRANSACTION_DELETE &&
+			transaction->phase >= LIFECYCLE_PHASE_REPLACEMENT_STAGED &&
+			transaction->new_sidecar_inode == 0))
 		return prefix_error(error, error_size,
 			"runtime prefix transaction belongs to another lifecycle: %s",
 			names->transaction);
@@ -2565,21 +2723,35 @@ static int inspect_stable_snapshot(
 	if (state_result < 0)
 		return -1;
 	if (state_result == 0) {
-		snapshot->kind = LIFECYCLE_STABLE_CURRENT_V2;
+		snapshot->kind = LIFECYCLE_STABLE_CURRENT_V3;
 		return 0;
 	}
+	struct stat legacy_state;
+	if (fstatat(handle->directory_fd,
+			DARLING_RUNTIME_PREFIX_LEGACY_STATE_NAME,
+			&legacy_state, AT_SYMLINK_NOFOLLOW) == 0) {
+		snapshot->kind = LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED;
+		return 0;
+	}
+	if (errno != ENOENT)
+		return prefix_error(error, error_size,
+			"cannot inspect legacy runtime prefix state: %s",
+			strerror(errno));
 	int legacy_result = validate_legacy_marker(handle->directory_fd,
 		mode, owner_uid, error, error_size);
 	if (legacy_result < 0)
 		return -1;
 	if (legacy_result == 0) {
-		snapshot->kind = LIFECYCLE_STABLE_LEGACY_V1;
+		snapshot->kind = LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED;
 		snapshot->value.legacy_mode = mode;
 		return 0;
 	}
-	return prefix_error(error, error_size,
-		"runtime prefix has no recognized stable state: %s",
-		"recreation required");
+	/*
+	 * A populated prefix without the v3 state marker is an unversioned
+	 * legacy format. It is never interpreted or upgraded in place.
+	 */
+	snapshot->kind = LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED;
+	return 0;
 }
 
 enum lifecycle_stable_relation {
@@ -2605,12 +2777,12 @@ static enum lifecycle_stable_relation stable_relation(
 				transaction->old_device, transaction->old_inode)
 				? LIFECYCLE_RELATION_OLD_EMPTY
 				: LIFECYCLE_RELATION_UNEXPECTED;
-		case LIFECYCLE_STABLE_LEGACY_V1:
+		case LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED:
 			return prefix_inode_matches(handle,
 				transaction->old_device, transaction->old_inode)
 				? LIFECYCLE_RELATION_OLD_LEGACY
 				: LIFECYCLE_RELATION_UNEXPECTED;
-		case LIFECYCLE_STABLE_CURRENT_V2:
+		case LIFECYCLE_STABLE_CURRENT_V3:
 			if (snapshot->value.current.generation ==
 				transaction->new_generation)
 				return LIFECYCLE_RELATION_NEW_CURRENT;
@@ -2647,37 +2819,18 @@ static enum lifecycle_recovery_disposition recovery_disposition(
 					if (relation == LIFECYCLE_RELATION_NEW_CURRENT)
 						return LIFECYCLE_RECOVERY_FINISH;
 					return LIFECYCLE_RECOVERY_INVALID;
-				case LIFECYCLE_PHASE_PREFIX_PUBLISHED:
-				case LIFECYCLE_PHASE_CLEANUP:
-					return relation == LIFECYCLE_RELATION_NEW_CURRENT
-						? LIFECYCLE_RECOVERY_FINISH
-						: LIFECYCLE_RECOVERY_INVALID;
-				case LIFECYCLE_PHASE_INVALID:
-				case LIFECYCLE_PHASE_STATE_STAGED:
-				case LIFECYCLE_PHASE_STATE_PUBLISHED:
-					return LIFECYCLE_RECOVERY_INVALID;
-			}
-			break;
-		case LIFECYCLE_TRANSACTION_UPGRADE:
-			switch (phase) {
-				case LIFECYCLE_PHASE_PREPARED:
-					return relation == LIFECYCLE_RELATION_OLD_LEGACY
-						? LIFECYCLE_RECOVERY_ROLLBACK
-						: LIFECYCLE_RECOVERY_INVALID;
-				case LIFECYCLE_PHASE_STATE_STAGED:
-					if (relation == LIFECYCLE_RELATION_OLD_LEGACY)
+				case LIFECYCLE_PHASE_SIDECAR_PUBLISHED:
+					if (relation == LIFECYCLE_RELATION_MISSING)
 						return LIFECYCLE_RECOVERY_ROLLBACK;
 					if (relation == LIFECYCLE_RELATION_NEW_CURRENT)
 						return LIFECYCLE_RECOVERY_FINISH;
 					return LIFECYCLE_RECOVERY_INVALID;
-				case LIFECYCLE_PHASE_STATE_PUBLISHED:
+				case LIFECYCLE_PHASE_PREFIX_PUBLISHED:
 				case LIFECYCLE_PHASE_CLEANUP:
 					return relation == LIFECYCLE_RELATION_NEW_CURRENT
 						? LIFECYCLE_RECOVERY_FINISH
 						: LIFECYCLE_RECOVERY_INVALID;
 				case LIFECYCLE_PHASE_INVALID:
-				case LIFECYCLE_PHASE_REPLACEMENT_STAGED:
-				case LIFECYCLE_PHASE_PREFIX_PUBLISHED:
 					return LIFECYCLE_RECOVERY_INVALID;
 			}
 			break;
@@ -2686,6 +2839,15 @@ static enum lifecycle_recovery_disposition recovery_disposition(
 				case LIFECYCLE_PHASE_PREPARED:
 				case LIFECYCLE_PHASE_REPLACEMENT_STAGED:
 					if (relation == LIFECYCLE_RELATION_OLD_EMPTY ||
+						relation == LIFECYCLE_RELATION_OLD_LEGACY ||
+						relation == LIFECYCLE_RELATION_OLD_CURRENT)
+						return LIFECYCLE_RECOVERY_ROLLBACK;
+					if (relation == LIFECYCLE_RELATION_NEW_CURRENT)
+						return LIFECYCLE_RECOVERY_FINISH;
+					return LIFECYCLE_RECOVERY_INVALID;
+				case LIFECYCLE_PHASE_SIDECAR_PUBLISHED:
+					if (relation == LIFECYCLE_RELATION_OLD_EMPTY ||
+						relation == LIFECYCLE_RELATION_OLD_LEGACY ||
 						relation == LIFECYCLE_RELATION_OLD_CURRENT)
 						return LIFECYCLE_RECOVERY_ROLLBACK;
 					if (relation == LIFECYCLE_RELATION_NEW_CURRENT)
@@ -2697,14 +2859,18 @@ static enum lifecycle_recovery_disposition recovery_disposition(
 						? LIFECYCLE_RECOVERY_FINISH
 						: LIFECYCLE_RECOVERY_INVALID;
 				case LIFECYCLE_PHASE_INVALID:
-				case LIFECYCLE_PHASE_STATE_STAGED:
-				case LIFECYCLE_PHASE_STATE_PUBLISHED:
 					return LIFECYCLE_RECOVERY_INVALID;
 			}
 			break;
 		case LIFECYCLE_TRANSACTION_DELETE:
 			switch (phase) {
 				case LIFECYCLE_PHASE_PREPARED:
+					if (relation == LIFECYCLE_RELATION_OLD_CURRENT)
+						return LIFECYCLE_RECOVERY_ROLLBACK;
+					if (relation == LIFECYCLE_RELATION_MISSING)
+						return LIFECYCLE_RECOVERY_FINISH;
+					return LIFECYCLE_RECOVERY_INVALID;
+				case LIFECYCLE_PHASE_SIDECAR_PUBLISHED:
 					if (relation == LIFECYCLE_RELATION_OLD_CURRENT)
 						return LIFECYCLE_RECOVERY_ROLLBACK;
 					if (relation == LIFECYCLE_RELATION_MISSING)
@@ -2717,8 +2883,6 @@ static enum lifecycle_recovery_disposition recovery_disposition(
 						: LIFECYCLE_RECOVERY_INVALID;
 				case LIFECYCLE_PHASE_INVALID:
 				case LIFECYCLE_PHASE_REPLACEMENT_STAGED:
-				case LIFECYCLE_PHASE_STATE_STAGED:
-				case LIFECYCLE_PHASE_STATE_PUBLISHED:
 					return LIFECYCLE_RECOVERY_INVALID;
 			}
 			break;
@@ -2759,6 +2923,149 @@ int darling_runtime_prefix_test_recovery_matrix(
 }
 #endif
 
+static int named_directory_identity(
+	int parent_fd,
+	const char* name,
+	dev_t expected_device,
+	ino_t expected_inode,
+	bool missing_ok,
+	char* error,
+	size_t error_size
+)
+{
+	struct stat status;
+	if (fstatat(parent_fd, name, &status, AT_SYMLINK_NOFOLLOW) != 0) {
+		if (missing_ok && errno == ENOENT)
+			return 1;
+		return prefix_error(error, error_size,
+			"cannot inspect lifecycle sidecar identity: %s",
+			strerror(errno));
+	}
+	if (S_ISLNK(status.st_mode) || !S_ISDIR(status.st_mode) ||
+		status.st_dev != expected_device ||
+		status.st_ino != expected_inode)
+		return prefix_error(error, error_size,
+			"lifecycle sidecar identity is inconsistent: %s", name);
+	return 0;
+}
+
+static int recover_sidecar_rollback(
+	darling_runtime_prefix handle,
+	const struct lifecycle_names* names,
+	const struct lifecycle_transaction* transaction,
+	char* error,
+	size_t error_size
+)
+{
+	struct stat final_status;
+	int final_result = fstatat(handle->parent_fd, handle->sidecar_leaf,
+		&final_status, AT_SYMLINK_NOFOLLOW);
+	if (final_result != 0 && errno != ENOENT)
+		return prefix_error(error, error_size,
+			"cannot inspect sidecar rollback boundary: %s",
+			strerror(errno));
+	const bool final_missing = final_result != 0;
+	const bool new_published = !final_missing &&
+		S_ISDIR(final_status.st_mode) &&
+		!S_ISLNK(final_status.st_mode) &&
+		final_status.st_dev == transaction->new_sidecar_device &&
+		final_status.st_ino == transaction->new_sidecar_inode;
+	if (!new_published) {
+		if ((!final_missing &&
+			 (transaction->old_sidecar_inode == 0 ||
+			  final_status.st_dev != transaction->old_sidecar_device ||
+			  final_status.st_ino != transaction->old_sidecar_inode)) ||
+			(final_missing && transaction->old_sidecar_inode != 0))
+			return prefix_error(error, error_size,
+				"runtime sidecar changed before rollback: %s",
+				handle->sidecar_leaf);
+		return remove_named_tree(handle->parent_fd,
+			names->sidecar_stage, true, error, error_size);
+	}
+	if (named_directory_identity(handle->parent_fd,
+			handle->sidecar_leaf,
+			transaction->new_sidecar_device,
+			transaction->new_sidecar_inode,
+			false, error, error_size) != 0)
+		return -1;
+	if (transaction->old_sidecar_inode != 0) {
+		if (named_directory_identity(handle->parent_fd,
+				names->sidecar_stage,
+				transaction->old_sidecar_device,
+				transaction->old_sidecar_inode,
+				false, error, error_size) != 0 ||
+			renameat2(handle->parent_fd, names->sidecar_stage,
+				handle->parent_fd, handle->sidecar_leaf,
+				RENAME_EXCHANGE) != 0)
+			return prefix_error(error, error_size,
+				"cannot roll back runtime prefix sidecar publication: %s",
+				strerror(errno));
+		return remove_named_tree(handle->parent_fd,
+			names->sidecar_stage, false, error, error_size);
+	}
+	return remove_named_tree(handle->parent_fd,
+		handle->sidecar_leaf, false, error, error_size);
+}
+
+static int recover_sidecar_finish(
+	darling_runtime_prefix handle,
+	const struct lifecycle_names* names,
+	const struct lifecycle_transaction* transaction,
+	char* error,
+	size_t error_size
+)
+{
+	if (named_directory_identity(handle->parent_fd,
+			handle->sidecar_leaf,
+			transaction->new_sidecar_device,
+			transaction->new_sidecar_inode,
+			false, error, error_size) != 0)
+		return -1;
+	return remove_named_tree(handle->parent_fd,
+		names->sidecar_stage, true, error, error_size);
+}
+
+static int recover_delete_sidecar(
+	darling_runtime_prefix handle,
+	const struct lifecycle_names* names,
+	const struct lifecycle_transaction* transaction,
+	enum lifecycle_recovery_disposition disposition,
+	char* error,
+	size_t error_size
+)
+{
+	int stage_result = named_directory_identity(handle->parent_fd,
+		names->sidecar_stage,
+		transaction->old_sidecar_device,
+		transaction->old_sidecar_inode,
+		true, error, error_size);
+	if (stage_result < 0)
+		return -1;
+	if (stage_result == 1) {
+		if (transaction->phase >= LIFECYCLE_PHASE_SIDECAR_PUBLISHED)
+			return prefix_error(error, error_size,
+				"runtime sidecar deletion stage is missing: %s",
+				names->sidecar_stage);
+		return 0;
+	}
+	if (disposition == LIFECYCLE_RECOVERY_ROLLBACK) {
+		struct stat appeared;
+		if (fstatat(handle->parent_fd, handle->sidecar_leaf,
+				&appeared, AT_SYMLINK_NOFOLLOW) == 0 ||
+			errno != ENOENT ||
+			renameat2(handle->parent_fd, names->sidecar_stage,
+				handle->parent_fd, handle->sidecar_leaf,
+				RENAME_NOREPLACE) != 0)
+			return prefix_error(error, error_size,
+				"cannot roll back runtime sidecar deletion: %s",
+				strerror(errno));
+		return fsync_directory(handle->parent_fd,
+			"sidecar deletion rollback", error, error_size);
+	}
+	return remove_named_tree(handle->parent_fd,
+		names->sidecar_stage, false, error, error_size);
+}
+
 static int recover_interrupted_transaction(
 	darling_runtime_prefix handle,
 	const struct lifecycle_names* names,
@@ -2777,9 +3084,11 @@ static int recover_interrupted_transaction(
 	if (transaction_result == 1) {
 		struct stat unexpected;
 		if (fstatat(handle->parent_fd, names->stage, &unexpected,
+				AT_SYMLINK_NOFOLLOW) == 0 ||
+			fstatat(handle->parent_fd, names->sidecar_stage, &unexpected,
 				AT_SYMLINK_NOFOLLOW) == 0)
 			return prefix_error(error, error_size,
-				"orphan runtime prefix stage has no transaction: %s",
+				"orphan runtime prefix or sidecar stage has no transaction: %s",
 				names->stage);
 		if (errno != ENOENT)
 			return prefix_error(error, error_size,
@@ -2807,11 +3116,18 @@ static int recover_interrupted_transaction(
 			names->transaction);
 
 	if (disposition == LIFECYCLE_RECOVERY_ROLLBACK) {
-		if (remove_named_tree(handle->parent_fd, names->stage,
+		if (((transaction.operation == LIFECYCLE_TRANSACTION_CREATE ||
+			  transaction.operation == LIFECYCLE_TRANSACTION_RECREATE) &&
+			 recover_sidecar_rollback(handle, names, &transaction,
+				error, error_size) != 0) ||
+			(transaction.operation == LIFECYCLE_TRANSACTION_DELETE &&
+			 recover_delete_sidecar(handle, names, &transaction,
+				disposition, error, error_size) != 0) ||
+			remove_named_tree(handle->parent_fd, names->stage,
 				true, error, error_size) != 0 ||
 			(handle->directory_fd >= 0 &&
 			 unlink_private_regular_at(handle->directory_fd,
-				".darling-prefix-state-v2.tmp", true,
+				".darling-prefix-state-v3.tmp", true,
 				error, error_size) != 0) ||
 			unlink_private_regular_at(handle->parent_fd,
 				names->transaction, false,
@@ -2829,6 +3145,15 @@ static int recover_interrupted_transaction(
 		if (remove_named_tree(handle->parent_fd, names->stage,
 				true, error, error_size) != 0)
 			return -1;
+		if ((operation == LIFECYCLE_TRANSACTION_CREATE ||
+			 operation == LIFECYCLE_TRANSACTION_RECREATE) &&
+			recover_sidecar_finish(handle, names, &transaction,
+				error, error_size) != 0)
+			return -1;
+		if (operation == LIFECYCLE_TRANSACTION_DELETE &&
+			recover_delete_sidecar(handle, names, &transaction,
+				disposition, error, error_size) != 0)
+			return -1;
 		if ((operation == LIFECYCLE_TRANSACTION_RECREATE ||
 			 operation == LIFECYCLE_TRANSACTION_DELETE) &&
 			remove_prefix_workdir(handle, true,
@@ -2836,12 +3161,8 @@ static int recover_interrupted_transaction(
 			return -1;
 		if (handle->directory_fd >= 0) {
 			if (unlink_private_regular_at(handle->directory_fd,
-					".darling-prefix-state-v2.tmp", true,
+					".darling-prefix-state-v3.tmp", true,
 					error, error_size) != 0 ||
-				(operation == LIFECYCLE_TRANSACTION_UPGRADE &&
-				 unlink_private_regular_at(handle->directory_fd,
-					DARLING_RUNTIME_MODE_MARKER_NAME, true,
-					error, error_size) != 0) ||
 				fsync_directory(handle->directory_fd,
 					"transaction finish", error, error_size) != 0)
 				return -1;
@@ -2859,6 +3180,7 @@ static int recover_interrupted_transaction(
 
 static int make_prefix_state(
 	int prefix_fd,
+	int sidecar_fd,
 	enum darling_runtime_mode mode,
 	uint64_t generation,
 	uid_t owner_uid,
@@ -2869,8 +3191,11 @@ static int make_prefix_state(
 )
 {
 	struct stat status;
+	struct stat sidecar_status;
 	if (prefix_fd < 0 || fstat(prefix_fd, &status) != 0 ||
-		!S_ISDIR(status.st_mode) || generation == 0)
+		!S_ISDIR(status.st_mode) || sidecar_fd < 0 ||
+		fstat(sidecar_fd, &sidecar_status) != 0 ||
+		!S_ISDIR(sidecar_status.st_mode) || generation == 0)
 		return prefix_error(error, error_size,
 			"cannot identify runtime prefix state directory: %s",
 			strerror(errno));
@@ -2880,6 +3205,8 @@ static int make_prefix_state(
 	state->generation = generation;
 	state->prefix_device = status.st_dev;
 	state->prefix_inode = status.st_ino;
+	state->sidecar_device = sidecar_status.st_dev;
+	state->sidecar_inode = sidecar_status.st_ino;
 	state->owner_uid = owner_uid;
 	state->owner_gid = owner_gid;
 	strcpy(state->provenance, DARLING_RUNTIME_PREFIX_PROVENANCE);
@@ -2919,20 +3246,41 @@ static int initialize_staged_prefix(
 {
 	struct stat unexpected;
 	if (fstatat(target->parent_fd, names->stage, &unexpected,
+			AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT ||
+		fstatat(target->parent_fd, names->sidecar_stage, &unexpected,
 			AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
 		return prefix_error(error, error_size,
-			"runtime prefix stage already exists or is hostile: %s",
+			"runtime prefix or sidecar stage already exists or is hostile: %s",
 			names->stage);
+	int sidecar_fd = create_and_open_directory(target->parent_fd,
+		names->sidecar_stage, 0700, error, error_size);
+	if (sidecar_fd < 0)
+		return -1;
+	if (fchown(sidecar_fd, owner_uid, owner_gid) != 0 ||
+		fchmod(sidecar_fd, 0700) != 0 ||
+		fsync_directory(sidecar_fd, "staged empty sidecar",
+			error, error_size) != 0) {
+		int saved_errno = errno;
+		close(sidecar_fd);
+		errno = saved_errno;
+		return prefix_error(error, error_size,
+			"cannot finalize staged runtime prefix sidecar: %s",
+			strerror(errno));
+	}
 	int stage_fd = create_and_open_directory(target->parent_fd,
 		names->stage, 0700, error, error_size);
-	if (stage_fd < 0)
+	if (stage_fd < 0) {
+		close(sidecar_fd);
 		return -1;
+	}
 	darling_runtime_prefix staged =
 		DARLING_RUNTIME_PREFIX_INITIALIZER;
 	staged->parent_fd = dup(target->parent_fd);
 	staged->directory_fd = stage_fd;
+	staged->sidecar_fd = sidecar_fd;
 	staged->anchor_state = DARLING_RUNTIME_PREFIX_ANCHOR_EMPTY;
 	strcpy(staged->leaf, names->stage);
+	strcpy(staged->sidecar_leaf, names->sidecar_stage);
 	if (staged->parent_fd < 0 ||
 		darling_runtime_mode_setup_prefix(staged, user_name,
 			owner_uid, owner_gid, error, error_size) != 0 ||
@@ -2940,7 +3288,7 @@ static int initialize_staged_prefix(
 		 prefix_error(error, error_size,
 			"cannot finalize staged prefix mode: %s",
 			strerror(errno)) != 0) ||
-		make_prefix_state(stage_fd, mode, generation,
+		make_prefix_state(stage_fd, sidecar_fd, mode, generation,
 			owner_uid, owner_gid, state_out,
 			error, error_size) != 0 ||
 		write_new_prefix_state(stage_fd, state_out,
@@ -3022,6 +3370,45 @@ static int publish_staged_prefix(
 		error, error_size);
 }
 
+static int publish_staged_sidecar(
+	darling_runtime_prefix handle,
+	const struct lifecycle_names* names,
+	darling_runtime_prefix staged,
+	enum lifecycle_transaction_operation operation,
+	char* error,
+	size_t error_size
+)
+{
+	if ((operation != LIFECYCLE_TRANSACTION_CREATE &&
+			operation != LIFECYCLE_TRANSACTION_RECREATE) ||
+		staged == NULL || staged->sidecar_fd < 0 ||
+		strcmp(staged->sidecar_leaf, names->sidecar_stage) != 0 ||
+		handle->sidecar_leaf[0] == '\0')
+		return prefix_error(error, error_size,
+			"staged runtime prefix sidecar capability is invalid: %s",
+			names->sidecar_stage);
+	const bool replacing = handle->sidecar_fd >= 0;
+	int rename_result = replacing
+		? renameat2(handle->parent_fd, names->sidecar_stage,
+			handle->parent_fd, handle->sidecar_leaf, RENAME_EXCHANGE)
+		: renameat2(handle->parent_fd, names->sidecar_stage,
+			handle->parent_fd, handle->sidecar_leaf, RENAME_NOREPLACE);
+	if (rename_result != 0)
+		return prefix_error(error, error_size,
+			"cannot publish staged runtime prefix sidecar atomically: %s",
+			strerror(errno));
+	int old_sidecar_fd = handle->sidecar_fd;
+	handle->sidecar_fd = staged->sidecar_fd;
+	staged->sidecar_fd = old_sidecar_fd;
+	if (staged->sidecar_fd < 0)
+		staged->sidecar_leaf[0] = '\0';
+	if (fsync_directory(handle->parent_fd,
+			"prefix sidecar publication", error, error_size) != 0)
+		return -1;
+	return lifecycle_checkpoint("sidecar-published",
+		error, error_size);
+}
+
 static int format_workdir_leaf(
 	const darling_runtime_prefix handle,
 	char* leaf,
@@ -3100,6 +3487,105 @@ static int ensure_prefix_not_running(
 	return 0;
 }
 
+static int decode_mountinfo_path(char* path)
+{
+	char* input = path;
+	char* output = path;
+	while (*input != '\0') {
+		if (*input == '\\' &&
+			input[1] >= '0' && input[1] <= '7' &&
+			input[2] >= '0' && input[2] <= '7' &&
+			input[3] >= '0' && input[3] <= '7') {
+			unsigned int value =
+				(unsigned int)(input[1] - '0') * 64 +
+				(unsigned int)(input[2] - '0') * 8 +
+				(unsigned int)(input[3] - '0');
+			if (value == 0)
+				return -1;
+			*output++ = (char)value;
+			input += 4;
+			continue;
+		}
+		*output++ = *input++;
+	}
+	*output = '\0';
+	return 0;
+}
+
+static int ensure_prefix_not_mounted(
+	const darling_runtime_prefix handle,
+	char* error,
+	size_t error_size
+)
+{
+	char descriptor_path[64];
+	char prefix_path[DARLING_RUNTIME_PREFIX_PATH_MAX];
+	int descriptor_length = snprintf(descriptor_path,
+		sizeof(descriptor_path), "/proc/self/fd/%d",
+		handle->directory_fd);
+	if (descriptor_length < 0 ||
+		(size_t)descriptor_length >= sizeof(descriptor_path))
+		return prefix_error(error, error_size,
+			"cannot construct retained prefix descriptor path: %s",
+			"invalid");
+	ssize_t prefix_length = readlink(descriptor_path,
+		prefix_path, sizeof(prefix_path) - 1);
+	if (prefix_length <= 0 ||
+		prefix_length >= (ssize_t)sizeof(prefix_path) - 1)
+		return prefix_error(error, error_size,
+			"cannot identify retained prefix for mount check: %s",
+			prefix_length < 0 ? strerror(errno) : "path too long");
+	prefix_path[prefix_length] = '\0';
+	if (strstr(prefix_path, " (deleted)") != NULL)
+		return prefix_error(error, error_size,
+			"retained prefix was detached before mount check: %s",
+			"invalid");
+
+	const char* mountinfo_path = "/proc/self/mountinfo";
+#ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
+	if (darling_runtime_prefix_test_mountinfo_path != NULL)
+		mountinfo_path = darling_runtime_prefix_test_mountinfo_path;
+#endif
+	FILE* mountinfo = fopen(mountinfo_path, "re");
+	if (mountinfo == NULL)
+		return prefix_error(error, error_size,
+			"cannot inspect runtime prefix mounts: %s",
+			strerror(errno));
+	char* line = NULL;
+	size_t capacity = 0;
+	int result = 0;
+	while (getline(&line, &capacity, mountinfo) >= 0) {
+		char* save = NULL;
+		char* field = strtok_r(line, " ", &save);
+		for (int index = 1; field != NULL && index < 5; ++index)
+			field = strtok_r(NULL, " ", &save);
+		if (field == NULL || decode_mountinfo_path(field) != 0) {
+			result = prefix_error(error, error_size,
+				"runtime mountinfo is malformed: %s", "invalid");
+			break;
+		}
+		size_t mount_length = strlen(field);
+		if ((mount_length == (size_t)prefix_length &&
+			 memcmp(field, prefix_path, mount_length) == 0) ||
+			(mount_length > (size_t)prefix_length &&
+			 memcmp(field, prefix_path, (size_t)prefix_length) == 0 &&
+			 field[prefix_length] == '/')) {
+			result = prefix_error(error, error_size,
+				"runtime prefix has a live mount and cannot be"
+				" recreated: %s", field);
+			break;
+		}
+	}
+	int saved_errno = errno;
+	free(line);
+	if (fclose(mountinfo) != 0 && result == 0)
+		result = prefix_error(error, error_size,
+			"cannot finish runtime prefix mount inspection: %s",
+			strerror(errno));
+	errno = saved_errno;
+	return result;
+}
+
 static void recover_preserving_failure(
 	darling_runtime_prefix handle,
 	const struct lifecycle_names* names,
@@ -3159,6 +3645,16 @@ static int begin_transaction(
 		transaction->old_device = old_status.st_dev;
 		transaction->old_inode = old_status.st_ino;
 	}
+	if (handle->sidecar_fd >= 0) {
+		struct stat old_sidecar;
+		if (fstat(handle->sidecar_fd, &old_sidecar) != 0 ||
+			!S_ISDIR(old_sidecar.st_mode))
+			return prefix_error(error, error_size,
+				"cannot identify current runtime prefix sidecar: %s",
+				strerror(errno));
+		transaction->old_sidecar_device = old_sidecar.st_dev;
+		transaction->old_sidecar_inode = old_sidecar.st_ino;
+	}
 	if (write_transaction(handle, names, transaction,
 			LIFECYCLE_PUBLISH_CREATE,
 			error, error_size) != 0)
@@ -3207,7 +3703,29 @@ static int create_or_recreate_prefix(
 	struct darling_runtime_prefix_state new_state;
 	if (initialize_staged_prefix(handle, names, mode, user_name,
 			owner_uid, owner_gid, transaction.new_generation,
-			staged, &new_state, error, error_size) != 0 ||
+			staged, &new_state, error, error_size) != 0) {
+		int saved_errno = errno;
+		char saved_error[512];
+		snprintf(saved_error, sizeof(saved_error), "%s",
+			error == NULL ? "cannot stage runtime prefix" : error);
+		darling_runtime_mode_close_prefix(staged);
+		recover_preserving_failure(handle, names, mode,
+			owner_uid, owner_gid, saved_errno, saved_error,
+			error, error_size);
+		return -1;
+	}
+	struct stat staged_sidecar_status;
+	if (fstat(staged->sidecar_fd, &staged_sidecar_status) != 0) {
+		int saved_errno = errno;
+		darling_runtime_mode_close_prefix(staged);
+		errno = saved_errno;
+		return prefix_error(error, error_size,
+			"cannot identify staged runtime sidecar: %s",
+			strerror(errno));
+	}
+	transaction.new_sidecar_device = staged_sidecar_status.st_dev;
+	transaction.new_sidecar_inode = staged_sidecar_status.st_ino;
+	if (
 		advance_transaction_phase(handle, names, &transaction,
 			LIFECYCLE_PHASE_PREPARED,
 			LIFECYCLE_PHASE_REPLACEMENT_STAGED,
@@ -3217,6 +3735,23 @@ static int create_or_recreate_prefix(
 		char saved_error[512];
 		snprintf(saved_error, sizeof(saved_error), "%s",
 			error == NULL ? "cannot stage runtime prefix" : error);
+		darling_runtime_mode_close_prefix(staged);
+		recover_preserving_failure(handle, names, mode,
+			owner_uid, owner_gid, saved_errno, saved_error,
+			error, error_size);
+		return -1;
+	}
+	if (publish_staged_sidecar(handle, names, staged, operation,
+			error, error_size) != 0 ||
+		advance_transaction_phase(handle, names, &transaction,
+			LIFECYCLE_PHASE_REPLACEMENT_STAGED,
+			LIFECYCLE_PHASE_SIDECAR_PUBLISHED,
+			"journal-sidecar-published",
+			error, error_size) != 0) {
+		int saved_errno = errno;
+		char saved_error[512];
+		snprintf(saved_error, sizeof(saved_error), "%s",
+			error == NULL ? "cannot publish runtime sidecar" : error);
 		darling_runtime_mode_close_prefix(staged);
 		recover_preserving_failure(handle, names, mode,
 			owner_uid, owner_gid, saved_errno, saved_error,
@@ -3237,7 +3772,7 @@ static int create_or_recreate_prefix(
 		return -1;
 	}
 	if (advance_transaction_phase(handle, names, &transaction,
-			LIFECYCLE_PHASE_REPLACEMENT_STAGED,
+			LIFECYCLE_PHASE_SIDECAR_PUBLISHED,
 			LIFECYCLE_PHASE_PREFIX_PUBLISHED,
 			"journal-prefix-published",
 			error, error_size) != 0 ||
@@ -3262,6 +3797,9 @@ static int create_or_recreate_prefix(
 		}
 		if (remove_named_tree(handle->parent_fd, names->stage,
 				false, error, error_size) != 0 ||
+			remove_named_tree(handle->parent_fd,
+				names->sidecar_stage, true,
+				error, error_size) != 0 ||
 			remove_prefix_workdir(handle, true,
 				error, error_size) != 0) {
 			int saved_errno = errno;
@@ -3274,6 +3812,11 @@ static int create_or_recreate_prefix(
 			return -1;
 		}
 	}
+	if (operation == LIFECYCLE_TRANSACTION_CREATE &&
+		remove_named_tree(handle->parent_fd,
+			names->sidecar_stage, true,
+			error, error_size) != 0)
+		return -1;
 	if (cleanup_transaction_metadata(handle, names, false,
 			error, error_size) != 0 ||
 		lifecycle_checkpoint("cleanup-complete",
@@ -3291,89 +3834,11 @@ static int create_or_recreate_prefix(
 	return 0;
 }
 
-static int upgrade_legacy_prefix(
-	darling_runtime_prefix handle,
-	const struct lifecycle_names* names,
-	enum darling_runtime_mode mode,
-	uid_t owner_uid,
-	gid_t owner_gid,
-	enum lifecycle_recovery_status recovered,
-	struct darling_runtime_prefix_lifecycle_result* result,
-	char* error,
-	size_t error_size
-)
-{
-	struct lifecycle_transaction transaction;
-	if (begin_transaction(handle, names,
-			LIFECYCLE_TRANSACTION_UPGRADE,
-			mode, 0, 1, owner_uid, owner_gid,
-			&transaction, error, error_size) != 0) {
-		int saved_errno = errno;
-		char saved_error[512];
-		snprintf(saved_error, sizeof(saved_error), "%s",
-			error == NULL ? "cannot begin prefix upgrade" : error);
-		recover_preserving_failure(handle, names, mode,
-			owner_uid, owner_gid, saved_errno, saved_error,
-			error, error_size);
-		return -1;
-	}
-	struct darling_runtime_prefix_state state;
-	if (make_prefix_state(handle->directory_fd, mode, 1,
-			owner_uid, owner_gid, &state, error, error_size) != 0 ||
-		stage_new_prefix_state(handle->directory_fd, &state,
-			error, error_size) != 0 ||
-		advance_transaction_phase(handle, names, &transaction,
-			LIFECYCLE_PHASE_PREPARED,
-			LIFECYCLE_PHASE_STATE_STAGED,
-			"journal-state-staged", error, error_size) != 0 ||
-		publish_staged_prefix_state(handle->directory_fd,
-			LIFECYCLE_PUBLISH_CREATE, error, error_size) != 0 ||
-		advance_transaction_phase(handle, names, &transaction,
-			LIFECYCLE_PHASE_STATE_STAGED,
-			LIFECYCLE_PHASE_STATE_PUBLISHED,
-			"journal-state-published", error, error_size) != 0 ||
-		advance_transaction_phase(handle, names, &transaction,
-			LIFECYCLE_PHASE_STATE_PUBLISHED,
-			LIFECYCLE_PHASE_CLEANUP,
-			"cleanup-start",
-			error, error_size) != 0) {
-		int saved_errno = errno;
-		char saved_error[512];
-		snprintf(saved_error, sizeof(saved_error), "%s",
-			error == NULL ? "cannot upgrade runtime prefix" : error);
-		recover_preserving_failure(handle, names, mode,
-			owner_uid, owner_gid, saved_errno, saved_error,
-			error, error_size);
-		return -1;
-	}
-	if (cleanup_transaction_metadata(handle, names, true,
-			error, error_size) != 0 ||
-		lifecycle_checkpoint("cleanup-complete",
-			error, error_size) != 0)
-		return -1;
-	if (result != NULL) {
-		memset(result, 0, sizeof(*result));
-		result->action = DARLING_RUNTIME_PREFIX_UPGRADED;
-		result->recovery =
-			recovered == LIFECYCLE_RECOVERED
-				? DARLING_RUNTIME_PREFIX_RECOVERED_TRANSACTION
-				: DARLING_RUNTIME_PREFIX_NO_RECOVERY;
-		result->state = state;
-	}
-	return 0;
-}
-
-enum lifecycle_legacy_policy {
-	LIFECYCLE_LEGACY_REJECT,
-	LIFECYCLE_LEGACY_ALLOW_UPGRADE,
-};
-
 static int preflight_existing_prefix_compatibility(
 	darling_runtime_prefix handle,
 	enum darling_runtime_mode mode,
 	uid_t owner_uid,
 	gid_t owner_gid,
-	enum lifecycle_legacy_policy legacy_policy,
 	struct lifecycle_stable_snapshot* stable,
 	char* error,
 	size_t error_size
@@ -3383,16 +3848,11 @@ static int preflight_existing_prefix_compatibility(
 			stable, error, error_size) != 0)
 		return -1;
 	switch (stable->kind) {
-		case LIFECYCLE_STABLE_CURRENT_V2:
+		case LIFECYCLE_STABLE_CURRENT_V3:
 			return validate_complete_prefix_contents(handle,
 				error, error_size);
-		case LIFECYCLE_STABLE_LEGACY_V1:
-			if (legacy_policy != LIFECYCLE_LEGACY_ALLOW_UPGRADE)
-				return prefix_error(error, error_size,
-					"legacy runtime prefix state requires explicit upgrade: %s",
-					"recreation required");
-			return validate_complete_prefix_contents(handle,
-				error, error_size);
+		case LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED:
+			return 1;
 		case LIFECYCLE_STABLE_MISSING:
 		case LIFECYCLE_STABLE_EMPTY:
 			return 0;
@@ -3419,12 +3879,26 @@ int darling_runtime_prefix_prepare(
 		return prefix_error(error, error_size,
 			"runtime prefix prepare input is invalid: %s", "invalid");
 	struct lifecycle_stable_snapshot preflight;
-	if (handle->anchor_state == DARLING_RUNTIME_PREFIX_ANCHOR_POPULATED &&
-		preflight_existing_prefix_compatibility(handle, mode,
-			owner_uid, owner_gid,
-			LIFECYCLE_LEGACY_ALLOW_UPGRADE, &preflight,
-			error, error_size) != 0)
-		return -1;
+	if (handle->anchor_state == DARLING_RUNTIME_PREFIX_ANCHOR_POPULATED) {
+		int preflight_result =
+			preflight_existing_prefix_compatibility(handle, mode,
+				owner_uid, owner_gid, &preflight,
+				error, error_size);
+		if (preflight_result < 0)
+			return -1;
+		if (preflight_result > 0) {
+			if (result != NULL) {
+				memset(result, 0, sizeof(*result));
+				result->verdict =
+					DARLING_RUNTIME_PREFIX_VERDICT_RECREATE_REQUIRED;
+			}
+			prefix_error(error, error_size,
+				"legacy or unversioned prefix is not bootable;"
+				" explicit recreation is required: %s",
+				"PREFIX_RECREATE_REQUIRED");
+			return DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED;
+		}
+	}
 	struct lifecycle_names names;
 	if (format_lifecycle_names(handle, &names,
 			error, error_size) != 0)
@@ -3457,17 +3931,24 @@ int darling_runtime_prefix_prepare(
 				DARLING_RUNTIME_PREFIX_CREATED, recovered, result,
 				error, error_size);
 			break;
-		case LIFECYCLE_STABLE_LEGACY_V1:
-			if (validate_complete_prefix_contents(handle,
+		case LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED:
+			if (result != NULL) {
+				memset(result, 0, sizeof(*result));
+				result->verdict =
+					DARLING_RUNTIME_PREFIX_VERDICT_RECREATE_REQUIRED;
+			}
+			prefix_error(error, error_size,
+				"legacy or unversioned prefix is not bootable;"
+				" explicit recreation is required: %s",
+				"PREFIX_RECREATE_REQUIRED");
+			result_code = DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED;
+			break;
+		case LIFECYCLE_STABLE_CURRENT_V3: {
+			if (anchor_bound_sidecar(handle, &stable.value.current,
 					error, error_size) != 0) {
 				result_code = -1;
 				break;
 			}
-			result_code = upgrade_legacy_prefix(handle, &names, mode,
-				owner_uid, owner_gid, recovered, result,
-				error, error_size);
-			break;
-		case LIFECYCLE_STABLE_CURRENT_V2: {
 			struct stat legacy;
 			if (fstatat(handle->directory_fd,
 					DARLING_RUNTIME_MODE_MARKER_NAME, &legacy,
@@ -3499,6 +3980,18 @@ int darling_runtime_prefix_prepare(
 			break;
 		}
 	}
+	if (result_code == 0) {
+		if (flock(lock_fd, LOCK_SH) != 0) {
+			int saved_errno = errno;
+			close(lock_fd);
+			errno = saved_errno;
+			return prefix_error(error, error_size,
+				"cannot retain runtime prefix lifecycle lease: %s",
+				strerror(errno));
+		}
+		handle->lifecycle_lock_fd = lock_fd;
+		return 0;
+	}
 	close(lock_fd);
 	return result_code;
 }
@@ -3519,10 +4012,10 @@ int darling_runtime_prefix_recreate(
 		return prefix_error(error, error_size,
 			"runtime prefix recreate input is invalid: %s", "invalid");
 	struct lifecycle_stable_snapshot preflight;
-	if (preflight_existing_prefix_compatibility(handle, mode,
-			owner_uid, owner_gid, LIFECYCLE_LEGACY_REJECT,
-			&preflight,
-			error, error_size) != 0)
+	int preflight_result = preflight_existing_prefix_compatibility(
+		handle, mode, owner_uid, owner_gid, &preflight,
+		error, error_size);
+	if (preflight_result < 0)
 		return -1;
 	struct lifecycle_names names;
 	if (format_lifecycle_names(handle, &names,
@@ -3540,19 +4033,46 @@ int darling_runtime_prefix_recreate(
 			error, error_size) != 0 ||
 		darling_runtime_mode_verify_prefix_name(handle,
 			error, error_size) != 0 ||
-		ensure_prefix_not_running(handle, error, error_size) != 0) {
+		ensure_prefix_not_running(handle, error, error_size) != 0 ||
+		ensure_prefix_not_mounted(handle, error, error_size) != 0) {
 		close(lock_fd);
 		return -1;
 	}
-	struct darling_runtime_prefix_state state;
-	if (read_prefix_state_fd(handle->directory_fd, mode,
-			owner_uid, owner_gid, &state, false,
-			error, error_size) != 0) {
+	struct lifecycle_stable_snapshot stable;
+	if (inspect_stable_snapshot(handle, mode, owner_uid, owner_gid,
+			&stable, error, error_size) != 0) {
 		close(lock_fd);
 		return -1;
+	}
+	uint64_t old_generation = 0;
+	if (stable.kind == LIFECYCLE_STABLE_CURRENT_V3)
+	{
+		if (anchor_bound_sidecar(handle, &stable.value.current,
+				error, error_size) != 0) {
+			close(lock_fd);
+			return -1;
+		}
+		old_generation = stable.value.current.generation;
+	}
+	else if (stable.kind != LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED) {
+		close(lock_fd);
+		return prefix_error(error, error_size,
+			"runtime prefix cannot be explicitly recreated from state: %s",
+			"invalid");
+	}
+	if (stable.kind == LIFECYCLE_STABLE_LEGACY_OR_UNVERSIONED) {
+		struct stat unexpected_sidecar;
+		if (fstatat(handle->parent_fd, handle->sidecar_leaf,
+				&unexpected_sidecar, AT_SYMLINK_NOFOLLOW) == 0 ||
+			errno != ENOENT) {
+			close(lock_fd);
+			return prefix_error(error, error_size,
+				"legacy prefix has unexpected sidecar state: %s",
+				handle->sidecar_leaf);
+		}
 	}
 	int result_code = create_or_recreate_prefix(handle, &names,
-		mode, user_name, owner_uid, owner_gid, state.generation,
+		mode, user_name, owner_uid, owner_gid, old_generation,
 		DARLING_RUNTIME_PREFIX_RECREATED, recovered, result,
 		error, error_size);
 	close(lock_fd);
@@ -3575,11 +4095,18 @@ int darling_runtime_prefix_delete(
 			"runtime prefix delete input is invalid: %s", "invalid");
 	if (handle->directory_fd >= 0) {
 		struct lifecycle_stable_snapshot preflight;
-		if (preflight_existing_prefix_compatibility(handle, mode,
-				owner_uid, owner_gid,
-				LIFECYCLE_LEGACY_REJECT, &preflight,
-				error, error_size) != 0)
+		int preflight_result =
+			preflight_existing_prefix_compatibility(handle, mode,
+				owner_uid, owner_gid, &preflight,
+				error, error_size);
+		if (preflight_result != 0) {
+			if (preflight_result > 0)
+				prefix_error(error, error_size,
+					"legacy prefix deletion is permitted only"
+					" through explicit recreate: %s",
+					"PREFIX_RECREATE_REQUIRED");
 			return -1;
+		}
 	}
 	struct lifecycle_names names;
 	if (format_lifecycle_names(handle, &names,
@@ -3612,13 +4139,16 @@ int darling_runtime_prefix_delete(
 	}
 	if (darling_runtime_mode_verify_prefix_name(handle,
 			error, error_size) != 0 ||
-		ensure_prefix_not_running(handle, error, error_size) != 0) {
+		ensure_prefix_not_running(handle, error, error_size) != 0 ||
+		ensure_prefix_not_mounted(handle, error, error_size) != 0) {
 		close(lock_fd);
 		return -1;
 	}
 	struct darling_runtime_prefix_state state;
 	if (read_prefix_state_fd(handle->directory_fd, mode,
 			owner_uid, owner_gid, &state, false,
+			error, error_size) != 0 ||
+		anchor_bound_sidecar(handle, &state,
 			error, error_size) != 0) {
 		close(lock_fd);
 		return -1;
@@ -3640,6 +4170,31 @@ int darling_runtime_prefix_delete(
 		return -1;
 	}
 	struct stat appeared;
+	if (fstatat(handle->parent_fd, names.sidecar_stage, &appeared,
+			AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT ||
+		renameat2(handle->parent_fd, handle->sidecar_leaf,
+			handle->parent_fd, names.sidecar_stage,
+			RENAME_NOREPLACE) != 0 ||
+		fsync_directory(handle->parent_fd, "sidecar deletion",
+			error, error_size) != 0 ||
+		advance_transaction_phase(handle, &names, &transaction,
+			LIFECYCLE_PHASE_PREPARED,
+			LIFECYCLE_PHASE_SIDECAR_PUBLISHED,
+			"journal-sidecar-published",
+			error, error_size) != 0) {
+		int saved_errno = errno;
+		char saved_error[512];
+		snprintf(saved_error, sizeof(saved_error),
+			"cannot atomically detach runtime sidecar for deletion: %s",
+			strerror(saved_errno));
+		recover_preserving_failure(handle, &names, mode,
+			owner_uid, owner_gid, saved_errno, saved_error,
+			error, error_size);
+		close(lock_fd);
+		return -1;
+	}
+	close(handle->sidecar_fd);
+	handle->sidecar_fd = -1;
 	if (fstatat(handle->parent_fd, names.stage, &appeared,
 			AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT ||
 		renameat2(handle->parent_fd, handle->leaf,
@@ -3668,7 +4223,7 @@ int darling_runtime_prefix_delete(
 		lifecycle_checkpoint("prefix-published",
 			error, error_size) != 0 ||
 		advance_transaction_phase(handle, &names, &transaction,
-			LIFECYCLE_PHASE_PREPARED,
+			LIFECYCLE_PHASE_SIDECAR_PUBLISHED,
 			LIFECYCLE_PHASE_PREFIX_PUBLISHED,
 			"journal-prefix-published",
 			error, error_size) != 0 ||
@@ -3678,6 +4233,8 @@ int darling_runtime_prefix_delete(
 			"cleanup-start",
 			error, error_size) != 0 ||
 		remove_named_tree(handle->parent_fd, names.stage,
+			false, error, error_size) != 0 ||
+		remove_named_tree(handle->parent_fd, names.sidecar_stage,
 			false, error, error_size) != 0 ||
 		remove_prefix_workdir(handle, true,
 			error, error_size) != 0 ||

@@ -144,6 +144,17 @@ int main(int argc, char ** argv)
 		showHelp(argv[0]);
 		return 1;
 	}
+	const bool recreatePrefix =
+		strcmp(argv[cli.command_index], "recreate-prefix") == 0;
+	if (recreatePrefix != cli.confirm_prefix_recreate) {
+		fprintf(stderr,
+			recreatePrefix
+				? "PREFIX_RECREATE_REQUIRED: recreate-prefix requires"
+				  " exact --confirm-prefix-recreate confirmation\n"
+				: "--confirm-prefix-recreate is valid only with"
+				  " recreate-prefix\n");
+		return 1;
+	}
 
 	if (darling_runtime_mode_select_process(
 			&cli,
@@ -248,16 +259,25 @@ int main(int argc, char ** argv)
 		}
 	}
 	struct darling_runtime_prefix_lifecycle_result lifecycle;
-	int lifecycle_result = darling_runtime_prefix_prepare(
-		g_runtimePrefix,
-		g_runtimeMode,
-		prefix_owner->pw_name,
-		g_originalUid,
-		g_originalGid,
-		&lifecycle,
-		runtimeModeError,
-		sizeof(runtimeModeError)
-	);
+	int lifecycle_result = recreatePrefix
+		? darling_runtime_prefix_recreate(
+			g_runtimePrefix,
+			g_runtimeMode,
+			prefix_owner->pw_name,
+			g_originalUid,
+			g_originalGid,
+			&lifecycle,
+			runtimeModeError,
+			sizeof(runtimeModeError))
+		: darling_runtime_prefix_prepare(
+			g_runtimePrefix,
+			g_runtimeMode,
+			prefix_owner->pw_name,
+			g_originalUid,
+			g_originalGid,
+			&lifecycle,
+			runtimeModeError,
+			sizeof(runtimeModeError));
 	if (!rootless) {
 		if (seteuid(0) != 0 || setegid(0) != 0) {
 			fprintf(stderr,
@@ -266,10 +286,23 @@ int main(int argc, char ** argv)
 			return 1;
 		}
 	}
+	if (lifecycle_result == DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED) {
+		fprintf(stderr,
+			"PREFIX_RECREATE_REQUIRED: %s; run with"
+			" --confirm-prefix-recreate recreate-prefix\n",
+			runtimeModeError);
+		return DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED;
+	}
 	if (lifecycle_result != 0) {
 		fprintf(stderr, "Cannot prepare Darling prefix lifecycle: %s\n",
 			runtimeModeError);
 		return 1;
+	}
+	if (recreatePrefix) {
+		fprintf(stderr,
+			"PREFIX_RECREATED format=sidecar-v1 generation=%llu\n",
+			(unsigned long long)lifecycle.state.generation);
+		return 0;
 	}
 	g_fixPermissions =
 		lifecycle.action == DARLING_RUNTIME_PREFIX_CREATED ||
@@ -1018,9 +1051,13 @@ void showHelp(const char* argv0)
 	fprintf(stderr, "\t%s [--rootless] shell [arguments...]\n", argv0);
 	fprintf(stderr, "\t%s [--rootless] exec <program-path> [arguments...]\n", argv0);
 	fprintf(stderr, "\t%s [--rootless] shutdown\n", argv0);
+	fprintf(stderr, "\t%s [--rootless] --confirm-prefix-recreate"
+		" recreate-prefix\n", argv0);
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Options:\n"
-		"--rootless - select rootless-eunion (exact spelling; requires an E-UNION-capable build)\n");
+		"--rootless - select rootless-eunion (exact spelling; requires an E-UNION-capable build)\n"
+		"--confirm-prefix-recreate - explicit destructive confirmation;"
+		" valid only with recreate-prefix\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Environment variables:\n"
 		"DPREFIX - specifies the location of Darling prefix, defaults to ~/.darling\n"
@@ -1057,7 +1094,9 @@ pid_t spawnInitProcess(void)
 
 	if (darling_runtime_mode_verify_prefix_name(g_runtimePrefix,
 			error, sizeof(error)) != 0 ||
-		g_runtimePrefix->workdir_fd < 0) {
+		g_runtimePrefix->workdir_fd < 0 ||
+		g_runtimePrefix->sidecar_fd < 0 ||
+		g_runtimePrefix->lifecycle_lock_fd < 0) {
 		fprintf(stderr,
 			"Cannot hand the retained Darling prefix to darlingserver: %s\n",
 			error[0] == '\0' ? "runtime workdir fd is missing" : error);
@@ -1097,6 +1136,8 @@ pid_t spawnInitProcess(void)
 		char prefixfd_str[21];
 		char parentfd_str[21];
 		char workdirfd_str[21];
+		char sidecarfd_str[21];
+		char lockfd_str[21];
 
 		snprintf(uid_str, sizeof(uid_str), "%d", g_originalUid);
 		snprintf(gid_str, sizeof(gid_str), "%d", g_originalGid);
@@ -1107,6 +1148,10 @@ pid_t spawnInitProcess(void)
 			g_runtimePrefix->parent_fd);
 		snprintf(workdirfd_str, sizeof(workdirfd_str), "%d",
 			g_runtimePrefix->workdir_fd);
+		snprintf(sidecarfd_str, sizeof(sidecarfd_str), "%d",
+			g_runtimePrefix->sidecar_fd);
+		snprintf(lockfd_str, sizeof(lockfd_str), "%d",
+			g_runtimePrefix->lifecycle_lock_fd);
 
 		close(pipefd[0]);
 		if (darling_runtime_mode_make_fd_inheritable(
@@ -1114,7 +1159,12 @@ pid_t spawnInitProcess(void)
 			darling_runtime_mode_make_fd_inheritable(
 				g_runtimePrefix->parent_fd, error, sizeof(error)) != 0 ||
 			darling_runtime_mode_make_fd_inheritable(
-				g_runtimePrefix->workdir_fd, error, sizeof(error)) != 0) {
+				g_runtimePrefix->workdir_fd, error, sizeof(error)) != 0 ||
+			darling_runtime_mode_make_fd_inheritable(
+				g_runtimePrefix->sidecar_fd, error, sizeof(error)) != 0 ||
+			darling_runtime_mode_make_fd_inheritable(
+				g_runtimePrefix->lifecycle_lock_fd,
+				error, sizeof(error)) != 0) {
 			fprintf(stderr,
 				"Cannot preserve Darling prefix descriptors for darlingserver: %s\n",
 				error);
@@ -1123,7 +1173,8 @@ pid_t spawnInitProcess(void)
 
 		execl(INSTALL_PREFIX "/bin/darlingserver", "darlingserver",
 			prefixfd_str, parentfd_str, g_runtimePrefix->leaf,
-			workdirfd_str, uid_str, gid_str, pipefd_str,
+			workdirfd_str, sidecarfd_str, lockfd_str,
+			uid_str, gid_str, pipefd_str,
 			g_fixPermissions ? "1" : "0", NULL);
 
 		fprintf(stderr, "Failed to start darlingserver\n");

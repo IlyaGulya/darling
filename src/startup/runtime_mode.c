@@ -135,6 +135,13 @@ int darling_runtime_mode_parse_cli(
 			cli->show_version = true;
 			continue;
 		}
+		if (strcmp(argv[index], "--confirm-prefix-recreate") == 0) {
+			if (cli->confirm_prefix_recreate)
+				return mode_error(error, error_size,
+					"--confirm-prefix-recreate was specified more than once");
+			cli->confirm_prefix_recreate = true;
+			continue;
+		}
 		if (error != NULL && error_size != 0)
 			snprintf(error, error_size,
 				"unknown launcher option (long options must be exact): %s",

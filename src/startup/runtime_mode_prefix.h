@@ -10,10 +10,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define DARLING_RUNTIME_PREFIX_STATE_SCHEMA_VERSION 2
-#define DARLING_RUNTIME_PREFIX_STATE_NAME ".darling-prefix-state-v2"
+#define DARLING_RUNTIME_PREFIX_STATE_SCHEMA_VERSION 3
+#define DARLING_RUNTIME_PREFIX_STATE_NAME ".darling-prefix-state-v3"
+#define DARLING_RUNTIME_PREFIX_LEGACY_STATE_NAME ".darling-prefix-state-v2"
 #define DARLING_RUNTIME_PREFIX_PROVENANCE \
-	"darling-runtime-prefix-lifecycle-v2"
+	"darling-runtime-prefix-sidecar-v1"
+#define DARLING_RUNTIME_PREFIX_SIDECAR_SUFFIX ".eunion-sidecar-v1"
+#define DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED 2
 
 enum darling_runtime_prefix_anchor_state {
 	DARLING_RUNTIME_PREFIX_ANCHOR_UNINITIALIZED,
@@ -24,31 +27,36 @@ enum darling_runtime_prefix_anchor_state {
 };
 
 /*
- * Owning, move-only capability. The one-element array typedef makes ordinary
- * C assignment and copy-initialization ill-formed while retaining the same
- * zero-overhead representation and natural pointer decay at API boundaries.
- * The retained descriptors are the authority; the original path is
- * deliberately not retained. Transfer ownership only with
+ * Assignment-resistant owning capability with runtime typestate. The
+ * one-element array typedef rejects ordinary whole-object assignment in C,
+ * while owner state and descriptor validation remain authoritative against
+ * copies made through lower-level memory operations. The representation is
+ * zero-overhead and naturally decays at API boundaries. Retained descriptors,
+ * not the original path, are the authority; transfer ownership only with
  * darling_runtime_prefix_move().
  */
 typedef struct {
 	int directory_fd;
 	int parent_fd;
 	int workdir_fd;
+	int sidecar_fd;
+	int lifecycle_lock_fd;
 	char leaf[NAME_MAX + 1];
 	char workdir_leaf[NAME_MAX + 1];
+	char sidecar_leaf[NAME_MAX + 1];
 	enum darling_runtime_prefix_anchor_state anchor_state;
 } darling_runtime_prefix[1];
 
 #define DARLING_RUNTIME_PREFIX_INITIALIZER \
 	{{ .directory_fd = -1, .parent_fd = -1, .workdir_fd = -1, \
-		.leaf = {0}, .workdir_leaf = {0}, \
+		.sidecar_fd = -1, .leaf = {0}, .workdir_leaf = {0}, \
+		.lifecycle_lock_fd = -1, \
+		.sidecar_leaf = {0}, \
 		.anchor_state = DARLING_RUNTIME_PREFIX_ANCHOR_UNINITIALIZED }}
 
 enum darling_runtime_prefix_lifecycle_action {
 	DARLING_RUNTIME_PREFIX_CREATED,
 	DARLING_RUNTIME_PREFIX_REUSED,
-	DARLING_RUNTIME_PREFIX_UPGRADED,
 	DARLING_RUNTIME_PREFIX_REPAIRED,
 	DARLING_RUNTIME_PREFIX_RECREATED,
 	DARLING_RUNTIME_PREFIX_DELETED,
@@ -60,12 +68,18 @@ struct darling_runtime_prefix_state {
 	uint64_t generation;
 	dev_t prefix_device;
 	ino_t prefix_inode;
+	dev_t sidecar_device;
+	ino_t sidecar_inode;
 	uid_t owner_uid;
 	gid_t owner_gid;
 	char provenance[64];
 };
 
 struct darling_runtime_prefix_lifecycle_result {
+	enum {
+		DARLING_RUNTIME_PREFIX_READY,
+		DARLING_RUNTIME_PREFIX_VERDICT_RECREATE_REQUIRED,
+	} verdict;
 	enum darling_runtime_prefix_lifecycle_action action;
 	enum {
 		DARLING_RUNTIME_PREFIX_NO_RECOVERY,
@@ -229,7 +243,6 @@ int darling_runtime_prefix_test_checkpoint(const char* phase);
 
 enum darling_runtime_prefix_test_operation {
 	DARLING_RUNTIME_PREFIX_TEST_CREATE = 1,
-	DARLING_RUNTIME_PREFIX_TEST_UPGRADE,
 	DARLING_RUNTIME_PREFIX_TEST_RECREATE,
 	DARLING_RUNTIME_PREFIX_TEST_DELETE,
 };
@@ -237,8 +250,7 @@ enum darling_runtime_prefix_test_operation {
 enum darling_runtime_prefix_test_phase {
 	DARLING_RUNTIME_PREFIX_TEST_PREPARED = 1,
 	DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED,
-	DARLING_RUNTIME_PREFIX_TEST_STATE_STAGED,
-	DARLING_RUNTIME_PREFIX_TEST_STATE_PUBLISHED,
+	DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED,
 	DARLING_RUNTIME_PREFIX_TEST_PREFIX_PUBLISHED,
 	DARLING_RUNTIME_PREFIX_TEST_CLEANUP,
 };
