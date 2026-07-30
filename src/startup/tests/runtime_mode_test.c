@@ -73,6 +73,8 @@ int fsync(int fd)
 }
 
 #ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
+extern const char* darling_runtime_prefix_test_mountinfo_path;
+
 int darling_runtime_prefix_test_checkpoint(const char* phase)
 {
 	if (checkpoint_injection == CHECKPOINT_NONE ||
@@ -163,9 +165,10 @@ static int find_temporary_entry(
 	const char* name = path + state->base;
 	if (strncmp(name, ".darling-dir-", strlen(".darling-dir-")) == 0 ||
 		strstr(name, ".tmp.") != NULL ||
-		strstr(name, ".darling-prefix-stage-v2-") != NULL ||
-		strstr(name, ".darling-prefix-transaction-v2-") != NULL ||
-		strcmp(name, ".darling-prefix-state-v2.tmp") == 0)
+		strstr(name, ".darling-prefix-stage-v3-") != NULL ||
+		strstr(name, ".darling-prefix-sidecar-stage-v1-") != NULL ||
+		strstr(name, ".darling-prefix-transaction-v3-") != NULL ||
+		strcmp(name, ".darling-prefix-state-v3.tmp") == 0)
 		leaked_temporary = 1;
 	return 0;
 }
@@ -281,6 +284,23 @@ static void test_process_boundary(void)
 			error, sizeof(error)) == 0 &&
 			cli.show_help && cli.command_index == -1,
 		"exact --help parsing failed");
+	char* recreate[] = {
+		"darling", "--rootless", "--confirm-prefix-recreate",
+		"recreate-prefix", NULL,
+	};
+	require(darling_runtime_mode_parse_cli(4, recreate, &cli,
+			error, sizeof(error)) == 0 &&
+			cli.rootless && cli.confirm_prefix_recreate &&
+			cli.command_index == 3,
+		"exact recreate confirmation was not parsed");
+	char* duplicate_recreate[] = {
+		"darling", "--confirm-prefix-recreate",
+		"--confirm-prefix-recreate", "recreate-prefix", NULL,
+	};
+	require(darling_runtime_mode_parse_cli(
+			4, duplicate_recreate, &cli,
+			error, sizeof(error)) != 0,
+		"duplicate recreate confirmation was accepted");
 
 	require(darling_runtime_mode_parse_cli(3, argv, &cli,
 			error, sizeof(error)) == 0, error);
@@ -428,6 +448,10 @@ static void delete_prefix_fixture(
 			error, sizeof(error)) == 0, error);
 	require(result.action == DARLING_RUNTIME_PREFIX_DELETED,
 		"delete lifecycle action mismatch");
+	struct stat sidecar;
+	require(fstatat(handle->parent_fd, handle->sidecar_leaf,
+			&sidecar, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
+		"delete lifecycle retained final sidecar");
 	darling_runtime_mode_close_prefix(handle);
 }
 
@@ -452,72 +476,115 @@ static void require_state(
 		"prefix state generation mismatch");
 	require(state.owner_uid == getuid() && state.owner_gid == getgid(),
 		"prefix state owner mismatch");
+	struct stat sidecar_status;
+	require(handle->sidecar_fd >= 0 &&
+		fstat(handle->sidecar_fd, &sidecar_status) == 0 &&
+		S_ISDIR(sidecar_status.st_mode) &&
+		(sidecar_status.st_mode & 07777) == 0700 &&
+		state.sidecar_device == sidecar_status.st_dev &&
+		state.sidecar_inode == sidecar_status.st_ino,
+		"prefix state does not bind retained private sidecar");
 	require(strcmp(state.provenance,
 			DARLING_RUNTIME_PREFIX_PROVENANCE) == 0,
 		"prefix state provenance mismatch");
 }
 
-static void run_upgrade_interruption(
-	const char* directory,
-	const char* name,
-	enum checkpoint_injection injection,
-	const char* phase
-)
+static void test_legacy_recreate_policy(
+	const char* directory, const char* name)
 {
 	char path[2048];
 	snprintf(path, sizeof(path), "%s/%s", directory, name);
 	create_legacy_prefix_fixture(path);
+	char sentinel[4096];
+	snprintf(sentinel, sizeof(sentinel), "%s/private/legacy-sentinel",
+		path);
+	int sentinel_fd = open(sentinel,
+		O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	require(sentinel_fd >= 0 &&
+		write(sentinel_fd, "legacy\n", 7) == 7 &&
+		fsync(sentinel_fd) == 0 && close(sentinel_fd) == 0,
+		"create legacy no-mutation sentinel");
+	struct stat before;
+	require(lstat(sentinel, &before) == 0,
+		"snapshot legacy sentinel");
 
-	pid_t child = fork();
-	require(child >= 0, "fork upgrade interruption fixture");
-	if (child == 0) {
-		darling_runtime_prefix handle =
-			DARLING_RUNTIME_PREFIX_INITIALIZER;
-		char error[512] = {0};
-		if (darling_runtime_mode_open_prefix(path, handle,
-				error, sizeof(error)) != 0)
-			_exit(90);
-		checkpoint_injection = injection;
-		checkpoint_phase = phase;
-		struct darling_runtime_prefix_lifecycle_result result;
-		int outcome = darling_runtime_prefix_prepare(handle,
-			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
-			"tester", getuid(), getgid(), &result,
-			error, sizeof(error));
-		darling_runtime_mode_close_prefix(handle);
-		_exit(outcome == 0 ? 91 : 0);
-	}
-	int status;
-	require(waitpid(child, &status, 0) == child,
-		"wait for upgrade interruption fixture");
-	if (injection == CHECKPOINT_FAILURE)
-		require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-			"injected lifecycle failure did not propagate");
-	else
-		require((WIFSIGNALED(status) && WTERMSIG(status) == SIGINT) ||
-				(WIFEXITED(status) && WEXITSTATUS(status) == 127),
-			"injected lifecycle SIGINT did not interrupt");
-
-	checkpoint_injection = CHECKPOINT_NONE;
-	checkpoint_phase = NULL;
 	darling_runtime_prefix recovered =
 		DARLING_RUNTIME_PREFIX_INITIALIZER;
+	char error[512] = {0};
+	open_prefix_fixture(path, recovered);
 	struct darling_runtime_prefix_lifecycle_result result;
-	prepare_prefix_fixture(path, recovered, &result);
-	require(result.action == DARLING_RUNTIME_PREFIX_UPGRADED ||
-			result.action == DARLING_RUNTIME_PREFIX_REUSED ||
-			result.action == DARLING_RUNTIME_PREFIX_REPAIRED,
-		"interrupted upgrade did not reach a valid stable state");
-	if (injection == CHECKPOINT_SIGINT)
-		require(result.recovery ==
-				DARLING_RUNTIME_PREFIX_RECOVERED_TRANSACTION,
-			"SIGINT recovery was not reported");
+	require(darling_runtime_prefix_prepare(recovered,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			"tester", getuid(), getgid(), &result,
+			error, sizeof(error)) ==
+			DARLING_RUNTIME_PREFIX_RECREATE_REQUIRED,
+		"legacy prefix did not return typed recreate verdict");
+	require(result.verdict ==
+			DARLING_RUNTIME_PREFIX_VERDICT_RECREATE_REQUIRED &&
+			strstr(error, "PREFIX_RECREATE_REQUIRED") != NULL,
+		"legacy recreate verdict omitted typed diagnostics");
+	struct stat after;
+	require(lstat(sentinel, &after) == 0 &&
+			before.st_dev == after.st_dev &&
+			before.st_ino == after.st_ino &&
+			before.st_size == after.st_size,
+		"ordinary prepare mutated legacy prefix");
+
+	char init_pid[4096];
+	snprintf(init_pid, sizeof(init_pid), "%s/.init.pid", path);
+	char pid_content[64];
+	snprintf(pid_content, sizeof(pid_content), "%ld\n", (long)getpid());
+	write_exact_file(init_pid, pid_content);
+	memset(error, 0, sizeof(error));
+	require(darling_runtime_prefix_recreate(recovered,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			"tester", getuid(), getgid(), &result,
+			error, sizeof(error)) != 0 &&
+			strstr(error, "live process") != NULL,
+		"explicit recreation ignored a live prefix process");
+	require_exact_file(sentinel, "legacy\n");
+	require(unlink(init_pid) == 0,
+		"remove live-process recreation fixture");
+
+	char mountinfo_path[4096];
+	snprintf(mountinfo_path, sizeof(mountinfo_path),
+		"%s/mountinfo-fixture", directory);
+	FILE* mountinfo = fopen(mountinfo_path, "we");
+	require(mountinfo != NULL,
+		"create mountinfo recreation fixture");
+	require(fprintf(mountinfo,
+			"36 25 0:32 / %s rw,relatime - tmpfs tmpfs rw\n",
+			path) > 0 && fflush(mountinfo) == 0 &&
+			fsync(fileno(mountinfo)) == 0 && fclose(mountinfo) == 0,
+		"write mountinfo recreation fixture");
+	darling_runtime_prefix_test_mountinfo_path = mountinfo_path;
+	memset(error, 0, sizeof(error));
+	require(darling_runtime_prefix_recreate(recovered,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			"tester", getuid(), getgid(), &result,
+			error, sizeof(error)) != 0 &&
+			strstr(error, "live mount") != NULL,
+		"explicit recreation ignored a live prefix mount");
+	darling_runtime_prefix_test_mountinfo_path = NULL;
+	require_exact_file(sentinel, "legacy\n");
+	require(unlink(mountinfo_path) == 0,
+		"remove mountinfo recreation fixture");
+
+	require(darling_runtime_prefix_recreate(recovered,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			"tester", getuid(), getgid(), &result,
+			error, sizeof(error)) == 0,
+		error);
+	require(result.action == DARLING_RUNTIME_PREFIX_RECREATED,
+		"explicit legacy recreation action mismatch");
 	require_state(recovered, 1);
+	require(access(sentinel, F_OK) != 0 && errno == ENOENT,
+		"explicit recreation retained legacy payload");
 	struct stat legacy;
 	require(fstatat(recovered->directory_fd,
 			DARLING_RUNTIME_MODE_MARKER_NAME, &legacy,
 			AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT,
-		"legacy marker survived v1 to v2 upgrade");
+		"legacy marker survived explicit sidecar-v1 recreation");
 	require_no_temporary_entries(directory);
 	delete_prefix_fixture(recovered);
 }
@@ -709,8 +776,8 @@ static void run_staged_durability_order(const char* directory)
 			index < fsync_trace_count; ++index) {
 		const char* base = strrchr(fsync_trace[index], '/');
 		if (base != NULL &&
-			strncmp(base + 1, ".darling-prefix-stage-v2-",
-				strlen(".darling-prefix-stage-v2-")) == 0) {
+			strncmp(base + 1, ".darling-prefix-stage-v3-",
+				strlen(".darling-prefix-stage-v3-")) == 0) {
 			root_after_private = true;
 			break;
 		}
@@ -916,9 +983,11 @@ static void test_mutation_interruption_coverage(void)
 		const char* label;
 		const char* phase;
 	} cases[] = {
-		{"early", "transaction-prepared"},
-		{"middle", "replacement-staged"},
-		{"late", "cleanup-start"},
+		{"transaction", "transaction-prepared"},
+		{"replacement", "replacement-staged"},
+		{"sidecar", "sidecar-published"},
+		{"prefix", "prefix-published"},
+		{"cleanup", "cleanup-start"},
 	};
 	static const enum checkpoint_injection injections[] = {
 		CHECKPOINT_FAILURE,
@@ -951,9 +1020,10 @@ static void test_mutation_interruption_coverage(void)
 		const char* label;
 		const char* phase;
 	} delete_cases[] = {
-		{"early", "transaction-prepared"},
-		{"middle", "prefix-published"},
-		{"late", "cleanup-start"},
+		{"transaction", "transaction-prepared"},
+		{"sidecar", "journal-sidecar-published"},
+		{"prefix", "prefix-published"},
+		{"cleanup", "cleanup-start"},
 	};
 	for (size_t injection = 0;
 			injection < sizeof(injections) / sizeof(injections[0]);
@@ -969,7 +1039,7 @@ static void test_mutation_interruption_coverage(void)
 				delete_cases[phase].phase);
 		}
 	}
-	require(sequence == 18,
+	require(sequence == 28,
 		"real create/recreate/delete interruption matrix was incomplete");
 	remove_fixture_tree(directory);
 }
@@ -1010,45 +1080,41 @@ static enum darling_runtime_prefix_test_recovery expected_recovery(
 	switch (operation) {
 		case DARLING_RUNTIME_PREFIX_TEST_CREATE:
 			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
-				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED) &&
+				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED) &&
 				stable == DARLING_RUNTIME_PREFIX_TEST_MISSING)
 				return DARLING_RUNTIME_PREFIX_TEST_ROLLBACK;
 			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_PREFIX_PUBLISHED ||
-				 phase == DARLING_RUNTIME_PREFIX_TEST_CLEANUP) &&
-				stable == DARLING_RUNTIME_PREFIX_TEST_NEW_CURRENT)
-				return DARLING_RUNTIME_PREFIX_TEST_FINISH;
-			return DARLING_RUNTIME_PREFIX_TEST_INVALID;
-		case DARLING_RUNTIME_PREFIX_TEST_UPGRADE:
-			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
-				 phase == DARLING_RUNTIME_PREFIX_TEST_STATE_STAGED) &&
-				stable == DARLING_RUNTIME_PREFIX_TEST_OLD_LEGACY)
-				return DARLING_RUNTIME_PREFIX_TEST_ROLLBACK;
-			if ((phase == DARLING_RUNTIME_PREFIX_TEST_STATE_STAGED ||
-				 phase == DARLING_RUNTIME_PREFIX_TEST_STATE_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_CLEANUP) &&
 				stable == DARLING_RUNTIME_PREFIX_TEST_NEW_CURRENT)
 				return DARLING_RUNTIME_PREFIX_TEST_FINISH;
 			return DARLING_RUNTIME_PREFIX_TEST_INVALID;
 		case DARLING_RUNTIME_PREFIX_TEST_RECREATE:
 			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
-				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED) &&
+				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED) &&
 				(stable == DARLING_RUNTIME_PREFIX_TEST_OLD_EMPTY ||
+				 stable == DARLING_RUNTIME_PREFIX_TEST_OLD_LEGACY ||
 				 stable == DARLING_RUNTIME_PREFIX_TEST_OLD_CURRENT))
 				return DARLING_RUNTIME_PREFIX_TEST_ROLLBACK;
 			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_REPLACEMENT_STAGED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_PREFIX_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_CLEANUP) &&
 				stable == DARLING_RUNTIME_PREFIX_TEST_NEW_CURRENT)
 				return DARLING_RUNTIME_PREFIX_TEST_FINISH;
 			return DARLING_RUNTIME_PREFIX_TEST_INVALID;
 		case DARLING_RUNTIME_PREFIX_TEST_DELETE:
-			if (phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED &&
+			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED) &&
 				stable == DARLING_RUNTIME_PREFIX_TEST_OLD_CURRENT)
 				return DARLING_RUNTIME_PREFIX_TEST_ROLLBACK;
 			if ((phase == DARLING_RUNTIME_PREFIX_TEST_PREPARED ||
+				 phase == DARLING_RUNTIME_PREFIX_TEST_SIDECAR_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_PREFIX_PUBLISHED ||
 				 phase == DARLING_RUNTIME_PREFIX_TEST_CLEANUP) &&
 				stable == DARLING_RUNTIME_PREFIX_TEST_MISSING)
@@ -1082,7 +1148,7 @@ static void test_recovery_matrix(void)
 			}
 		}
 	}
-	require(combinations == 144,
+	require(combinations == 90,
 		"recovery matrix did not cover every combination");
 }
 
@@ -1163,7 +1229,7 @@ static void test_prefix_lifecycle(void)
 	require(state_size > 0, "capture canonical state fixture");
 	char hostile[2048];
 	snprintf(hostile, sizeof(hostile), "%s", state_content);
-	char* schema = strstr(hostile, "schema_version=2\n");
+	char* schema = strstr(hostile, "schema_version=3\n");
 	require(schema != NULL, "locate state schema fixture");
 	memcpy(schema, "schema_version=9\n", strlen("schema_version=9\n"));
 	replace_fd_file(moved->directory_fd,
@@ -1224,7 +1290,7 @@ static void test_prefix_lifecycle(void)
 
 	replace_fd_file(moved->directory_fd,
 		DARLING_RUNTIME_PREFIX_STATE_NAME,
-		"DARLING_PREFIX_STATE_V2\nschema_version=2\n");
+		"DARLING_PREFIX_STATE_V3\nschema_version=3\n");
 	require(darling_runtime_prefix_prepare(moved,
 			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
 			"tester", getuid(), getgid(), &result,
@@ -1269,18 +1335,7 @@ static void test_prefix_lifecycle(void)
 	require_exact_file(sentinel, "immutable-lower\n");
 	darling_runtime_mode_close_prefix(moved);
 
-	run_upgrade_interruption(directory, "upgrade-fail-early",
-		CHECKPOINT_FAILURE, "transaction-prepared");
-	run_upgrade_interruption(directory, "upgrade-fail-middle",
-		CHECKPOINT_FAILURE, "state-published");
-	run_upgrade_interruption(directory, "upgrade-fail-late",
-		CHECKPOINT_FAILURE, "cleanup-start");
-	run_upgrade_interruption(directory, "upgrade-sigint-early",
-		CHECKPOINT_SIGINT, "transaction-prepared");
-	run_upgrade_interruption(directory, "upgrade-sigint-middle",
-		CHECKPOINT_SIGINT, "state-published");
-	run_upgrade_interruption(directory, "upgrade-sigint-late",
-		CHECKPOINT_SIGINT, "cleanup-start");
+	test_legacy_recreate_policy(directory, "legacy-recreate-policy");
 
 	require_no_temporary_entries(directory);
 	require_exact_file(sentinel, "immutable-lower\n");

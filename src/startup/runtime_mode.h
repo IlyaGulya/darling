@@ -24,6 +24,7 @@ struct darling_runtime_cli {
 	bool rootless;
 	bool show_help;
 	bool show_version;
+	bool confirm_prefix_recreate;
 	int command_index;
 };
 
