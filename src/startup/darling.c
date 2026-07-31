@@ -1162,7 +1162,7 @@ pid_t spawnInitProcess(void)
 				g_runtimePrefix->workdir_fd, error, sizeof(error)) != 0 ||
 			darling_runtime_mode_make_fd_inheritable(
 				g_runtimePrefix->sidecar_fd, error, sizeof(error)) != 0 ||
-			darling_runtime_mode_make_fd_inheritable(
+			darling_runtime_mode_make_lock_fd_inheritable(
 				g_runtimePrefix->lifecycle_lock_fd,
 				error, sizeof(error)) != 0) {
 			fprintf(stderr,

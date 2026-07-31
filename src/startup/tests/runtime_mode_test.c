@@ -1433,6 +1433,26 @@ static void test_prefix_marker(void)
 	require(fcntl(missing->directory_fd, F_SETFD,
 			descriptor_flags | FD_CLOEXEC) == 0,
 		"restore prefix descriptor close-on-exec");
+	int lock_fixture = openat(missing->parent_fd, "lock-fd-fixture",
+		O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+	require(lock_fixture >= 0, "create lifecycle lock fd fixture");
+	require(darling_runtime_mode_make_fd_inheritable(lock_fixture,
+			error, sizeof(error)) != 0,
+		"directory capability helper accepted a regular lock fd");
+	require(darling_runtime_mode_make_lock_fd_inheritable(lock_fixture,
+			error, sizeof(error)) == 0,
+		"lifecycle lock fd could not cross launcher/server exec");
+	descriptor_flags = fcntl(lock_fixture, F_GETFD);
+	require(descriptor_flags >= 0 &&
+			(descriptor_flags & FD_CLOEXEC) == 0,
+		"lifecycle lock fd remained close-on-exec");
+	require(darling_runtime_mode_make_lock_fd_inheritable(
+			missing->directory_fd, error, sizeof(error)) != 0,
+		"lock capability helper accepted a directory fd");
+	require(close(lock_fixture) == 0,
+		"close lifecycle lock fd fixture");
+	require(unlinkat(missing->parent_fd, "lock-fd-fixture", 0) == 0,
+		"remove lifecycle lock fd fixture");
 
 	char unsafe_target[1024];
 	char unsafe_link[1024];

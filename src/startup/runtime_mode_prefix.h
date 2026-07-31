@@ -238,6 +238,12 @@ int darling_runtime_mode_make_fd_inheritable(
 	size_t error_size
 );
 
+int darling_runtime_mode_make_lock_fd_inheritable(
+	int fd,
+	char* error,
+	size_t error_size
+);
+
 #ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
 int darling_runtime_prefix_test_checkpoint(const char* phase);
 
