@@ -121,6 +121,7 @@ int main(int argc, char** argv, char** envp)
 	const char* orig_argv1 = NULL;
 
 	mldr_load_results.kernfd = -1;
+	mldr_load_results.vchroot_fd = -1;
 	mldr_load_results.argc = argc;
 	mldr_load_results.argv = argv;
 
@@ -967,6 +968,13 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 
 	// keep our write end while closing the unused read end.
 	__mldr_close_process_lifetime_pipe(lifetime_pipe[0]);
+
+	if (dserver_rpc_vchroot_directory(&lr->vchroot_fd) < 0 ||
+		lr->vchroot_fd < 0) {
+		fprintf(stderr,
+			"Failed to retrieve retained vchroot directory from darlingserver\n");
+		exit(1);
+	}
 
 	if (!lr->root_path) {
 		static char vchroot_buffer[4096];
