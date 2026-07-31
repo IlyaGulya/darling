@@ -53,13 +53,12 @@ int main(int argc, const char** argv)
 		return 3;
 	}
 
-	close(dfd);
-
 	// This is only needed for this binary and shouldn't be passed down
 	unsetenv("DYLD_ROOT_PATH");
 
 	// printf("Will execv %s\n", argv[2]);
 	execv(argv[2], (char * const *) argv+2);
+	close(dfd);
 	perror("execv");
 
 	return 4;
