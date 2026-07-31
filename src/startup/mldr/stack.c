@@ -43,6 +43,7 @@
 
 #define EXECUTABLE_PATH "executable_path="
 #define RUNTIME_MODE_ENV_PREFIX DARLING_RUNTIME_MODE_ENV "="
+#define VCHROOT_FD_APPLE_PREFIX "vchroot_fd="
 
 #define __put_user(value, pointer) ({ \
 		__typeof__(value) _tmpval = (value); \
@@ -70,7 +71,9 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	char kernfd[12];
 	char __user* elfcalls_user;
 	char elfcalls[27];
-	char __user* applep_contents[4];
+	char __user* vchroot_fd_user;
+	char vchroot_fd[32];
+	char __user* applep_contents[5];
 	const size_t runtime_mode_envc =
 		lr->init_runtime_mode != DARLING_RUNTIME_MODE_INVALID ? 1 : 0;
 	char runtime_mode_env[128];
@@ -131,12 +134,13 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	// `envc`-count pointers for env vars, plus the typed runtime mode when
 	// mldr was invoked for launchd bootstrap (+1 for NULL)
 	// `sizeof(applep_contents) / sizeof(*applep_contents)`-count pointers for applep arguments (already includes NULL)
-	// space for exepath, kernfd, and elfcalls
+	// space for exepath, kernfd, elfcalls, and the retained vchroot FD
 	sp -= 1 + 1 + (lr->argc + 1) +
 		(lr->envc + runtime_mode_envc + 1) +
 		(sizeof(applep_contents) / sizeof(*applep_contents)) +
 		user_long_count(exepath_len + sizeof(EXECUTABLE_PATH) +
-			sizeof(kernfd) + sizeof(elfcalls) + runtime_mode_env_size);
+			sizeof(kernfd) + sizeof(elfcalls) + sizeof(vchroot_fd) +
+			runtime_mode_env_size);
 
 	exepath_user = (char __user*) lr->stack_top - exepath_len - sizeof(EXECUTABLE_PATH);
 	memcpy(exepath_user, EXECUTABLE_PATH, sizeof(EXECUTABLE_PATH)-1);
@@ -155,15 +159,25 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	snprintf(elfcalls, sizeof(elfcalls), "elf_calls=" POINTER_FORMAT, (unsigned long)(uintptr_t)&_elfcalls);
 	elfcalls_user = kernfd_user - sizeof(elfcalls);
 	memcpy(elfcalls_user, elfcalls, sizeof(elfcalls));
+	if (lr->vchroot_fd < 0 ||
+		snprintf(vchroot_fd, sizeof(vchroot_fd),
+			VCHROOT_FD_APPLE_PREFIX "%d", lr->vchroot_fd) >=
+			(int)sizeof(vchroot_fd)) {
+		fprintf(stderr, "Cannot construct retained vchroot FD apple entry\n");
+		exit(1);
+	}
+	vchroot_fd_user = elfcalls_user - sizeof(vchroot_fd);
+	memcpy(vchroot_fd_user, vchroot_fd, sizeof(vchroot_fd));
 	if (runtime_mode_env_size != 0) {
-		runtime_mode_env_user = elfcalls_user - runtime_mode_env_size;
+		runtime_mode_env_user = vchroot_fd_user - runtime_mode_env_size;
 		memcpy(runtime_mode_env_user, runtime_mode_env, runtime_mode_env_size);
 	}
 
 	applep_contents[0] = exepath_user;
 	applep_contents[1] = kernfd_user;
 	applep_contents[2] = elfcalls_user;
-	applep_contents[3] = NULL;
+	applep_contents[3] = vchroot_fd_user;
+	applep_contents[4] = NULL;
 
 	lr->stack_top = (unsigned long) sp;
 
