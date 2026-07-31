@@ -886,23 +886,59 @@ int darling_runtime_mode_write_relative_atomic(
 	return 0;
 }
 
+static int make_typed_fd_inheritable(
+	int fd,
+	bool require_directory,
+	char* error,
+	size_t error_size
+)
+{
+	struct stat status;
+	if (fd < 0)
+		return prefix_error(error, error_size,
+			require_directory ?
+				"cannot inherit invalid runtime directory fd: %s" :
+				"cannot inherit invalid runtime lock fd: %s",
+			"invalid");
+	if (fstat(fd, &status) != 0)
+		return prefix_error(error, error_size,
+			require_directory ?
+				"cannot inspect runtime directory fd: %s" :
+				"cannot inspect runtime lock fd: %s",
+			strerror(errno));
+	if ((require_directory && !S_ISDIR(status.st_mode)) ||
+			(!require_directory && !S_ISREG(status.st_mode)))
+		return prefix_error(error, error_size,
+			require_directory ?
+				"cannot inherit runtime directory fd with wrong file type: %s" :
+				"cannot inherit runtime lock fd with wrong file type: %s",
+			"invalid");
+	int flags = fcntl(fd, F_GETFD);
+	if (flags < 0 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) != 0)
+		return prefix_error(error, error_size,
+			require_directory ?
+				"cannot preserve runtime directory fd across exec: %s" :
+				"cannot preserve runtime lock fd across exec: %s",
+			strerror(errno));
+	return 0;
+}
+
 int darling_runtime_mode_make_fd_inheritable(
 	int fd,
 	char* error,
 	size_t error_size
 )
 {
-	struct stat status;
-	if (fd < 0 || fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode))
-		return prefix_error(error, error_size,
-			"cannot inherit invalid runtime directory fd: %s",
-			fd < 0 ? "invalid" : strerror(errno));
-	int flags = fcntl(fd, F_GETFD);
-	if (flags < 0 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) != 0)
-		return prefix_error(error, error_size,
-			"cannot preserve runtime directory fd across exec: %s",
-			strerror(errno));
-	return 0;
+	return make_typed_fd_inheritable(fd, true, error, error_size);
+}
+
+int darling_runtime_mode_make_lock_fd_inheritable(
+	int fd,
+	char* error,
+	size_t error_size
+)
+{
+	return make_typed_fd_inheritable(fd, false, error, error_size);
 }
 
 static int fsync_directory(
