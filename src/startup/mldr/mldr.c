@@ -232,6 +232,7 @@ int main(int argc, char** argv, char** envp)
 		if (
 			ENV_VAR_MATCHES("__mldr_bprefs=")   ||
 			ENV_VAR_MATCHES("__mldr_sockpath=") ||
+			ENV_VAR_MATCHES("__mldr_vchroot_fd=") ||
 			ENV_VAR_MATCHES("__mldr_runtime_mode=")
 		) {
 			size_t len_after = 0;
@@ -549,6 +550,23 @@ static void process_special_env(struct load_results* lr) {
 		sscanf(str, "%i", &lr->lifetime_pipe);
 	}
 
+	str = getenv("__mldr_vchroot_fd");
+	if (str != NULL) {
+		char* end = NULL;
+		errno = 0;
+		long descriptor = strtol(str, &end, 10);
+		struct stat descriptor_stat;
+		if (errno != 0 || end == str || *end != '\0' ||
+			descriptor < 0 || descriptor > INT32_MAX ||
+			fstat((int)descriptor, &descriptor_stat) != 0 ||
+			!S_ISDIR(descriptor_stat.st_mode)) {
+			fprintf(stderr,
+				"invalid retained vchroot directory from bootstrap boundary\n");
+			exit(1);
+		}
+		lr->vchroot_fd = (int)descriptor;
+	}
+
 	str = getenv("__mldr_DYLD_ROOT_PATH");
 
 	if (str != NULL && lr->root_path == NULL) {
@@ -588,6 +606,7 @@ static void unset_special_env() {
 	unsetenv("__mldr_bprefs");
 	unsetenv("__mldr_sockpath");
 	unsetenv("__mldr_lifetime_pipe");
+	unsetenv("__mldr_vchroot_fd");
 	unsetenv("__mldr_rootless_pid1");
 	unsetenv("__mldr_runtime_mode");
 };
@@ -969,8 +988,9 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	// keep our write end while closing the unused read end.
 	__mldr_close_process_lifetime_pipe(lifetime_pipe[0]);
 
-	if (dserver_rpc_vchroot_directory(&lr->vchroot_fd) < 0 ||
-		lr->vchroot_fd < 0) {
+	if (lr->vchroot_fd < 0 &&
+		(dserver_rpc_vchroot_directory(&lr->vchroot_fd) < 0 ||
+			lr->vchroot_fd < 0)) {
 		fprintf(stderr,
 			"Failed to retrieve retained vchroot directory from darlingserver\n");
 		exit(1);
