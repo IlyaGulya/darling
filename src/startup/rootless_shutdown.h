@@ -10,6 +10,7 @@
 enum rootless_shutdown_phase {
 	ROOTLESS_SHUTDOWN_RUNNING,
 	ROOTLESS_SHUTDOWN_CLOSURE_BOUND,
+	ROOTLESS_SHUTDOWN_QUIESCING,
 	ROOTLESS_SHUTDOWN_TERM,
 	ROOTLESS_SHUTDOWN_DRAINING,
 	ROOTLESS_SHUTDOWN_KILL,
@@ -19,6 +20,7 @@ enum rootless_shutdown_phase {
 };
 
 struct rootless_shutdown_policy {
+	unsigned quiesce_timeout_ms;
 	unsigned term_timeout_ms;
 	unsigned kill_timeout_ms;
 	unsigned poll_interval_ms;
@@ -29,6 +31,7 @@ struct rootless_shutdown_result {
 	pid_t session;
 	ino_t closure_inode;
 	size_t identities_observed;
+	unsigned quiesce_rounds;
 	unsigned term_rounds;
 	unsigned kill_rounds;
 };

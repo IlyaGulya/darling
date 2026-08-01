@@ -20,3 +20,23 @@ foreach(shutdown_test IN ITEMS session lifecycle shared_session)
 		LABELS "env:host;rootless-shutdown"
 		TIMEOUT 20)
 endforeach()
+
+add_executable(darling_rootless_shellspawn_shutdown_test
+	../../shellspawn/shellspawn.c
+	../../shellspawn/duct_signals.c
+	../runtime_mode.c)
+target_compile_definitions(darling_rootless_shellspawn_shutdown_test PRIVATE
+	_GNU_SOURCE
+	TESTING
+	DARLING_RUNTIME_EUNION_CAPABLE=1)
+target_compile_options(darling_rootless_shellspawn_shutdown_test PRIVATE
+	-Wall -Wextra -Werror -Wno-c23-extensions)
+target_include_directories(darling_rootless_shellspawn_shutdown_test PRIVATE
+	..
+	../../shellspawn)
+add_test(NAME darling_rootless_shellspawn_shutdown_test
+	COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/rootless_shellspawn_shutdown_test.sh
+		$<TARGET_FILE:darling_rootless_shellspawn_shutdown_test>)
+set_tests_properties(darling_rootless_shellspawn_shutdown_test PROPERTIES
+	LABELS "env:host;rootless-shutdown"
+	TIMEOUT 20)

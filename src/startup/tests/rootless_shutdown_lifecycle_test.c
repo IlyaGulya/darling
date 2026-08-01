@@ -86,7 +86,7 @@ static int bind_socket(const char* path)
 	return result;
 }
 
-static int prepare_endpoints(const char* prefix)
+static int prepare_endpoint_directories(const char* prefix)
 {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/var", prefix);
@@ -102,19 +102,39 @@ static int prepare_endpoints(const char* prefix)
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
 		return -1;
 
+	return 0;
+}
+
+static int prepare_endpoints(const char* prefix, int guest_owned)
+{
+	if (prepare_endpoint_directories(prefix) != 0)
+		return -1;
+	char path[512];
 	snprintf(path, sizeof(path), "%s/.init.pid", prefix);
 	if (write_file(path, "123\n") != 0)
 		return -1;
 	static const char* sockets[] = {
 		".darlingserver.sock",
 		".darlingserver.stat.sock",
-		"var/run/shellspawn.sock",
-		"var/tmp/launchd/sock",
 	};
 	for (size_t index = 0; index < sizeof(sockets) / sizeof(sockets[0]); ++index) {
 		snprintf(path, sizeof(path), "%s/%s", prefix, sockets[index]);
 		if (bind_socket(path) != 0)
 			return -1;
+	}
+	if (guest_owned) {
+		static const char* guest_sockets[] = {
+			"var/run/shellspawn.sock",
+			"var/tmp/launchd/sock",
+		};
+		for (size_t index = 0;
+			index < sizeof(guest_sockets) / sizeof(guest_sockets[0]);
+			++index) {
+			snprintf(path, sizeof(path), "%s/%s", prefix,
+				guest_sockets[index]);
+			if (bind_socket(path) != 0)
+				return -1;
+		}
 	}
 	return 0;
 }
@@ -325,7 +345,7 @@ static int run_shutdown_case(
 	int expect_kill
 )
 {
-	if (prepare_endpoints(prefix_path) != 0)
+	if (prepare_endpoints(prefix_path, 0) != 0)
 		return 20;
 	struct session_fixture fixture = spawn_fixture(mode, prefix);
 	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
@@ -441,7 +461,7 @@ int main(void)
 	if (mkdir(missing_path, 0700) != 0)
 		return 40;
 
-	if (prepare_endpoints(prefix_path) != 0)
+	if (prepare_endpoints(prefix_path, 0) != 0)
 		return 41;
 	struct rootless_shutdown_closure_capability timeout_closure =
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
@@ -502,9 +522,55 @@ int main(void)
 		index < sizeof(timeout_endpoints) / sizeof(timeout_endpoints[0]);
 		++index) {
 		if (darling_runtime_mode_unlink_relative(prefix,
-				timeout_endpoints[index], 0, false,
+				timeout_endpoints[index], 0, true,
 				error, sizeof(error)) != 0)
 			return 44;
+	}
+
+	/* Host cleanup must never unlink guest-owned endpoints behind E-UNION's
+	 * durable sidecar. A surviving guest endpoint is a fail-closed shutdown,
+	 * not permission to leave a stale INDEX record pointing at a removed inode. */
+	if (prepare_endpoints(prefix_path, 1) != 0)
+		return 49;
+	struct session_fixture guest_endpoint_fixture =
+		spawn_fixture(FIXTURE_GRACEFUL, prefix);
+	if (guest_endpoint_fixture.init <= 0 || guest_endpoint_fixture.leader <= 0)
+		return 50;
+	struct rootless_shutdown_result guest_endpoint_result;
+	int guest_endpoint_rc = shutdown_rootless_runtime(
+		guest_endpoint_fixture.leader,
+		guest_endpoint_fixture.init,
+		prefix,
+		NULL,
+		&guest_endpoint_result,
+		error,
+		sizeof(error));
+	(void)waitpid(guest_endpoint_fixture.init, NULL, 0);
+	guest_endpoint_fixture.init = -1;
+	cleanup_fixture(&guest_endpoint_fixture);
+	if (guest_endpoint_rc == 0 ||
+		guest_endpoint_result.phase != ROOTLESS_SHUTDOWN_DRAINED ||
+		!endpoint_exists(prefix_path, "var/run/shellspawn.sock") ||
+		!endpoint_exists(prefix_path, "var/tmp/launchd/sock")) {
+		fprintf(stderr, "guest endpoint fail-closed contract failed rc=%d "
+			"phase=%d error=%s\n", guest_endpoint_rc,
+			guest_endpoint_result.phase, error);
+		return 51;
+	}
+	static const char* failed_endpoints[] = {
+		".init.pid",
+		".darlingserver.sock",
+		".darlingserver.stat.sock",
+		"var/run/shellspawn.sock",
+		"var/tmp/launchd/sock",
+	};
+	for (size_t index = 0;
+		index < sizeof(failed_endpoints) / sizeof(failed_endpoints[0]);
+		++index) {
+		if (darling_runtime_mode_unlink_relative(prefix,
+				failed_endpoints[index], 0, true,
+				error, sizeof(error)) != 0)
+			return 52;
 	}
 
 	darling_runtime_mode_close_prefix(prefix);
@@ -523,6 +589,6 @@ int main(void)
 		return 48;
 	puts("ROOTLESS_SHUTDOWN_LIFECYCLE_OK cycles=3 stubborn=PASS "
 		"late_fork=PASS root_late_fork=PASS zombie_session=PASS "
-		"timeout=PASS endpoints=5");
+		"timeout=PASS endpoints=5 guest_endpoint_fail_closed=PASS");
 	return 0;
 }

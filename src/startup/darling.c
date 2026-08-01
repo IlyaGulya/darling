@@ -53,6 +53,8 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 // (dunno which one is really responsible for this).
 #define USE_LINUX_4_11_HACK 1
 #define ROOTLESS_SHELLSPAWN_READY_TIMEOUT_MS 30000
+#define ROOTLESS_LAUNCHD_SHUTDOWN_REQUEST_TIMEOUT_MS 5000
+#define ROOTLESS_LAUNCHD_QUIESCE_TIMEOUT_MS 5000
 
 uid_t g_originalUid;
 gid_t g_originalGid;
@@ -88,6 +90,94 @@ static long rootlessShellspawnReadyTimeoutMs(void)
 		exit(1);
 	}
 	return timeout_ms;
+}
+
+static void terminateShutdownRequest(pid_t child)
+{
+	(void)kill(child, SIGKILL);
+	while (waitpid(child, NULL, 0) < 0 && errno == EINTR)
+		;
+}
+
+static int waitForShutdownRequest(pid_t child, unsigned timeout_ms)
+{
+	struct timespec started;
+	if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+		int clock_error = errno;
+		terminateShutdownRequest(child);
+		errno = clock_error;
+		return -errno;
+	}
+	for (;;) {
+		int status;
+		pid_t waited = waitpid(child, &status, WNOHANG);
+		if (waited == child) {
+			if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+				return 0;
+			return -EPROTO;
+		}
+		if (waited < 0 && errno != EINTR) {
+			int wait_error = errno;
+			terminateShutdownRequest(child);
+			return -wait_error;
+		}
+		struct timespec now;
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			int clock_error = errno;
+			terminateShutdownRequest(child);
+			return -clock_error;
+		}
+		unsigned long long elapsed_ms =
+			(unsigned long long)(now.tv_sec - started.tv_sec) * 1000ULL;
+		if (now.tv_nsec >= started.tv_nsec)
+			elapsed_ms += (unsigned long long)(now.tv_nsec - started.tv_nsec) /
+				1000000ULL;
+		else
+			elapsed_ms -= (unsigned long long)(started.tv_nsec - now.tv_nsec) /
+				1000000ULL;
+		if (elapsed_ms >= timeout_ms) {
+			terminateShutdownRequest(child);
+			return -ETIMEDOUT;
+		}
+		struct timespec delay = { .tv_nsec = 10 * 1000 * 1000L };
+		while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
+			;
+	}
+}
+
+static int requestRootlessLaunchdShutdown(pid_t pidInit)
+{
+	pid_t child = fork();
+	if (child < 0)
+		return -errno;
+	if (child == 0) {
+		const char* arguments[] = { "/bin/launchctl", "shutdown", NULL };
+		spawnShell(pidInit, arguments);
+		_exit(127);
+	}
+	return waitForShutdownRequest(child,
+		ROOTLESS_LAUNCHD_SHUTDOWN_REQUEST_TIMEOUT_MS);
+}
+
+static int requireRootlessShellspawnEndpointAbsent(void)
+{
+	char error[512] = {0};
+	struct stat status;
+	if (darling_runtime_mode_stat_relative(g_runtimePrefix,
+			"var/run/shellspawn.sock", &status,
+			error, sizeof(error)) == 0) {
+		fprintf(stderr,
+			"Rootless shellspawn endpoint survived the previous session; "
+			"refusing host-side removal that would bypass E-UNION: %s\n",
+			"var/run/shellspawn.sock");
+		return -1;
+	}
+	if (errno != ENOENT) {
+		fprintf(stderr, "Cannot inspect rootless shellspawn endpoint: %s\n",
+			error[0] == '\0' ? strerror(errno) : error);
+		return -1;
+	}
+	return 0;
 }
 
 static void removePrivilegedRuntimeStateFiles(void)
@@ -341,11 +431,26 @@ int main(int argc, char ** argv)
 		fclose(file);
 
 		if (rootless) {
+			int graceful_request = requestRootlessLaunchdShutdown(pidInit);
+			const struct rootless_shutdown_policy shutdown_policy = {
+				.quiesce_timeout_ms = graceful_request == 0
+					? ROOTLESS_LAUNCHD_QUIESCE_TIMEOUT_MS : 0,
+				.term_timeout_ms = 1000,
+				.kill_timeout_ms = 5000,
+				.poll_interval_ms = 20,
+			};
 			struct rootless_shutdown_result shutdown_state;
 			int shutdown_result = shutdown_rootless_runtime(
-				launchd_pid, pidInit, g_runtimePrefix, NULL,
+				launchd_pid, pidInit, g_runtimePrefix, &shutdown_policy,
 				&shutdown_state, runtimeModeError,
 				sizeof(runtimeModeError));
+			if (graceful_request != 0) {
+				fprintf(stderr,
+					"Failed to request graceful launchd shutdown: %s\n",
+					strerror(-graceful_request));
+				if (shutdown_result == 0)
+					return 1;
+			}
 			if (shutdown_result != 0) {
 				fprintf(stderr,
 					"Failed to stop rootless Darling session at phase %s: %s\n",
@@ -365,7 +470,10 @@ int main(int argc, char ** argv)
 	// If prefix's init is not running, start it up
 	if (pidInit == 0)
 	{
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
+		if (rootless) {
+			if (requireRootlessShellspawnEndpointAbsent() != 0)
+				return 1;
+		} else if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
 				"var/run/shellspawn.sock", 0, true,
 				runtimeModeError, sizeof(runtimeModeError)) != 0) {
 			fprintf(stderr, "Cannot clear stale shellspawn socket: %s\n",

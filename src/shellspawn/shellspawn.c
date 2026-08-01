@@ -41,6 +41,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 int g_serverSocket = -1;
 struct sigaction sigchld_oldaction;
 static bool g_rootlessRuntime;
+static volatile sig_atomic_t g_shutdownRequested;
 
 void setupSocket(void);
 void listenForConnections(void);
@@ -48,6 +49,28 @@ void spawnShell(int fd);
 void setupSigchild(void);
 void restoreSigchild(void);
 void reapAll(void);
+
+static void requestShutdown(int signal_number)
+{
+	(void)signal_number;
+	g_shutdownRequested = 1;
+}
+
+static int installShutdownHandler(void)
+{
+	struct sigaction action = {0};
+	action.sa_handler = requestShutdown;
+	sigemptyset(&action.sa_mask);
+	return sigaction(SIGTERM, &action, NULL);
+}
+
+static void restoreShutdownHandler(void)
+{
+	struct sigaction action = {0};
+	action.sa_handler = SIG_DFL;
+	sigemptyset(&action.sa_mask);
+	(void)sigaction(SIGTERM, &action, NULL);
+}
 
 enum shell_wait_result
 {
@@ -209,6 +232,8 @@ static void rootlessTestMarkSocketPending(void)
 }
 int main(int argc, const char** argv)
 {
+	(void)argc;
+	(void)argv;
 	enum darling_runtime_mode runtime_mode = DARLING_RUNTIME_MODE_INVALID;
 	char runtime_mode_error[256] = {0};
 	if (darling_runtime_mode_require_canonical_process(
@@ -228,6 +253,11 @@ int main(int argc, const char** argv)
 	// we have to allow it to become a zombie, therefore we need to
 	// restore the sigaction of SIGCHLD of the child shellspawn
 	setupSigchild();
+	if (g_rootlessRuntime && installShutdownHandler() != 0)
+	{
+		perror("Installing shellspawn shutdown handler");
+		return EXIT_FAILURE;
+	}
 	rootlessTestDelaySocketReady();
 	rootlessTestMarkSocketPending();
 	setupSocket();
@@ -235,6 +265,12 @@ int main(int argc, const char** argv)
 
 	if (g_serverSocket != -1)
 		close(g_serverSocket);
+	if (g_rootlessRuntime &&
+		unlink(SHELLSPAWN_SOCKPATH) != 0 && errno != ENOENT)
+	{
+		perror("Removing shellspawn socket during shutdown");
+		return EXIT_FAILURE;
+	}
 	return 0;
 }
 
@@ -276,14 +312,18 @@ void listenForConnections(void)
 	struct sockaddr_un addr;
 	socklen_t len = sizeof(addr);
 
-	while (true)
+	while (!g_shutdownRequested)
 	{
 		sock = accept(g_serverSocket, (struct sockaddr*) &addr, &len);
+		if (sock == -1 && errno == EINTR && !g_shutdownRequested)
+			continue;
 		if (sock == -1)
 			break;
 
 		if (fork() == 0)
 		{
+			if (g_rootlessRuntime)
+				restoreShutdownHandler();
 			restoreSigchild();
 			fcntl(sock, F_SETFD, FD_CLOEXEC);
 			spawnShell(sock);
@@ -398,7 +438,7 @@ void spawnShell(int fd)
 				}
 				if (cmptr->cmsg_len != CMSG_LEN(sizeof(int) * 3))
 				{
-					if (DBG) printf("bad cmsg_len: %d\n", cmptr->cmsg_len);
+					if (DBG) printf("bad cmsg_len: %zu\n", cmptr->cmsg_len);
 					goto err;
 				}
 

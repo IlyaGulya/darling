@@ -31,15 +31,19 @@ struct process_ledger {
 };
 
 static const struct rootless_shutdown_policy default_policy = {
+	.quiesce_timeout_ms = 0,
 	.term_timeout_ms = 1000,
 	.kill_timeout_ms = 5000,
 	.poll_interval_ms = 20,
 };
 
-static const char* const runtime_endpoints[] = {
+static const char* const host_runtime_endpoints[] = {
 	".init.pid",
 	".darlingserver.sock",
 	".darlingserver.stat.sock",
+};
+
+static const char* const guest_runtime_endpoints[] = {
 	"var/run/shellspawn.sock",
 	"var/tmp/launchd/sock",
 };
@@ -51,6 +55,8 @@ const char* rootless_shutdown_phase_name(enum rootless_shutdown_phase phase)
 		return "RUNNING";
 	case ROOTLESS_SHUTDOWN_CLOSURE_BOUND:
 		return "CLOSURE_BOUND";
+	case ROOTLESS_SHUTDOWN_QUIESCING:
+		return "QUIESCING";
 	case ROOTLESS_SHUTDOWN_TERM:
 		return "TERM";
 	case ROOTLESS_SHUTDOWN_DRAINING:
@@ -750,6 +756,52 @@ static void sleep_milliseconds(unsigned milliseconds)
 		;
 }
 
+static int process_identity_active(pid_t pid,
+	unsigned long long start_time, int* active)
+{
+	struct process_snapshot snapshot;
+	int status = process_snapshot_for_pid(pid, &snapshot);
+	if (status == -ESRCH) {
+		*active = 0;
+		return 0;
+	}
+	if (status != 0)
+		return status;
+	*active = snapshot.start_time == start_time && process_is_active(&snapshot);
+	return 0;
+}
+
+static int quiesce_session_member(pid_t pid,
+	unsigned long long start_time, unsigned timeout_ms,
+	unsigned poll_interval_ms, unsigned* rounds)
+{
+	if (pid <= 0 || timeout_ms == 0)
+		return 0;
+	unsigned long long now;
+	int status = monotonic_milliseconds(&now);
+	if (status != 0)
+		return status;
+	const unsigned long long deadline = now + timeout_ms;
+	for (;;) {
+		int active = 0;
+		status = process_identity_active(pid, start_time, &active);
+		if (status != 0 || !active)
+			return status;
+		(*rounds)++;
+		status = monotonic_milliseconds(&now);
+		if (status != 0)
+			return status;
+		if (now >= deadline)
+			return -ETIMEDOUT;
+		const unsigned remaining = deadline > now
+			? (unsigned)(deadline - now) : 0;
+		const unsigned delay = poll_interval_ms < remaining
+			? poll_interval_ms : remaining;
+		if (delay != 0)
+			sleep_milliseconds(delay);
+	}
+}
+
 static int drain_until(pid_t init_process,
 	unsigned long long init_start_time,
 	const struct rootless_shutdown_closure_capability* closure,
@@ -872,53 +924,73 @@ fail_without_capability:
 }
 
 static int preflight_runtime_endpoints(const darling_runtime_prefix prefix,
+	const char* const* endpoints, size_t endpoint_count,
 	char* error, size_t error_size)
 {
-	for (size_t index = 0;
-		index < sizeof(runtime_endpoints) / sizeof(runtime_endpoints[0]);
-		++index) {
+	for (size_t index = 0; index < endpoint_count; ++index) {
 		struct stat status;
-		if (darling_runtime_mode_stat_relative(prefix,
-				runtime_endpoints[index],
+		if (darling_runtime_mode_stat_relative(prefix, endpoints[index],
 				&status, error, error_size) != 0 && errno != ENOENT)
 			return -1;
 	}
 	return 0;
 }
 
-static int remove_runtime_endpoints(const darling_runtime_prefix prefix,
-	char* error, size_t error_size)
+static int require_guest_runtime_endpoints_absent(
+	const darling_runtime_prefix prefix, char* error, size_t error_size)
 {
-	if (preflight_runtime_endpoints(prefix, error, error_size) != 0)
-		return -1;
 	for (size_t index = 0;
-		index < sizeof(runtime_endpoints) / sizeof(runtime_endpoints[0]);
-		++index) {
+		index < sizeof(guest_runtime_endpoints) /
+			sizeof(guest_runtime_endpoints[0]); ++index) {
 		struct stat status;
 		if (darling_runtime_mode_stat_relative(prefix,
-				runtime_endpoints[index], &status,
+				guest_runtime_endpoints[index], &status,
+				error, error_size) == 0) {
+			errno = EBUSY;
+			if (error != NULL && error_size != 0)
+				snprintf(error, error_size,
+					"guest runtime endpoint survived graceful shutdown: %s",
+					guest_runtime_endpoints[index]);
+			return -1;
+		}
+		if (errno != ENOENT)
+			return -1;
+	}
+	return 0;
+}
+
+static int remove_host_runtime_endpoints(const darling_runtime_prefix prefix,
+	char* error, size_t error_size)
+{
+	const size_t endpoint_count = sizeof(host_runtime_endpoints) /
+		sizeof(host_runtime_endpoints[0]);
+	if (preflight_runtime_endpoints(prefix, host_runtime_endpoints,
+			endpoint_count, error, error_size) != 0)
+		return -1;
+	for (size_t index = 0; index < endpoint_count; ++index) {
+		struct stat status;
+		if (darling_runtime_mode_stat_relative(prefix,
+				host_runtime_endpoints[index], &status,
 				error, error_size) != 0) {
 			if (errno == ENOENT)
 				continue;
 			return -1;
 		}
 		if (darling_runtime_mode_unlink_relative(prefix,
-				runtime_endpoints[index],
+				host_runtime_endpoints[index],
 				0, true, error, error_size) != 0)
 			return -1;
 	}
-	for (size_t index = 0;
-		index < sizeof(runtime_endpoints) / sizeof(runtime_endpoints[0]);
-		++index) {
+	for (size_t index = 0; index < endpoint_count; ++index) {
 		struct stat status;
 		if (darling_runtime_mode_stat_relative(prefix,
-				runtime_endpoints[index], &status,
+				host_runtime_endpoints[index], &status,
 				error, error_size) == 0) {
 			errno = EBUSY;
 			if (error != NULL && error_size != 0)
 				snprintf(error, error_size,
 					"runtime endpoint reappeared during shutdown: %s",
-					runtime_endpoints[index]);
+					host_runtime_endpoints[index]);
 			return -1;
 		}
 		if (errno != ENOENT)
@@ -944,21 +1016,28 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 	const struct rootless_shutdown_policy* policy = requested_policy != NULL
 		? requested_policy : &default_policy;
 	if (result == NULL || prefix == NULL || prefix->directory_fd < 0 ||
-		session_member <= 0 || init_process <= 0 ||
+		session_member < 0 || init_process <= 0 ||
 		policy->poll_interval_ms == 0) {
 		return shutdown_error(error, error_size, EINVAL,
 			"rootless shutdown input is invalid");
 	}
 	*result = local;
-	int status = process_snapshot_for_pid(session_member, &member_snapshot);
-	if (status != 0)
-		return shutdown_error(error, error_size, -status,
-			"cannot inspect rootless session member: %s", strerror(-status));
+	int member_present = session_member > 0;
+	int status = 0;
+	if (member_present) {
+		status = process_snapshot_for_pid(session_member, &member_snapshot);
+		if (status == -ESRCH)
+			member_present = 0;
+		else if (status != 0)
+			return shutdown_error(error, error_size, -status,
+				"cannot inspect rootless session member: %s",
+				strerror(-status));
+	}
 	status = process_snapshot_for_pid(init_process, &init_snapshot);
 	if (status != 0)
 		return shutdown_error(error, error_size, -status,
 			"cannot inspect Darling init process: %s", strerror(-status));
-	local.session = member_snapshot.session;
+	local.session = member_present ? member_snapshot.session : init_snapshot.session;
 	status = bind_runtime_closure(init_process, prefix, &closure,
 		error, error_size);
 	if (status != 0)
@@ -977,7 +1056,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 	}
 	if (rootless_shutdown_closure_contains(&closure, init_process,
 			error, error_size) != 0 ||
-		(process_is_active(&member_snapshot) &&
+		(member_present && process_is_active(&member_snapshot) &&
 		 rootless_shutdown_closure_contains(&closure, session_member,
 			error, error_size) != 0)) {
 		outcome = -1;
@@ -1002,9 +1081,25 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 					strerror(status != 0 ? -status : ESRCH));
 				goto finish;
 			}
-			local.phase = ROOTLESS_SHUTDOWN_TERM;
+			local.phase = ROOTLESS_SHUTDOWN_QUIESCING;
 			break;
 		}
+		case ROOTLESS_SHUTDOWN_QUIESCING:
+			status = member_present
+				? quiesce_session_member(session_member,
+					member_snapshot.start_time,
+					policy->quiesce_timeout_ms,
+					policy->poll_interval_ms,
+					&local.quiesce_rounds)
+				: 0;
+			if (status != 0 && status != -ETIMEDOUT) {
+				outcome = shutdown_error(error, error_size, -status,
+					"cannot observe graceful rootless quiesce: %s",
+					strerror(-status));
+				goto finish;
+			}
+			local.phase = ROOTLESS_SHUTDOWN_TERM;
+			break;
 		case ROOTLESS_SHUTDOWN_TERM: {
 			unsigned active = 0;
 			status = signal_runtime_closure(init_process,
@@ -1078,8 +1173,18 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 			local.phase = ROOTLESS_SHUTDOWN_DRAINED;
 			break;
 		case ROOTLESS_SHUTDOWN_DRAINED:
-			if (remove_runtime_endpoints(prefix, error, error_size) != 0) {
+			if (require_guest_runtime_endpoints_absent(
+					prefix, error, error_size) != 0) {
 				outcome = -1;
+				(void)rootless_shutdown_cleanup_empty_closure(
+					&closure, NULL, 0);
+				goto finish;
+			}
+			if (remove_host_runtime_endpoints(prefix,
+					error, error_size) != 0) {
+				outcome = -1;
+				(void)rootless_shutdown_cleanup_empty_closure(
+					&closure, NULL, 0);
 				goto finish;
 			}
 			local.phase = ROOTLESS_SHUTDOWN_ENDPOINTS_REMOVED;
