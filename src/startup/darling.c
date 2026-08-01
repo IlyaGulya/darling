@@ -151,6 +151,13 @@ static int requestRootlessLaunchdShutdown(pid_t pidInit)
 	if (child < 0)
 		return -errno;
 	if (child == 0) {
+		/* shellspawn is itself a launchd job and can retain the trusted-fd
+		 * environment variable after that descriptor has become unavailable to
+		 * a spawned client. Bind this one-shot control request to launchd's
+		 * guest-visible endpoint instead of inheriting that stale hint. */
+		if (setenv("__LAUNCHD_FD", "-1", 1) != 0 ||
+			setenv("LAUNCHD_SOCKET", "/var/tmp/launchd/sock", 1) != 0)
+			_exit(126);
 		const char* arguments[] = { "/bin/launchctl", "shutdown", NULL };
 		spawnShell(pidInit, arguments);
 		_exit(127);
