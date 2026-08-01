@@ -37,13 +37,10 @@ static const struct rootless_shutdown_policy default_policy = {
 	.poll_interval_ms = 20,
 };
 
-static const char* const host_runtime_endpoints[] = {
+static const char* const runtime_endpoints[] = {
 	".init.pid",
 	".darlingserver.sock",
 	".darlingserver.stat.sock",
-};
-
-static const char* const guest_runtime_endpoints[] = {
 	"var/run/shellspawn.sock",
 	"var/tmp/launchd/sock",
 };
@@ -936,61 +933,38 @@ static int preflight_runtime_endpoints(const darling_runtime_prefix prefix,
 	return 0;
 }
 
-static int require_guest_runtime_endpoints_absent(
-	const darling_runtime_prefix prefix, char* error, size_t error_size)
-{
-	for (size_t index = 0;
-		index < sizeof(guest_runtime_endpoints) /
-			sizeof(guest_runtime_endpoints[0]); ++index) {
-		struct stat status;
-		if (darling_runtime_mode_stat_relative(prefix,
-				guest_runtime_endpoints[index], &status,
-				error, error_size) == 0) {
-			errno = EBUSY;
-			if (error != NULL && error_size != 0)
-				snprintf(error, error_size,
-					"guest runtime endpoint survived graceful shutdown: %s",
-					guest_runtime_endpoints[index]);
-			return -1;
-		}
-		if (errno != ENOENT)
-			return -1;
-	}
-	return 0;
-}
-
-static int remove_host_runtime_endpoints(const darling_runtime_prefix prefix,
+static int remove_runtime_endpoints(const darling_runtime_prefix prefix,
 	char* error, size_t error_size)
 {
-	const size_t endpoint_count = sizeof(host_runtime_endpoints) /
-		sizeof(host_runtime_endpoints[0]);
-	if (preflight_runtime_endpoints(prefix, host_runtime_endpoints,
+	const size_t endpoint_count = sizeof(runtime_endpoints) /
+		sizeof(runtime_endpoints[0]);
+	if (preflight_runtime_endpoints(prefix, runtime_endpoints,
 			endpoint_count, error, error_size) != 0)
 		return -1;
 	for (size_t index = 0; index < endpoint_count; ++index) {
 		struct stat status;
 		if (darling_runtime_mode_stat_relative(prefix,
-				host_runtime_endpoints[index], &status,
+				runtime_endpoints[index], &status,
 				error, error_size) != 0) {
 			if (errno == ENOENT)
 				continue;
 			return -1;
 		}
 		if (darling_runtime_mode_unlink_relative(prefix,
-				host_runtime_endpoints[index],
+				runtime_endpoints[index],
 				0, true, error, error_size) != 0)
 			return -1;
 	}
 	for (size_t index = 0; index < endpoint_count; ++index) {
 		struct stat status;
 		if (darling_runtime_mode_stat_relative(prefix,
-				host_runtime_endpoints[index], &status,
+				runtime_endpoints[index], &status,
 				error, error_size) == 0) {
 			errno = EBUSY;
 			if (error != NULL && error_size != 0)
 				snprintf(error, error_size,
 					"runtime endpoint reappeared during shutdown: %s",
-					host_runtime_endpoints[index]);
+					runtime_endpoints[index]);
 			return -1;
 		}
 		if (errno != ENOENT)
@@ -1173,14 +1147,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 			local.phase = ROOTLESS_SHUTDOWN_DRAINED;
 			break;
 		case ROOTLESS_SHUTDOWN_DRAINED:
-			if (require_guest_runtime_endpoints_absent(
-					prefix, error, error_size) != 0) {
-				outcome = -1;
-				(void)rootless_shutdown_cleanup_empty_closure(
-					&closure, NULL, 0);
-				goto finish;
-			}
-			if (remove_host_runtime_endpoints(prefix,
+			if (remove_runtime_endpoints(prefix,
 					error, error_size) != 0) {
 				outcome = -1;
 				(void)rootless_shutdown_cleanup_empty_closure(
