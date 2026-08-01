@@ -69,7 +69,6 @@ static kq_callback kqipc_listen_callback = ipc_listen_callback;
 static pid_t ipc_self = 0;
 
 char *sockpath = NULL;
-static char *sockdir = NULL;
 
 static bool ipc_inited = false;
 
@@ -82,9 +81,10 @@ ipc_server_shutdown(void)
 
 	if (-1 == unlink(sockpath) && errno != ENOENT) {
 		launchd_syslog(LOG_WARNING, "unlink(\"%s\"): %s", sockpath, strerror(errno));
-	} else if (-1 == rmdir(sockdir) && errno != ENOENT) {
-		launchd_syslog(LOG_WARNING, "rmdir(\"%s\"): %s", sockdir, strerror(errno));
 	}
+	/* The directory is stable prefix state, not a runtime endpoint. Keeping it
+	 * avoids publishing a union tomb that the next boot would have to resurrect
+	 * before it can bind the replacement socket. */
 	ipc_inited = false;
 }
 
@@ -167,7 +167,6 @@ ipc_server_init(void)
 
 	ipc_inited = true;
 
-	sockdir = strdup(ourdir);
 	sockpath = strdup(sun.sun_path);
 	ipc_self = getpid();
 	atexit(ipc_server_shutdown);

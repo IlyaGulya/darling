@@ -40,3 +40,10 @@ add_test(NAME darling_rootless_shellspawn_shutdown_test
 set_tests_properties(darling_rootless_shellspawn_shutdown_test PROPERTIES
 	LABELS "env:host;rootless-shutdown"
 	TIMEOUT 20)
+
+add_test(NAME darling_rootless_launchd_endpoint_contract
+	COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/rootless_launchd_endpoint_contract.sh
+		${CMAKE_CURRENT_SOURCE_DIR}/../../launchd/src/ipc.c)
+set_tests_properties(darling_rootless_launchd_endpoint_contract PROPERTIES
+	LABELS "env:host;rootless-shutdown"
+	TIMEOUT 20)
