@@ -73,18 +73,19 @@ static char *sockdir = NULL;
 
 static bool ipc_inited = false;
 
-static void
-ipc_clean_up(void)
+void
+ipc_server_shutdown(void)
 {
-	if (ipc_self != getpid()) {
+	if (!ipc_inited || ipc_self != getpid()) {
 		return;
 	}
 
-	if (-1 == unlink(sockpath)) {
+	if (-1 == unlink(sockpath) && errno != ENOENT) {
 		launchd_syslog(LOG_WARNING, "unlink(\"%s\"): %s", sockpath, strerror(errno));
-	} else if (-1 == rmdir(sockdir)) {
+	} else if (-1 == rmdir(sockdir) && errno != ENOENT) {
 		launchd_syslog(LOG_WARNING, "rmdir(\"%s\"): %s", sockdir, strerror(errno));
 	}
+	ipc_inited = false;
 }
 
 void
@@ -169,7 +170,7 @@ ipc_server_init(void)
 	sockdir = strdup(ourdir);
 	sockpath = strdup(sun.sun_path);
 	ipc_self = getpid();
-	atexit(ipc_clean_up);
+	atexit(ipc_server_shutdown);
 
 out_bad:
 	if (!ipc_inited && fd != -1) {

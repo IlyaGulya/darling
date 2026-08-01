@@ -527,9 +527,9 @@ int main(void)
 			return 44;
 	}
 
-	/* Runtime endpoints are transaction-owned shutdown state. Once the complete
-	 * process closure is drained, product shutdown must remove every endpoint
-	 * through the retained prefix capability before publishing STOPPED. */
+	/* Guest processes must unlink their own E-UNION endpoints before the
+	 * launcher publishes STOPPED. A surviving guest endpoint fails closed so a
+	 * host unlink cannot leave a stale durable sidecar record. */
 	if (prepare_endpoints(prefix_path, 1) != 0)
 		return 49;
 	struct session_fixture guest_endpoint_fixture =
@@ -548,13 +548,29 @@ int main(void)
 	(void)waitpid(guest_endpoint_fixture.init, NULL, 0);
 	guest_endpoint_fixture.init = -1;
 	cleanup_fixture(&guest_endpoint_fixture);
-	if (guest_endpoint_rc != 0 ||
-		guest_endpoint_result.phase != ROOTLESS_SHUTDOWN_STOPPED ||
-		!endpoints_removed(prefix_path)) {
-		fprintf(stderr, "complete endpoint cleanup contract failed rc=%d "
+	if (guest_endpoint_rc == 0 ||
+		guest_endpoint_result.phase != ROOTLESS_SHUTDOWN_DRAINED ||
+		!endpoint_exists(prefix_path, "var/run/shellspawn.sock") ||
+		!endpoint_exists(prefix_path, "var/tmp/launchd/sock")) {
+		fprintf(stderr, "guest endpoint fail-closed contract failed rc=%d "
 			"phase=%d error=%s\n", guest_endpoint_rc,
 			guest_endpoint_result.phase, error);
 		return 51;
+	}
+	static const char* failed_endpoints[] = {
+		".init.pid",
+		".darlingserver.sock",
+		".darlingserver.stat.sock",
+		"var/run/shellspawn.sock",
+		"var/tmp/launchd/sock",
+	};
+	for (size_t index = 0;
+		index < sizeof(failed_endpoints) / sizeof(failed_endpoints[0]);
+		++index) {
+		if (darling_runtime_mode_unlink_relative(prefix,
+				failed_endpoints[index], 0, true,
+				error, sizeof(error)) != 0)
+			return 52;
 	}
 
 	darling_runtime_mode_close_prefix(prefix);

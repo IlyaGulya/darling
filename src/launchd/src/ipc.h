@@ -43,5 +43,6 @@ void ipc_callback(void *, struct kevent *);
 void ipc_revoke_fds(launch_data_t o);
 void ipc_close_fds(launch_data_t o);
 void ipc_server_init(void);
+void ipc_server_shutdown(void);
 
 #endif /* __LAUNCHD_IPC_H__ */

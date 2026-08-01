@@ -544,6 +544,13 @@ launchd_shutdown(void)
 
 	launchd_shutting_down = true;
 	launchd_log_push();
+	if (darling_rootless) {
+		/* Stop publishing the guest-visible control endpoint before draining
+		 * jobs. This unlink executes inside E-UNION, so durable sidecar state and
+		 * the guest namespace advance atomically; the host launcher must not
+		 * remove this endpoint behind E-UNION after the process closure drains. */
+		ipc_server_shutdown();
+	}
 
 	now = runtime_get_wall_time();
 
