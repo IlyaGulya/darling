@@ -33,6 +33,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <termios.h>
 #include <pty.h>
@@ -44,6 +45,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include "runtime_credentials.h"
 #include "runtime_mode.h"
 #include "runtime_mode_prefix.h"
+#include "rootless_shutdown.h"
 
 // Between Linux 4.9 and 4.11, a strange bug has been introduced
 // which prevents connecting to Unix sockets if the socket was
@@ -88,7 +90,7 @@ static long rootlessShellspawnReadyTimeoutMs(void)
 	return timeout_ms;
 }
 
-static void removeRuntimeStateFiles(void)
+static void removePrivilegedRuntimeStateFiles(void)
 {
 	char error[512] = {0};
 	static const char* entries[] = {
@@ -97,8 +99,7 @@ static void removeRuntimeStateFiles(void)
 		".darlingserver.sock",
 	};
 	for (size_t index = 0;
-			index < sizeof(entries) / sizeof(entries[0]);
-			index++) {
+		index < sizeof(entries) / sizeof(entries[0]); ++index) {
 		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
 				entries[index], 0, true, error, sizeof(error)) != 0) {
 			fprintf(stderr, "Cannot remove Darling runtime state %s: %s\n",
@@ -340,17 +341,24 @@ int main(int argc, char ** argv)
 		fclose(file);
 
 		if (rootless) {
-			int shutdown_result = shutdown_rootless_process_session(launchd_pid);
+			struct rootless_shutdown_result shutdown_state;
+			int shutdown_result = shutdown_rootless_runtime(
+				launchd_pid, pidInit, g_runtimePrefix, NULL,
+				&shutdown_state, runtimeModeError,
+				sizeof(runtimeModeError));
 			if (shutdown_result != 0) {
-				fprintf(stderr, "Failed to stop rootless Darling session: %s\n",
-					strerror(-shutdown_result));
+				fprintf(stderr,
+					"Failed to stop rootless Darling session at phase %s: %s\n",
+					rootless_shutdown_phase_name(shutdown_state.phase),
+					runtimeModeError[0] == '\0'
+						? strerror(-shutdown_result) : runtimeModeError);
 				return 1;
 			}
 		} else {
 			kill(launchd_pid, SIGKILL);
+			kill(pidInit, SIGKILL);
+			removePrivilegedRuntimeStateFiles();
 		}
-		kill(pidInit, SIGKILL);
-		removeRuntimeStateFiles();
 		return 0;
 	}
 
@@ -770,6 +778,36 @@ static size_t escapeQuotes(char *dest, const char *src)
 static bool rootlessInitIsRunning(pid_t pidInit)
 {
 	if (pidInit <= 0)
+		return false;
+
+	/* Reap our own completed darlingserver and reject an already-zombie
+	 * server owned by another launcher.  kill(pid, 0) alone reports zombies
+	 * as live and would keep a boot client in its readiness loop after a
+	 * successful concurrent shutdown. */
+	int child_status;
+	pid_t waited = waitpid(pidInit, &child_status, WNOHANG);
+	if (waited == pidInit)
+		return false;
+	if (waited < 0 && errno != ECHILD && errno != EINTR)
+		return false;
+
+	char path[64];
+	char stat_line[4096];
+	snprintf(path, sizeof(path), "/proc/%d/stat", pidInit);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return errno == EACCES || errno == EPERM;
+	ssize_t length = read(fd, stat_line, sizeof(stat_line) - 1);
+	int saved_errno = errno;
+	close(fd);
+	errno = saved_errno;
+	if (length <= 0)
+		return false;
+	stat_line[length] = '\0';
+	char* fields = strrchr(stat_line, ')');
+	if (fields == NULL || fields[1] != ' ' || fields[2] == '\0')
+		return false;
+	if (fields[2] == 'Z' || fields[2] == 'X')
 		return false;
 
 	if (kill(pidInit, 0) == 0)

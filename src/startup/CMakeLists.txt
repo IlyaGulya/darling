@@ -28,8 +28,21 @@ target_compile_definitions(darling PRIVATE
 target_link_libraries(darling -lutil)
 
 add_executable(darling_rootless_shutdown_session_test EXCLUDE_FROM_ALL
-	tests/rootless_shutdown_session_test.c rootless_shutdown.c)
+	tests/rootless_shutdown_session_test.c rootless_shutdown.c
+	runtime_credentials.c runtime_mode.c runtime_mode_prefix.c)
 target_include_directories(darling_rootless_shutdown_session_test PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(darling_rootless_shutdown_lifecycle_test EXCLUDE_FROM_ALL
+	tests/rootless_shutdown_lifecycle_test.c rootless_shutdown.c
+	runtime_credentials.c runtime_mode.c runtime_mode_prefix.c)
+target_include_directories(darling_rootless_shutdown_lifecycle_test PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(darling_rootless_shutdown_shared_session_test EXCLUDE_FROM_ALL
+	tests/rootless_shutdown_shared_session_test.c rootless_shutdown.c
+	runtime_credentials.c runtime_mode.c runtime_mode_prefix.c)
+target_include_directories(darling_rootless_shutdown_shared_session_test PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(darling_runtime_mode_test EXCLUDE_FROM_ALL
