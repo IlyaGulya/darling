@@ -47,6 +47,8 @@ int main(void)
 	char prefix_path[] = "/tmp/darling-rootless-shared-session.XXXXXX";
 	darling_runtime_prefix prefix = DARLING_RUNTIME_PREFIX_INITIALIZER;
 	char error[512] = {0};
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 	char path[512];
 	int pipefd[2];
 	if (mkdtemp(prefix_path) == NULL ||
@@ -63,7 +65,9 @@ int main(void)
 	if (mkdir(path, 0700) != 0)
 		return 4;
 	snprintf(path, sizeof(path), "%s/var/tmp/launchd", prefix_path);
-	if (mkdir(path, 0700) != 0 || pipe(pipefd) != 0)
+	if (mkdir(path, 0700) != 0 ||
+		rootless_shutdown_prepare_closure(prefix, &closure,
+			error, sizeof(error)) != 0 || pipe(pipefd) != 0)
 		return 5;
 
 	pid_t session_host = fork();
@@ -78,6 +82,7 @@ int main(void)
 		if (sentinel < 0)
 			_exit(11);
 		if (sentinel == 0) {
+			rootless_shutdown_release_closure(&closure);
 			for (;;)
 				pause();
 		}
@@ -85,6 +90,10 @@ int main(void)
 		if (root < 0)
 			_exit(12);
 		if (root == 0) {
+			if (rootless_shutdown_enter_closure(&closure,
+					error, sizeof(error)) != 0)
+				_exit(15);
+			rootless_shutdown_release_closure(&closure);
 			pid_t worker = fork();
 			if (worker < 0)
 				_exit(13);
@@ -104,6 +113,7 @@ int main(void)
 			for (;;)
 				pause();
 		}
+		rootless_shutdown_release_closure(&closure);
 		for (;;)
 			pause();
 	}
@@ -114,6 +124,10 @@ int main(void)
 	close(pipefd[0]);
 	if (fixture.session_host != session_host)
 		return 8;
+	if (rootless_shutdown_closure_contains(&closure, fixture.runtime_root,
+			error, sizeof(error)) != 0)
+		return 8;
+	rootless_shutdown_release_closure(&closure);
 
 	struct rootless_shutdown_result result;
 	int rc = shutdown_rootless_runtime(

@@ -20,6 +20,8 @@ enum fixture_mode {
 	FIXTURE_GRACEFUL,
 	FIXTURE_STUBBORN,
 	FIXTURE_LATE_FORK,
+	FIXTURE_ROOT_LATE_FORK,
+	FIXTURE_ZOMBIE_SESSION,
 };
 
 struct fixture_payload {
@@ -33,6 +35,8 @@ struct session_fixture {
 	pid_t worker;
 	int late_pipe;
 };
+
+static void cleanup_fixture(struct session_fixture* fixture);
 
 static int late_fork_pipe = -1;
 
@@ -156,22 +160,52 @@ static int read_exact(int fd, void* output, size_t size)
 	return 0;
 }
 
-static struct session_fixture spawn_fixture(enum fixture_mode mode)
+static struct session_fixture spawn_fixture(
+	enum fixture_mode mode,
+	darling_runtime_prefix prefix
+)
 {
 	int pipefd[2];
 	struct session_fixture fixture = { .init = -1, .leader = -1,
 		.worker = -1, .late_pipe = -1 };
-	if (pipe(pipefd) != 0)
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[256] = {0};
+	if (rootless_shutdown_prepare_closure(prefix, &closure,
+			error, sizeof(error)) != 0) {
+		fprintf(stderr, "fixture closure prepare failed: %s\n", error);
 		return fixture;
+	}
+	if (pipe(pipefd) != 0) {
+		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
+		return fixture;
+	}
 	fixture.init = fork();
-	if (fixture.init < 0)
+	if (fixture.init < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
 		return fixture;
+	}
 	if (fixture.init == 0) {
 		close(pipefd[0]);
+		if (rootless_shutdown_enter_closure(&closure,
+				error, sizeof(error)) != 0)
+			_exit(8);
+		rootless_shutdown_release_closure(&closure);
 		if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0)
 			_exit(9);
-		if (mode != FIXTURE_GRACEFUL)
+		if (mode == FIXTURE_ROOT_LATE_FORK) {
+			late_fork_pipe = pipefd[1];
+			struct sigaction action = {0};
+			action.sa_handler = late_fork_handler;
+			sigemptyset(&action.sa_mask);
+			if (sigaction(SIGTERM, &action, NULL) != 0)
+				_exit(15);
+		} else if (mode != FIXTURE_GRACEFUL &&
+			mode != FIXTURE_ZOMBIE_SESSION) {
 			signal(SIGTERM, SIG_IGN);
+		}
 		pid_t leader = fork();
 		if (leader < 0)
 			_exit(10);
@@ -203,6 +237,8 @@ static struct session_fixture spawn_fixture(enum fixture_mode mode)
 			};
 			if (write(pipefd[1], &payload, sizeof(payload)) != sizeof(payload))
 				_exit(14);
+			if (mode == FIXTURE_ZOMBIE_SESSION)
+				_exit(0);
 			for (;;)
 				pause();
 		}
@@ -213,13 +249,26 @@ static struct session_fixture spawn_fixture(enum fixture_mode mode)
 	struct fixture_payload payload;
 	if (read_exact(pipefd[0], &payload, sizeof(payload)) != 0) {
 		close(pipefd[0]);
+		cleanup_fixture(&fixture);
+		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
 		return fixture;
 	}
 	fixture.leader = payload.leader;
 	fixture.worker = payload.worker;
-	fixture.late_pipe = mode == FIXTURE_LATE_FORK ? pipefd[0] : -1;
+	fixture.late_pipe =
+		mode == FIXTURE_LATE_FORK || mode == FIXTURE_ROOT_LATE_FORK
+			? pipefd[0] : -1;
 	if (fixture.late_pipe < 0)
 		close(pipefd[0]);
+	if (rootless_shutdown_closure_contains(&closure, fixture.init,
+			error, sizeof(error)) != 0) {
+		fprintf(stderr, "fixture closure membership failed: %s\n", error);
+		cleanup_fixture(&fixture);
+		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
+		fixture.init = -1;
+		return fixture;
+	}
+	rootless_shutdown_release_closure(&closure);
 	return fixture;
 }
 
@@ -247,6 +296,28 @@ static int wait_pid_gone(pid_t pid)
 	return -1;
 }
 
+static int wait_pid_state(pid_t pid, char expected)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+	for (int attempt = 0; attempt < 500; ++attempt) {
+		FILE* file = fopen(path, "r");
+		if (file != NULL) {
+			char line[4096];
+			if (fgets(line, sizeof(line), file) != NULL) {
+				char* fields = strrchr(line, ')');
+				if (fields != NULL && fields[1] == ' ' && fields[2] == expected) {
+					fclose(file);
+					return 0;
+				}
+			}
+			fclose(file);
+		}
+		usleep(10000);
+	}
+	return -1;
+}
+
 static int run_shutdown_case(
 	const char* prefix_path,
 	darling_runtime_prefix prefix,
@@ -256,9 +327,14 @@ static int run_shutdown_case(
 {
 	if (prepare_endpoints(prefix_path) != 0)
 		return 20;
-	struct session_fixture fixture = spawn_fixture(mode);
+	struct session_fixture fixture = spawn_fixture(mode, prefix);
 	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
 		return 21;
+	if (mode == FIXTURE_ZOMBIE_SESSION &&
+		wait_pid_state(fixture.leader, 'Z') != 0) {
+		cleanup_fixture(&fixture);
+		return 22;
+	}
 	struct rootless_shutdown_result result;
 	char error[512] = {0};
 	int rc = shutdown_rootless_runtime(
@@ -269,22 +345,28 @@ static int run_shutdown_case(
 		&result,
 		error,
 		sizeof(error));
-	if (rc != 0 || result.phase != ROOTLESS_SHUTDOWN_STOPPED ||
-		!!result.kill_rounds != !!expect_kill || !endpoints_removed(prefix_path)) {
-		fprintf(stderr, "shutdown case failed mode=%d rc=%d phase=%d "
-			"term=%u kill=%u error=%s\n", mode, rc, result.phase,
-			result.term_rounds, result.kill_rounds, error);
-		cleanup_fixture(&fixture);
-		return 22;
-	}
 	pid_t late_pid = -1;
-	if (mode == FIXTURE_LATE_FORK) {
+	if (mode == FIXTURE_LATE_FORK || mode == FIXTURE_ROOT_LATE_FORK) {
 		struct pollfd pollfd = { .fd = fixture.late_pipe, .events = POLLIN };
 		if (poll(&pollfd, 1, 2000) <= 0 ||
 			read_exact(fixture.late_pipe, &late_pid, sizeof(late_pid)) != 0) {
 			cleanup_fixture(&fixture);
 			return 23;
 		}
+	}
+	if (rc != 0 || result.phase != ROOTLESS_SHUTDOWN_STOPPED ||
+		!!result.kill_rounds != !!expect_kill || !endpoints_removed(prefix_path) ||
+		result.closure_inode == 0 ||
+		(mode == FIXTURE_ROOT_LATE_FORK && result.identities_observed < 4) ||
+		(late_pid > 0 && wait_pid_gone(late_pid) != 0)) {
+		fprintf(stderr, "shutdown case failed mode=%d rc=%d phase=%d "
+			"term=%u kill=%u late_pid=%d late_alive=%d error=%s\n",
+			mode, rc, result.phase, result.term_rounds, result.kill_rounds,
+			(int)late_pid, late_pid > 0 && kill(late_pid, 0) == 0, error);
+		if (late_pid > 0)
+			(void)kill(late_pid, SIGKILL);
+		cleanup_fixture(&fixture);
+		return 22;
 	}
 	(void)waitpid(fixture.init, NULL, 0);
 	fixture.init = -1;
@@ -321,44 +403,57 @@ int main(void)
 		return 30;
 	if (run_shutdown_case(prefix_path, prefix, FIXTURE_LATE_FORK, 1) != 0)
 		return 31;
+	if (run_shutdown_case(prefix_path, prefix, FIXTURE_ROOT_LATE_FORK, 1) != 0)
+		return 32;
+	if (run_shutdown_case(prefix_path, prefix, FIXTURE_ZOMBIE_SESSION, 0) != 0)
+		return 33;
 
 	/* Missing endpoint parents mean the endpoints are already absent. */
 	char missing_path[512];
 	snprintf(missing_path, sizeof(missing_path), "%s/var/tmp/launchd", prefix_path);
 	if (rmdir(missing_path) != 0)
-		return 32;
+		return 34;
 	snprintf(missing_path, sizeof(missing_path), "%s/var/tmp", prefix_path);
 	if (rmdir(missing_path) != 0)
-		return 33;
+		return 35;
 	snprintf(missing_path, sizeof(missing_path), "%s/var/run", prefix_path);
 	if (rmdir(missing_path) != 0)
-		return 34;
-	struct session_fixture missing_fixture = spawn_fixture(FIXTURE_GRACEFUL);
+		return 36;
+	struct session_fixture missing_fixture = spawn_fixture(FIXTURE_GRACEFUL, prefix);
 	struct rootless_shutdown_result missing_result;
 	if (missing_fixture.init <= 0 || missing_fixture.leader <= 0 ||
 		shutdown_rootless_runtime(missing_fixture.leader, missing_fixture.init,
 			prefix, NULL, &missing_result, error, sizeof(error)) != 0 ||
 		missing_result.phase != ROOTLESS_SHUTDOWN_STOPPED) {
 		cleanup_fixture(&missing_fixture);
-		return 35;
+		return 37;
 	}
 	(void)waitpid(missing_fixture.init, NULL, 0);
 	missing_fixture.init = -1;
 	cleanup_fixture(&missing_fixture);
 	snprintf(missing_path, sizeof(missing_path), "%s/var/run", prefix_path);
 	if (mkdir(missing_path, 0700) != 0)
-		return 36;
+		return 38;
 	snprintf(missing_path, sizeof(missing_path), "%s/var/tmp", prefix_path);
 	if (mkdir(missing_path, 0700) != 0)
-		return 37;
+		return 39;
 	snprintf(missing_path, sizeof(missing_path), "%s/var/tmp/launchd", prefix_path);
 	if (mkdir(missing_path, 0700) != 0)
-		return 38;
+		return 40;
 
 	if (prepare_endpoints(prefix_path) != 0)
-		return 40;
+		return 41;
+	struct rootless_shutdown_closure_capability timeout_closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	if (rootless_shutdown_prepare_closure(prefix, &timeout_closure,
+			error, sizeof(error)) != 0)
+		return 42;
 	pid_t timeout_member = fork();
 	if (timeout_member == 0) {
+		if (rootless_shutdown_enter_closure(&timeout_closure,
+				error, sizeof(error)) != 0)
+			_exit(2);
+		rootless_shutdown_release_closure(&timeout_closure);
 		if (setsid() < 0)
 			_exit(1);
 		signal(SIGTERM, SIG_IGN);
@@ -366,8 +461,11 @@ int main(void)
 			pause();
 	}
 	if (timeout_member < 0)
-		return 41;
+		return 42;
 	usleep(20000);
+	if (rootless_shutdown_closure_contains(&timeout_closure, timeout_member,
+			error, sizeof(error)) != 0)
+		return 42;
 	const struct rootless_shutdown_policy timeout_policy = {
 		.term_timeout_ms = 0,
 		.kill_timeout_ms = 0,
@@ -383,12 +481,15 @@ int main(void)
 		error,
 		sizeof(error));
 	(void)waitpid(timeout_member, NULL, 0);
+	if (rootless_shutdown_cleanup_empty_closure(&timeout_closure,
+			error, sizeof(error)) != 0)
+		return 43;
 	if (timeout_rc != -ETIMEDOUT ||
 		timeout_result.phase != ROOTLESS_SHUTDOWN_KILL ||
 		!endpoint_exists(prefix_path, ".init.pid")) {
 		fprintf(stderr, "timeout contract failed rc=%d phase=%d error=%s\n",
 			timeout_rc, timeout_result.phase, error);
-		return 42;
+		return 43;
 	}
 	static const char* timeout_endpoints[] = {
 		".init.pid",
@@ -403,24 +504,25 @@ int main(void)
 		if (darling_runtime_mode_unlink_relative(prefix,
 				timeout_endpoints[index], 0, false,
 				error, sizeof(error)) != 0)
-			return 43;
+			return 44;
 	}
 
 	darling_runtime_mode_close_prefix(prefix);
 	char path[512];
 	snprintf(path, sizeof(path), "%s/var/tmp/launchd", prefix_path);
 	if (rmdir(path) != 0)
-		return 44;
+		return 45;
 	snprintf(path, sizeof(path), "%s/var/tmp", prefix_path);
 	if (rmdir(path) != 0)
-		return 45;
+		return 46;
 	snprintf(path, sizeof(path), "%s/var/run", prefix_path);
 	if (rmdir(path) != 0)
-		return 46;
+		return 47;
 	snprintf(path, sizeof(path), "%s/var", prefix_path);
 	if (rmdir(path) != 0 || rmdir(prefix_path) != 0)
-		return 47;
+		return 48;
 	puts("ROOTLESS_SHUTDOWN_LIFECYCLE_OK cycles=3 stubborn=PASS "
-		"late_fork=PASS timeout=PASS endpoints=5");
+		"late_fork=PASS root_late_fork=PASS zombie_session=PASS "
+		"timeout=PASS endpoints=5");
 	return 0;
 }

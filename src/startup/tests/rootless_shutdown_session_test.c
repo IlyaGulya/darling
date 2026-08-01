@@ -19,6 +19,8 @@ int main(void)
 	pid_t leader;
 	struct session_fixture fixture;
 	struct rootless_shutdown_result result;
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 	darling_runtime_prefix prefix = DARLING_RUNTIME_PREFIX_INITIALIZER;
 	char prefix_path[] = "/tmp/darling-rootless-session.XXXXXX";
 	char error[256] = {0};
@@ -41,13 +43,18 @@ int main(void)
 	snprintf(path, sizeof(path), "%s/var/tmp/launchd", prefix_path);
 	if (mkdir(path, 0700) != 0)
 		return 1;
-	if (pipe(pipefd) != 0)
+	if (rootless_shutdown_prepare_closure(prefix, &closure,
+			error, sizeof(error)) != 0 || pipe(pipefd) != 0)
 		return 1;
 	leader = fork();
 	if (leader < 0)
 		return 1;
 	if (leader == 0) {
 		close(pipefd[0]);
+		if (rootless_shutdown_enter_closure(&closure,
+				error, sizeof(error)) != 0)
+			return 5;
+		rootless_shutdown_release_closure(&closure);
 		if (setsid() < 0)
 			return 2;
 		fixture.worker = fork();
@@ -66,6 +73,10 @@ int main(void)
 	if (read(pipefd[0], &fixture, sizeof(fixture)) != sizeof(fixture))
 		return 1;
 	close(pipefd[0]);
+	if (rootless_shutdown_closure_contains(&closure, leader,
+			error, sizeof(error)) != 0)
+		return 1;
+	rootless_shutdown_release_closure(&closure);
 	if (shutdown_rootless_runtime(leader, leader, prefix, NULL,
 			&result, error, sizeof(error)) != 0 ||
 		result.phase != ROOTLESS_SHUTDOWN_STOPPED)

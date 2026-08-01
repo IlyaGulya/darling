@@ -3,11 +3,13 @@
 
 #include "runtime_mode_prefix.h"
 
+#include <limits.h>
 #include <stddef.h>
 #include <sys/types.h>
 
 enum rootless_shutdown_phase {
 	ROOTLESS_SHUTDOWN_RUNNING,
+	ROOTLESS_SHUTDOWN_CLOSURE_BOUND,
 	ROOTLESS_SHUTDOWN_TERM,
 	ROOTLESS_SHUTDOWN_DRAINING,
 	ROOTLESS_SHUTDOWN_KILL,
@@ -25,9 +27,52 @@ struct rootless_shutdown_policy {
 struct rootless_shutdown_result {
 	enum rootless_shutdown_phase phase;
 	pid_t session;
+	ino_t closure_inode;
+	size_t identities_observed;
 	unsigned term_rounds;
 	unsigned kill_rounds;
 };
+
+struct rootless_shutdown_closure_capability {
+	int parent_fd;
+	int directory_fd;
+	int membership_fd;
+	char leaf[NAME_MAX + 1];
+};
+
+#define ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER { \
+	.parent_fd = -1, .directory_fd = -1, .membership_fd = -1, .leaf = {0} \
+}
+
+int rootless_shutdown_prepare_closure(
+	const darling_runtime_prefix prefix,
+	struct rootless_shutdown_closure_capability* capability,
+	char* error,
+	size_t error_size
+);
+
+int rootless_shutdown_enter_closure(
+	const struct rootless_shutdown_closure_capability* capability,
+	char* error,
+	size_t error_size
+);
+
+int rootless_shutdown_closure_contains(
+	const struct rootless_shutdown_closure_capability* capability,
+	pid_t pid,
+	char* error,
+	size_t error_size
+);
+
+int rootless_shutdown_cleanup_empty_closure(
+	struct rootless_shutdown_closure_capability* capability,
+	char* error,
+	size_t error_size
+);
+
+void rootless_shutdown_release_closure(
+	struct rootless_shutdown_closure_capability* capability
+);
 
 const char* rootless_shutdown_phase_name(enum rootless_shutdown_phase phase);
 

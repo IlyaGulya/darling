@@ -1129,6 +1129,8 @@ pid_t spawnInitProcess(void)
 	int pipefd[2];
 	char buffer[1];
 	char error[512] = {0};
+	struct rootless_shutdown_closure_capability shutdown_closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 
 	if (darling_runtime_mode_verify_prefix_name(g_runtimePrefix,
 			error, sizeof(error)) != 0 ||
@@ -1138,12 +1140,22 @@ pid_t spawnInitProcess(void)
 		fprintf(stderr,
 			"Cannot hand the retained Darling prefix to darlingserver: %s\n",
 			error[0] == '\0' ? "runtime workdir fd is missing" : error);
+			exit(1);
+	}
+	if (rootlessModeEnabled() && rootless_shutdown_prepare_closure(
+			g_runtimePrefix, &shutdown_closure,
+			error, sizeof(error)) != 0) {
+		fprintf(stderr,
+			"Cannot prepare the rootless shutdown closure: %s\n", error);
 		exit(1);
 	}
 
 	if (pipe(pipefd) == -1)
 	{
 		fprintf(stderr, "Cannot create a pipe for synchronization: %s\n", strerror(errno));
+		if (rootlessModeEnabled())
+			(void)rootless_shutdown_cleanup_empty_closure(
+				&shutdown_closure, NULL, 0);
 		exit(1);
 	}
 
@@ -1161,12 +1173,22 @@ pid_t spawnInitProcess(void)
 	if (pid < 0)
 	{
 		fprintf(stderr, "Cannot fork() to create darling-init: %s\n", strerror(errno));
+		if (rootlessModeEnabled())
+			(void)rootless_shutdown_cleanup_empty_closure(
+				&shutdown_closure, NULL, 0);
 		exit(1);
 	}
 
 	if (pid == 0)
 	{
 		// The child
+		if (rootlessModeEnabled() && rootless_shutdown_enter_closure(
+				&shutdown_closure, error, sizeof(error)) != 0) {
+			fprintf(stderr,
+				"Cannot enter the rootless shutdown closure: %s\n", error);
+			_exit(1);
+		}
+		rootless_shutdown_release_closure(&shutdown_closure);
 
 		char uid_str[21];
 		char gid_str[21];
@@ -1221,8 +1243,21 @@ pid_t spawnInitProcess(void)
 
 	// Wait for the child to drop UID/GIDs and unshare stuff
 	close(pipefd[1]);
-	read(pipefd[0], buffer, 1);
+	ssize_t synchronization = read(pipefd[0], buffer, 1);
 	close(pipefd[0]);
+	if (rootlessModeEnabled() &&
+		(synchronization != 1 || rootless_shutdown_closure_contains(
+			&shutdown_closure, pid, error, sizeof(error)) != 0)) {
+		fprintf(stderr,
+			"Darlingserver did not retain its rootless shutdown closure: %s\n",
+			error[0] == '\0' ? "startup handshake failed" : error);
+		kill(pid, SIGKILL);
+		(void)waitpid(pid, NULL, 0);
+		(void)rootless_shutdown_cleanup_empty_closure(
+			&shutdown_closure, NULL, 0);
+		exit(1);
+	}
+	rootless_shutdown_release_closure(&shutdown_closure);
 
 	/*
 	snprintf(idmap, sizeof(idmap), "/proc/%d/uid_map", pid);
