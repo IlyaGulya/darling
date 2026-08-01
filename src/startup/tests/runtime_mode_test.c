@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 enum checkpoint_injection {
@@ -384,6 +385,73 @@ static void prepare_prefix_fixture(
 			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
 			"tester", getuid(), getgid(), result,
 			error, sizeof(error)) == 0, error);
+}
+
+static void delete_prefix_fixture(darling_runtime_prefix handle);
+
+static void test_shared_reuse_lease(void)
+{
+	char root[] = "/tmp/darling-prefix-reuse-lease-test.XXXXXX";
+	char* directory = mkdtemp(root);
+	require(directory != NULL, "mkdtemp shared reuse fixture");
+	char prefix[2048];
+	snprintf(prefix, sizeof(prefix), "%s/prefix", directory);
+
+	darling_runtime_prefix first =
+		DARLING_RUNTIME_PREFIX_INITIALIZER;
+	struct darling_runtime_prefix_lifecycle_result first_result;
+	prepare_prefix_fixture(prefix, first, &first_result);
+	require(first_result.action == DARLING_RUNTIME_PREFIX_CREATED,
+		"first lifecycle did not create typed prefix");
+
+	darling_runtime_prefix second =
+		DARLING_RUNTIME_PREFIX_INITIALIZER;
+	open_prefix_fixture(prefix, second);
+	struct darling_runtime_prefix_lifecycle_result second_result;
+	char error[512] = {0};
+	alarm(2);
+	require(darling_runtime_prefix_prepare(second,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			"tester", getuid(), getgid(), &second_result,
+			error, sizeof(error)) == 0, error);
+	alarm(0);
+	require(second_result.action == DARLING_RUNTIME_PREFIX_REUSED,
+		"second lifecycle did not reuse typed prefix");
+
+	darling_runtime_prefix writer =
+		DARLING_RUNTIME_PREFIX_INITIALIZER;
+	open_prefix_fixture(prefix, writer);
+	struct darling_runtime_prefix_lifecycle_result writer_result;
+	struct timespec started;
+	struct timespec finished;
+	require(clock_gettime(CLOCK_MONOTONIC, &started) == 0,
+		"start bounded writer deadline");
+	error[0] = '\0';
+	require(darling_runtime_prefix_delete(writer,
+			DARLING_RUNTIME_MODE_ROOTLESS_EUNION,
+			getuid(), getgid(), &writer_result,
+			error, sizeof(error)) != 0,
+		"exclusive writer bypassed active shared leases");
+	require(clock_gettime(CLOCK_MONOTONIC, &finished) == 0,
+		"finish bounded writer deadline");
+	int64_t elapsed_ms =
+		(int64_t)(finished.tv_sec - started.tv_sec) * INT64_C(1000) +
+		((int64_t)finished.tv_nsec - (int64_t)started.tv_nsec) /
+			INT64_C(1000000);
+	require(elapsed_ms >= 900 && elapsed_ms < 2000,
+		"exclusive writer deadline was not bounded");
+	require(errno == ETIMEDOUT &&
+		strstr(error, "runtime prefix lifecycle lock busy:") != NULL &&
+		strstr(error, "mode=exclusive") != NULL &&
+		strstr(error, "dev=") != NULL &&
+		strstr(error, "ino=") != NULL &&
+		strstr(error, "timeout_ms=1000") != NULL,
+		"bounded writer failure omitted lock diagnostics");
+	darling_runtime_mode_close_prefix(writer);
+
+	darling_runtime_mode_close_prefix(second);
+	delete_prefix_fixture(first);
+	remove_fixture_tree(directory);
 }
 
 static void create_legacy_prefix_fixture(const char* path)
@@ -1604,6 +1672,8 @@ int main(void)
 			test_mutation_interruption_coverage();
 		else if (strcmp(selected, "capability") == 0)
 			test_owned_capability_rejects_reopen();
+		else if (strcmp(selected, "shared-reuse") == 0)
+			test_shared_reuse_lease();
 		else if (strcmp(selected, "lifecycle") == 0)
 			test_prefix_lifecycle();
 		else if (strcmp(selected, "marker") == 0)
@@ -1621,6 +1691,7 @@ int main(void)
 	test_staged_tree_durability();
 	test_mutation_interruption_coverage();
 	test_owned_capability_rejects_reopen();
+	test_shared_reuse_lease();
 	test_prefix_lifecycle();
 	test_prefix_marker();
 	puts("DARLING_RUNTIME_MODE_CONTRACT_OK");

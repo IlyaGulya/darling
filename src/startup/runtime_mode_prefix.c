@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
@@ -24,6 +25,14 @@ const char* darling_runtime_prefix_test_mountinfo_path;
 #define DARLING_RUNTIME_PREFIX_PATH_MAX 4096
 
 static unsigned long directory_sequence;
+
+#ifdef DARLING_RUNTIME_PREFIX_LIFECYCLE_TESTING
+#define DARLING_RUNTIME_PREFIX_LOCK_TIMEOUT_MS 1000
+#else
+#define DARLING_RUNTIME_PREFIX_LOCK_TIMEOUT_MS 5000
+#endif
+
+#define DARLING_RUNTIME_PREFIX_LOCK_RETRY_NS UINT64_C(10000000)
 
 static int prefix_error(
 	char* error,
@@ -1434,6 +1443,8 @@ static int acquire_lifecycle_lock(
 	const struct lifecycle_names* names,
 	uid_t owner_uid,
 	gid_t owner_gid,
+	int operation,
+	bool allow_create,
 	char* error,
 	size_t error_size
 )
@@ -1443,13 +1454,19 @@ static int acquire_lifecycle_lock(
 	if (fd >= 0) {
 		handle->lifecycle_lock_fd = -1;
 	} else {
-		fd = openat(handle->parent_fd, names->lock,
-			O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-		if (fd >= 0)
-			created = true;
-		else if (errno == EEXIST)
+		if (allow_create) {
+			fd = openat(handle->parent_fd, names->lock,
+				O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+				0600);
+			if (fd >= 0)
+				created = true;
+			else if (errno == EEXIST)
+				fd = openat(handle->parent_fd, names->lock,
+					O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+		} else {
 			fd = openat(handle->parent_fd, names->lock,
 				O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+		}
 	}
 	if (fd < 0)
 		return prefix_error(error, error_size,
@@ -1492,13 +1509,81 @@ static int acquire_lifecycle_lock(
 		errno = saved_errno;
 		return -1;
 	}
-	if (flock(fd, LOCK_EX) != 0) {
+	if (operation != LOCK_SH && operation != LOCK_EX) {
+		close(fd);
+		errno = EINVAL;
+		return prefix_error(error, error_size,
+			"runtime prefix lifecycle lock mode is invalid: %s", "invalid");
+	}
+	struct timespec started;
+	if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
 		int saved_errno = errno;
 		close(fd);
 		errno = saved_errno;
 		return prefix_error(error, error_size,
-			"cannot acquire runtime prefix lifecycle lock: %s",
+			"cannot start runtime prefix lifecycle lock deadline: %s",
 			strerror(errno));
+	}
+	for (;;) {
+		if (flock(fd, operation | LOCK_NB) == 0)
+			break;
+		if (errno != EWOULDBLOCK && errno != EAGAIN) {
+			int saved_errno = errno;
+			close(fd);
+			errno = saved_errno;
+			return prefix_error(error, error_size,
+				"cannot acquire runtime prefix lifecycle lock: %s",
+				strerror(errno));
+		}
+		struct timespec now;
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			int saved_errno = errno;
+			close(fd);
+			errno = saved_errno;
+			return prefix_error(error, error_size,
+				"cannot inspect runtime prefix lifecycle lock deadline: %s",
+				strerror(errno));
+		}
+		int64_t elapsed_ns =
+			(int64_t)(now.tv_sec - started.tv_sec) * INT64_C(1000000000) +
+			(int64_t)now.tv_nsec - (int64_t)started.tv_nsec;
+		uint64_t elapsed_ms = elapsed_ns <= 0
+			? 0
+			: (uint64_t)elapsed_ns / UINT64_C(1000000);
+		if (elapsed_ms >= DARLING_RUNTIME_PREFIX_LOCK_TIMEOUT_MS) {
+			struct stat busy;
+			char detail[256];
+			if (fstat(fd, &busy) == 0) {
+				snprintf(detail, sizeof(detail),
+					"mode=%s dev=%ju ino=%ju timeout_ms=%u",
+					operation == LOCK_SH ? "shared" : "exclusive",
+					(uintmax_t)busy.st_dev, (uintmax_t)busy.st_ino,
+					(unsigned)DARLING_RUNTIME_PREFIX_LOCK_TIMEOUT_MS);
+			} else {
+				snprintf(detail, sizeof(detail),
+					"mode=%s timeout_ms=%u",
+					operation == LOCK_SH ? "shared" : "exclusive",
+					(unsigned)DARLING_RUNTIME_PREFIX_LOCK_TIMEOUT_MS);
+			}
+			close(fd);
+			errno = ETIMEDOUT;
+			return prefix_error(error, error_size,
+				"runtime prefix lifecycle lock busy: %s", detail);
+		}
+		struct timespec retry = {
+			.tv_sec = 0,
+			.tv_nsec = DARLING_RUNTIME_PREFIX_LOCK_RETRY_NS,
+		};
+		while (nanosleep(&retry, &retry) != 0) {
+			if (errno != EINTR) {
+				int saved_errno = errno;
+				close(fd);
+				errno = saved_errno;
+				return prefix_error(error, error_size,
+					"cannot wait for runtime prefix lifecycle lock: %s",
+					strerror(errno));
+			}
+		}
 	}
 	struct stat named;
 	struct stat locked;
@@ -3897,6 +3982,36 @@ static int preflight_existing_prefix_compatibility(
 		"runtime prefix stable state is invalid: %s", "invalid");
 }
 
+static int lifecycle_recovery_is_pending(
+	const darling_runtime_prefix handle,
+	const struct lifecycle_names* names,
+	char* error,
+	size_t error_size
+)
+{
+	struct lifecycle_transaction transaction;
+	int transaction_result = read_transaction(handle, names,
+		&transaction, error, error_size);
+	if (transaction_result < 0)
+		return -1;
+	if (transaction_result == 0)
+		return 1;
+
+	const char* stages[] = {names->stage, names->sidecar_stage};
+	for (size_t index = 0; index < sizeof(stages) / sizeof(stages[0]); ++index) {
+		struct stat unexpected;
+		if (fstatat(handle->parent_fd, stages[index], &unexpected,
+				AT_SYMLINK_NOFOLLOW) == 0)
+			return prefix_error(error, error_size,
+				"orphan runtime prefix or sidecar stage has no transaction: %s",
+				stages[index]);
+		if (errno != ENOENT)
+			return prefix_error(error, error_size,
+				"cannot inspect runtime prefix stage: %s", strerror(errno));
+	}
+	return 0;
+}
+
 int darling_runtime_prefix_prepare(
 	darling_runtime_prefix handle,
 	enum darling_runtime_mode mode,
@@ -3939,11 +4054,61 @@ int darling_runtime_prefix_prepare(
 	if (format_lifecycle_names(handle, &names,
 			error, error_size) != 0)
 		return -1;
+	bool shared_reuse =
+		handle->anchor_state == DARLING_RUNTIME_PREFIX_ANCHOR_POPULATED &&
+		preflight.kind == LIFECYCLE_STABLE_CURRENT_V3;
 	int lock_fd = acquire_lifecycle_lock(handle, &names,
 		owner_uid, owner_gid,
+		shared_reuse ? LOCK_SH : LOCK_EX,
+		!shared_reuse,
 		error, error_size);
 	if (lock_fd < 0)
 		return -1;
+	if (shared_reuse) {
+		int recovery_pending = lifecycle_recovery_is_pending(
+			handle, &names, error, error_size);
+		if (recovery_pending < 0) {
+			close(lock_fd);
+			return -1;
+		}
+		if (recovery_pending == 0) {
+			struct lifecycle_stable_snapshot stable;
+			if (inspect_stable_snapshot(handle, mode,
+					owner_uid, owner_gid, &stable,
+					error, error_size) != 0 ||
+				stable.kind != LIFECYCLE_STABLE_CURRENT_V3 ||
+				anchor_bound_sidecar(handle, &stable.value.current,
+					error, error_size) != 0 ||
+				validate_complete_prefix_contents(handle,
+					error, error_size) != 0) {
+				close(lock_fd);
+				return -1;
+			}
+			struct stat legacy;
+			if (fstatat(handle->directory_fd,
+					DARLING_RUNTIME_MODE_MARKER_NAME, &legacy,
+					AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+				close(lock_fd);
+				return prefix_error(error, error_size,
+					"current runtime prefix has unexpected legacy metadata: %s",
+					DARLING_RUNTIME_MODE_MARKER_NAME);
+			}
+			if (result != NULL) {
+				memset(result, 0, sizeof(*result));
+				result->action = DARLING_RUNTIME_PREFIX_REUSED;
+				result->recovery = DARLING_RUNTIME_PREFIX_NO_RECOVERY;
+				result->state = stable.value.current;
+			}
+			handle->lifecycle_lock_fd = lock_fd;
+			return 0;
+		}
+		close(lock_fd);
+		lock_fd = acquire_lifecycle_lock(handle, &names,
+			owner_uid, owner_gid, LOCK_EX, false,
+			error, error_size);
+		if (lock_fd < 0)
+			return -1;
+	}
 	enum lifecycle_recovery_status recovered =
 		LIFECYCLE_NOT_RECOVERED;
 	if (recover_interrupted_transaction(handle, &names, mode,
@@ -4017,7 +4182,7 @@ int darling_runtime_prefix_prepare(
 		}
 	}
 	if (result_code == 0) {
-		if (flock(lock_fd, LOCK_SH) != 0) {
+		if (flock(lock_fd, LOCK_SH | LOCK_NB) != 0) {
 			int saved_errno = errno;
 			close(lock_fd);
 			errno = saved_errno;
@@ -4058,7 +4223,7 @@ int darling_runtime_prefix_recreate(
 			error, error_size) != 0)
 		return -1;
 	int lock_fd = acquire_lifecycle_lock(handle, &names,
-		owner_uid, owner_gid,
+		owner_uid, owner_gid, LOCK_EX, true,
 		error, error_size);
 	if (lock_fd < 0)
 		return -1;
@@ -4149,7 +4314,7 @@ int darling_runtime_prefix_delete(
 			error, error_size) != 0)
 		return -1;
 	int lock_fd = acquire_lifecycle_lock(handle, &names,
-		owner_uid, owner_gid,
+		owner_uid, owner_gid, LOCK_EX, true,
 		error, error_size);
 	if (lock_fd < 0)
 		return -1;
