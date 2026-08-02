@@ -21,6 +21,11 @@ Darling has support for DPREFIXes, which are very similar to WINEPREFIXes. They 
 
 Please note that we use `overlayfs` for creating prefixes, and so we cannot support putting prefix on a filesystem like NFS or eCryptfs. In particular, the default prefix location won't work if you have an encrypted home directory.
 
+Rootless mode requires Linux pidfd support (`pidfd_open` and
+`pidfd_send_signal`, available since Linux 5.3). The launcher checks both
+operations before creating the runtime session cgroup or starting a guest, so
+an unsupported kernel fails without partially starting a rootless runtime.
+
 ### Hello world
 
 Let's start with a Hello world:

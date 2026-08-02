@@ -7,6 +7,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define ROOTLESS_SHUTDOWN_SESSION_STATE_NAME \
+	".darling-rootless-shutdown-session-v1"
+
 enum rootless_shutdown_phase {
 	ROOTLESS_SHUTDOWN_RUNNING,
 	ROOTLESS_SHUTDOWN_CLOSURE_BOUND,
@@ -20,6 +23,8 @@ enum rootless_shutdown_phase {
 };
 
 struct rootless_shutdown_policy {
+	unsigned acquisition_timeout_ms;
+	size_t pidfd_budget;
 	unsigned quiesce_timeout_ms;
 	unsigned term_timeout_ms;
 	unsigned kill_timeout_ms;
@@ -37,14 +42,22 @@ struct rootless_shutdown_result {
 };
 
 struct rootless_shutdown_closure_capability {
+	int prefix_fd;
 	int parent_fd;
 	int directory_fd;
 	int membership_fd;
+	int state_fd;
+	dev_t cgroup_device;
+	ino_t cgroup_inode;
+	dev_t state_device;
+	ino_t state_inode;
+	char path[PATH_MAX];
 	char leaf[NAME_MAX + 1];
 };
 
 #define ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER { \
-	.parent_fd = -1, .directory_fd = -1, .membership_fd = -1, .leaf = {0} \
+	.prefix_fd = -1, .parent_fd = -1, .directory_fd = -1, \
+	.membership_fd = -1, .state_fd = -1, .path = {0}, .leaf = {0} \
 }
 
 int rootless_shutdown_prepare_closure(
@@ -93,6 +106,10 @@ int shutdown_rootless_runtime(
 void rootless_shutdown_test_set_pidfd_open_checkpoint(
 	void (*checkpoint)(pid_t)
 );
+void rootless_shutdown_test_set_snapshot_replacement(pid_t pid, int enabled);
+void rootless_shutdown_test_set_pidfd_preflight_error(int error_number);
+void rootless_shutdown_test_set_parent_lookup_error(int error_number);
+void rootless_shutdown_test_set_membership_checkpoint(void (*checkpoint)(void));
 #endif
 
 #endif

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -25,6 +26,9 @@ enum fixture_mode {
 	FIXTURE_ZOMBIE_SESSION,
 	FIXTURE_INIT_EXITED,
 	FIXTURE_PIDFD_EXIT,
+	FIXTURE_SESSION_EXITED,
+	FIXTURE_DIFFERENT_PARENT,
+	FIXTURE_CHURN,
 };
 
 struct fixture_payload {
@@ -37,6 +41,8 @@ struct session_fixture {
 	pid_t leader;
 	pid_t worker;
 	int late_pipe;
+	int churn_command;
+	int churn_reply;
 };
 
 static void cleanup_fixture(struct session_fixture* fixture);
@@ -45,6 +51,10 @@ static int late_fork_pipe = -1;
 static pid_t pidfd_exit_target = -1;
 static int pidfd_exit_reaped;
 static volatile sig_atomic_t proc_root_scan_attempts;
+static int churn_command_fd = -1;
+static int churn_reply_fd = -1;
+static pid_t churn_latest_pid = -1;
+static int churn_checkpoint_failed;
 
 extern DIR* __real_opendir(const char* path);
 
@@ -77,7 +87,8 @@ static void late_fork_handler(int signal_number)
 			pause();
 	}
 	if (child > 0)
-		(void)write(late_fork_pipe, &child, sizeof(child));
+		if (write(late_fork_pipe, &child, sizeof(child)) < 0)
+			_exit(16);
 	_exit(0);
 }
 
@@ -180,6 +191,7 @@ static int endpoints_removed(const char* prefix)
 		".init.pid",
 		".darlingserver.sock",
 		".darlingserver.stat.sock",
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME,
 		"var/run/shellspawn.sock",
 		"var/tmp/launchd/sock",
 	};
@@ -207,14 +219,50 @@ static int read_exact(int fd, void* output, size_t size)
 	return 0;
 }
 
+static int count_open_fds(void)
+{
+	DIR* directory = opendir("/proc/self/fd");
+	if (directory == NULL)
+		return -1;
+	int count = 0;
+	for (;;) {
+		errno = 0;
+		struct dirent* entry = readdir(directory);
+		if (entry == NULL)
+			break;
+		if (strcmp(entry->d_name, ".") != 0 &&
+			strcmp(entry->d_name, "..") != 0)
+			count++;
+	}
+	int saved_errno = errno;
+	closedir(directory);
+	return saved_errno == 0 ? count : -1;
+}
+
+static void advance_membership_churn(void)
+{
+	char command = 'F';
+	pid_t child = -1;
+	if (churn_command_fd < 0 || churn_reply_fd < 0 ||
+		write(churn_command_fd, &command, sizeof(command)) != sizeof(command) ||
+		read_exact(churn_reply_fd, &child, sizeof(child)) != 0 || child <= 0) {
+		churn_checkpoint_failed = 1;
+		return;
+	}
+	churn_latest_pid = child;
+}
+
 static struct session_fixture spawn_fixture(
 	enum fixture_mode mode,
 	darling_runtime_prefix prefix
 )
 {
 	int pipefd[2];
+	int churn_commands[2] = {-1, -1};
+	int churn_replies[2] = {-1, -1};
 	struct session_fixture fixture = { .init = -1, .leader = -1,
-		.worker = -1, .late_pipe = -1 };
+		.worker = -1, .late_pipe = -1,
+		.churn_command = -1, .churn_reply = -1 };
 	struct rootless_shutdown_closure_capability closure =
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 	char error[256] = {0};
@@ -223,7 +271,9 @@ static struct session_fixture spawn_fixture(
 		fprintf(stderr, "fixture closure prepare failed: %s\n", error);
 		return fixture;
 	}
-	if (pipe(pipefd) != 0) {
+	if (pipe(pipefd) != 0 ||
+		(mode == FIXTURE_CHURN &&
+		 (pipe(churn_commands) != 0 || pipe(churn_replies) != 0))) {
 		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
 		return fixture;
 	}
@@ -236,6 +286,10 @@ static struct session_fixture spawn_fixture(
 	}
 	if (fixture.init == 0) {
 		close(pipefd[0]);
+		if (mode == FIXTURE_CHURN) {
+			close(churn_commands[1]);
+			close(churn_replies[0]);
+		}
 		if (rootless_shutdown_enter_closure(&closure,
 				error, sizeof(error)) != 0)
 			_exit(8);
@@ -252,7 +306,9 @@ static struct session_fixture spawn_fixture(
 		} else if (mode != FIXTURE_GRACEFUL &&
 			mode != FIXTURE_ZOMBIE_SESSION &&
 			mode != FIXTURE_INIT_EXITED &&
-			mode != FIXTURE_PIDFD_EXIT) {
+			mode != FIXTURE_PIDFD_EXIT &&
+			mode != FIXTURE_SESSION_EXITED &&
+			mode != FIXTURE_DIFFERENT_PARENT) {
 			signal(SIGTERM, SIG_IGN);
 		}
 		pid_t leader = fork();
@@ -288,15 +344,48 @@ static struct session_fixture spawn_fixture(
 				_exit(14);
 			if (mode == FIXTURE_ZOMBIE_SESSION)
 				_exit(0);
+			if (mode == FIXTURE_SESSION_EXITED)
+				_exit(0);
+			if (mode == FIXTURE_CHURN) {
+				pid_t churn_child = -1;
+				for (;;) {
+					char command;
+					if (read_exact(churn_commands[0],
+							&command, sizeof(command)) != 0)
+						_exit(17);
+					if (churn_child > 0) {
+						(void)kill(churn_child, SIGKILL);
+						(void)waitpid(churn_child, NULL, 0);
+					}
+					churn_child = fork();
+					if (churn_child == 0) {
+						signal(SIGTERM, SIG_IGN);
+						for (;;)
+							pause();
+					}
+					if (churn_child < 0 ||
+						write(churn_replies[1], &churn_child,
+							sizeof(churn_child)) != sizeof(churn_child))
+						_exit(18);
+				}
+			}
 			for (;;)
 				pause();
 		}
+		if (mode == FIXTURE_SESSION_EXITED)
+			(void)waitpid(leader, NULL, 0);
 		if (mode == FIXTURE_INIT_EXITED)
 			_exit(0);
 		for (;;)
 			pause();
 	}
 	close(pipefd[1]);
+	if (mode == FIXTURE_CHURN) {
+		close(churn_commands[0]);
+		close(churn_replies[1]);
+		fixture.churn_command = churn_commands[1];
+		fixture.churn_reply = churn_replies[0];
+	}
 	struct fixture_payload payload;
 	if (read_exact(pipefd[0], &payload, sizeof(payload)) != 0) {
 		close(pipefd[0]);
@@ -336,6 +425,10 @@ static void cleanup_fixture(struct session_fixture* fixture)
 	}
 	if (fixture->late_pipe >= 0)
 		close(fixture->late_pipe);
+	if (fixture->churn_command >= 0)
+		close(fixture->churn_command);
+	if (fixture->churn_reply >= 0)
+		close(fixture->churn_reply);
 }
 
 static int wait_pid_gone(pid_t pid)
@@ -395,11 +488,18 @@ static int run_shutdown_case(
 		cleanup_fixture(&fixture);
 		return 22;
 	}
+	if (mode == FIXTURE_SESSION_EXITED &&
+		wait_pid_gone(fixture.leader) != 0) {
+		cleanup_fixture(&fixture);
+		return 22;
+	}
 	if (mode == FIXTURE_PIDFD_EXIT) {
 		pidfd_exit_target = fixture.init;
 		pidfd_exit_reaped = 0;
 		rootless_shutdown_test_set_pidfd_open_checkpoint(exit_at_pidfd_open);
 	}
+	if (mode == FIXTURE_DIFFERENT_PARENT)
+		rootless_shutdown_test_set_parent_lookup_error(EACCES);
 	struct rootless_shutdown_result result;
 	char error[512] = {0};
 	int rc = shutdown_rootless_runtime(
@@ -416,6 +516,8 @@ static int run_shutdown_case(
 		if (pidfd_exit_reaped)
 			fixture.init = -1;
 	}
+	if (mode == FIXTURE_DIFFERENT_PARENT)
+		rootless_shutdown_test_set_parent_lookup_error(0);
 	pid_t late_pid = -1;
 	if (mode == FIXTURE_LATE_FORK || mode == FIXTURE_ROOT_LATE_FORK) {
 		struct pollfd pollfd = { .fd = fixture.late_pipe, .events = POLLIN };
@@ -454,6 +556,204 @@ static int run_shutdown_case(
 	return 0;
 }
 
+static int preflight_before_mutation_case(
+	const char* prefix_path, darling_runtime_prefix prefix)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[256] = {0};
+	rootless_shutdown_test_set_pidfd_preflight_error(ENOSYS);
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	rootless_shutdown_test_set_pidfd_preflight_error(0);
+	int state_exists = endpoint_exists(prefix_path,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME);
+	rootless_shutdown_release_closure(&closure);
+	if (rc != -ENOSYS || state_exists) {
+		fprintf(stderr, "pidfd preflight contract failed rc=%d state=%d error=%s\n",
+			rc, state_exists, error);
+		return 1;
+	}
+	return 0;
+}
+
+static int cgroup_same_name_aba_case(
+	const char* prefix_path, darling_runtime_prefix prefix)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	if (rootless_shutdown_prepare_closure(prefix, &closure,
+			error, sizeof(error)) != 0)
+		return 1;
+	ino_t original = closure.cgroup_inode;
+	if (closure.membership_fd >= 0) {
+		close(closure.membership_fd);
+		closure.membership_fd = -1;
+	}
+	if (unlinkat(closure.parent_fd, closure.leaf, AT_REMOVEDIR) != 0 ||
+		mkdirat(closure.parent_fd, closure.leaf, 0700) != 0) {
+		rootless_shutdown_release_closure(&closure);
+		return 2;
+	}
+	struct stat replacement;
+	if (fstatat(closure.parent_fd, closure.leaf, &replacement,
+			AT_SYMLINK_NOFOLLOW) != 0 || replacement.st_ino == original) {
+		rootless_shutdown_release_closure(&closure);
+		return 3;
+	}
+	struct rootless_shutdown_result result;
+	int rc = shutdown_rootless_runtime(0, getpid(), prefix, NULL,
+		&result, error, sizeof(error));
+	int replacement_survived = fstatat(closure.parent_fd, closure.leaf,
+		&replacement, AT_SYMLINK_NOFOLLOW) == 0;
+	(void)unlinkat(closure.parent_fd, closure.leaf, AT_REMOVEDIR);
+	(void)unlinkat(prefix->directory_fd,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME, 0);
+	(void)fsync(prefix->directory_fd);
+	rootless_shutdown_release_closure(&closure);
+	if (rc == 0 || !replacement_survived ||
+		endpoint_exists(prefix_path, ROOTLESS_SHUTDOWN_SESSION_STATE_NAME)) {
+		fprintf(stderr, "cgroup ABA contract failed rc=%d survived=%d error=%s\n",
+			rc, replacement_survived, error);
+		return 4;
+	}
+	return 0;
+}
+
+static int missing_session_identity_case(darling_runtime_prefix prefix)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	if (rootless_shutdown_prepare_closure(prefix, &closure,
+			error, sizeof(error)) != 0)
+		return 1;
+	if (unlinkat(prefix->directory_fd,
+			ROOTLESS_SHUTDOWN_SESSION_STATE_NAME, 0) != 0)
+		return 2;
+	struct rootless_shutdown_result result;
+	int rc = shutdown_rootless_runtime(0, getpid(), prefix, NULL,
+		&result, error, sizeof(error));
+	struct stat cgroup;
+	int cgroup_survived = fstatat(closure.parent_fd, closure.leaf,
+		&cgroup, AT_SYMLINK_NOFOLLOW) == 0;
+	if (closure.membership_fd >= 0) {
+		close(closure.membership_fd);
+		closure.membership_fd = -1;
+	}
+	(void)unlinkat(closure.parent_fd, closure.leaf, AT_REMOVEDIR);
+	rootless_shutdown_release_closure(&closure);
+	if (rc == 0 || !cgroup_survived) {
+		fprintf(stderr, "missing session identity contract failed rc=%d "
+			"cgroup_survived=%d error=%s\n", rc, cgroup_survived, error);
+		return 3;
+	}
+	return 0;
+}
+
+static int finish_fixture_after_failed_acquisition(
+	const char* prefix_path, darling_runtime_prefix prefix,
+	struct session_fixture* fixture)
+{
+	struct rootless_shutdown_result result;
+	char error[512] = {0};
+	int rc = shutdown_rootless_runtime(fixture->leader, fixture->init,
+		prefix, NULL, &result, error, sizeof(error));
+	if (rc != 0 || result.phase != ROOTLESS_SHUTDOWN_STOPPED ||
+		!endpoints_removed(prefix_path)) {
+		fprintf(stderr, "failed-acquisition cleanup failed rc=%d phase=%d %s\n",
+			rc, result.phase, error);
+		cleanup_fixture(fixture);
+		return 1;
+	}
+	(void)waitpid(fixture->init, NULL, 0);
+	fixture->init = -1;
+	cleanup_fixture(fixture);
+	return 0;
+}
+
+static int acquisition_failure_case(
+	const char* prefix_path, darling_runtime_prefix prefix,
+	int replacement, int churn, size_t pidfd_budget)
+{
+	int fd_baseline = count_open_fds();
+	if (fd_baseline < 0)
+		return 1;
+	if (prepare_endpoints(prefix_path, 0) != 0)
+		return 2;
+	struct session_fixture fixture = spawn_fixture(
+		churn ? FIXTURE_CHURN : FIXTURE_GRACEFUL, prefix);
+	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
+		return 3;
+	if (replacement)
+		rootless_shutdown_test_set_snapshot_replacement(fixture.worker, 1);
+	if (churn) {
+		churn_command_fd = fixture.churn_command;
+		churn_reply_fd = fixture.churn_reply;
+		churn_latest_pid = -1;
+		churn_checkpoint_failed = 0;
+		rootless_shutdown_test_set_membership_checkpoint(
+			advance_membership_churn);
+	}
+	const struct rootless_shutdown_policy policy = {
+		.acquisition_timeout_ms = 80,
+		.pidfd_budget = pidfd_budget,
+		.term_timeout_ms = 100,
+		.kill_timeout_ms = 100,
+		.poll_interval_ms = 1,
+	};
+	struct rootless_shutdown_result result;
+	char error[512] = {0};
+	int rc = shutdown_rootless_runtime(fixture.leader, fixture.init,
+		prefix, &policy, &result, error, sizeof(error));
+	rootless_shutdown_test_set_snapshot_replacement(-1, 0);
+	rootless_shutdown_test_set_membership_checkpoint(NULL);
+	churn_command_fd = -1;
+	churn_reply_fd = -1;
+	int all_survived = kill(fixture.init, 0) == 0 &&
+		kill(fixture.leader, 0) == 0 && kill(fixture.worker, 0) == 0;
+	int expected = pidfd_budget != 0 ? -EMFILE : -ETIMEDOUT;
+	if (rc != expected || result.phase != ROOTLESS_SHUTDOWN_CLOSURE_BOUND ||
+		!all_survived || (churn &&
+		 (churn_checkpoint_failed || churn_latest_pid <= 0))) {
+		fprintf(stderr, "acquisition failure contract failed replacement=%d "
+			"churn=%d budget=%zu rc=%d phase=%d survived=%d error=%s\n",
+			replacement, churn, pidfd_budget, rc, result.phase,
+			all_survived, error);
+		cleanup_fixture(&fixture);
+		return 4;
+	}
+	if (finish_fixture_after_failed_acquisition(
+			prefix_path, prefix, &fixture) != 0)
+		return 5;
+	int fd_post = count_open_fds();
+	if (fd_post != fd_baseline) {
+		fprintf(stderr, "pidfd compaction leak baseline=%d post=%d\n",
+			fd_baseline, fd_post);
+		return 6;
+	}
+	return 0;
+}
+
+static int low_rlimit_case(
+	const char* prefix_path, darling_runtime_prefix prefix)
+{
+	struct rlimit before;
+	if (getrlimit(RLIMIT_NOFILE, &before) != 0)
+		return 1;
+	struct rlimit limited = before;
+	if (limited.rlim_cur > 32)
+		limited.rlim_cur = 32;
+	if (setrlimit(RLIMIT_NOFILE, &limited) != 0)
+		return 2;
+	int rc = run_shutdown_case(prefix_path, prefix, FIXTURE_GRACEFUL, 0);
+	int saved_errno = errno;
+	int restore = setrlimit(RLIMIT_NOFILE, &before);
+	errno = saved_errno;
+	return rc == 0 && restore == 0 ? 0 : 3;
+}
+
 int main(void)
 {
 	char prefix_path[] = "/tmp/darling-rootless-shutdown.XXXXXX";
@@ -466,6 +766,12 @@ int main(void)
 		fprintf(stderr, "open prefix failed: %s\n", error);
 		return 2;
 	}
+	if (preflight_before_mutation_case(prefix_path, prefix) != 0)
+		return 56;
+	if (cgroup_same_name_aba_case(prefix_path, prefix) != 0)
+		return 57;
+	if (missing_session_identity_case(prefix) != 0)
+		return 64;
 
 	for (int cycle = 0; cycle < 3; ++cycle) {
 		int rc = run_shutdown_case(
@@ -485,6 +791,20 @@ int main(void)
 		return 53;
 	if (run_shutdown_case(prefix_path, prefix, FIXTURE_PIDFD_EXIT, 0) != 0)
 		return 54;
+	if (run_shutdown_case(prefix_path, prefix,
+			FIXTURE_SESSION_EXITED, 0) != 0)
+		return 58;
+	if (run_shutdown_case(prefix_path, prefix,
+			FIXTURE_DIFFERENT_PARENT, 0) != 0)
+		return 59;
+	if (low_rlimit_case(prefix_path, prefix) != 0)
+		return 60;
+	if (acquisition_failure_case(prefix_path, prefix, 1, 0, 0) != 0)
+		return 61;
+	if (acquisition_failure_case(prefix_path, prefix, 0, 1, 0) != 0)
+		return 62;
+	if (acquisition_failure_case(prefix_path, prefix, 0, 0, 2) != 0)
+		return 63;
 	if (proc_root_scan_attempts != 0)
 		return 55;
 
@@ -649,7 +969,11 @@ int main(void)
 		return 48;
 	puts("ROOTLESS_SHUTDOWN_LIFECYCLE_OK cycles=3 stubborn=PASS "
 		"late_fork=PASS root_late_fork=PASS zombie_session=PASS "
-		"init_enoent=PASS pidfd_exit_race=PASS proc_root_scan=ABSENT "
+		"init_enoent=PASS member_enoent=PASS pidfd_exit_race=PASS "
+		"pid_replacement=PASS cgroup_aba=PASS delegated_parent=BOUND "
+		"session_identity=REQUIRED pidfd_preflight=EARLY "
+		"low_rlimit=PASS churn=BOUNDED "
+		"proc_root_scan=ABSENT "
 		"timeout=PASS endpoints=5 "
 		"guest_endpoint_fail_closed=PASS");
 	return 0;
