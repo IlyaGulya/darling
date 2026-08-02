@@ -89,4 +89,10 @@ int shutdown_rootless_runtime(
 	size_t error_size
 );
 
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+void rootless_shutdown_test_set_pidfd_open_checkpoint(
+	void (*checkpoint)(pid_t)
+);
+#endif
+
 #endif

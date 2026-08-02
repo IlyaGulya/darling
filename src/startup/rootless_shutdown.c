@@ -1,15 +1,16 @@
 #include "rootless_shutdown.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@ struct process_snapshot {
 struct process_identity {
 	pid_t pid;
 	unsigned long long start_time;
+	int pidfd;
 };
 
 struct process_ledger {
@@ -524,114 +526,92 @@ static int process_is_active(const struct process_snapshot* snapshot)
 	return snapshot->state != 'Z' && snapshot->state != 'X';
 }
 
-struct process_record {
-	pid_t pid;
-	struct process_snapshot snapshot;
-};
-
-static int read_process_table(struct process_record** records, size_t* count)
+static int process_matches_identity(pid_t pid,
+	const struct process_snapshot* snapshot,
+	const struct process_identity* identity)
 {
-	DIR* proc = opendir("/proc");
-	struct dirent* entry;
-
-	if (proc == NULL)
-		return -errno;
-	*records = NULL;
-	*count = 0;
-	int saved_errno = 0;
-	for (;;) {
-		errno = 0;
-		entry = readdir(proc);
-		if (entry == NULL) {
-			saved_errno = errno;
-			break;
-		}
-		char* end;
-		long value;
-		pid_t pid;
-		struct process_record candidate;
-
-		if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
-			continue;
-		errno = 0;
-		value = strtol(entry->d_name, &end, 10);
-		if (errno != 0 || *end != '\0' || value <= 0 ||
-			(pid_t)value != value)
-			continue;
-		pid = (pid_t)value;
-		candidate.pid = pid;
-		int status = process_snapshot_for_pid(pid, &candidate.snapshot);
-		if (status == -ENOENT || status == -ESRCH)
-			continue;
-		if (status != 0) {
-			free(*records);
-			*records = NULL;
-			*count = 0;
-			closedir(proc);
-			return status;
-		}
-		struct process_record* grown = realloc(*records,
-			(*count + 1) * sizeof(**records));
-		if (grown == NULL) {
-			free(*records);
-			*records = NULL;
-			*count = 0;
-			closedir(proc);
-			return -ENOMEM;
-		}
-		*records = grown;
-		(*records)[(*count)++] = candidate;
-	}
-	closedir(proc);
-	if (saved_errno != 0) {
-		free(*records);
-		*records = NULL;
-		*count = 0;
-		return -saved_errno;
-	}
-	return 0;
+	return pid == identity->pid &&
+		snapshot->start_time == identity->start_time;
 }
 
-static int signal_identity_bound_process(
-	const struct process_record* expected, int signal_number)
+static struct process_identity* ledger_find(struct process_ledger* ledger,
+	pid_t pid, const struct process_snapshot* snapshot)
 {
-	struct process_snapshot current;
-	int status = process_snapshot_for_pid(expected->pid, &current);
-	if (status == -ENOENT || status == -ESRCH)
-		return 0;
-	if (status != 0)
-		return status;
-	if (current.start_time != expected->snapshot.start_time ||
-		!process_is_active(&current))
-		return 0;
-	if (signal_number != 0 && kill(expected->pid, signal_number) != 0 &&
+	for (size_t index = 0; index < ledger->count; ++index) {
+		if (process_matches_identity(pid, snapshot, &ledger->identities[index]))
+			return &ledger->identities[index];
+	}
+	return NULL;
+}
+
+static int open_process_pidfd(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+	int fd = (int)syscall(SYS_pidfd_open, pid, 0);
+	return fd < 0 ? -errno : fd;
+#else
+	(void)pid;
+	return -ENOSYS;
+#endif
+}
+
+static int signal_process_pidfd(int pidfd, int signal_number)
+{
+#ifdef SYS_pidfd_send_signal
+	if (syscall(SYS_pidfd_send_signal, pidfd, signal_number, NULL, 0) != 0 &&
 		errno != ESRCH)
 		return -errno;
 	return 0;
+#else
+	(void)pidfd;
+	(void)signal_number;
+	return -ENOSYS;
+#endif
 }
 
-static int process_matches_identity(const struct process_record* process,
-	const struct process_identity* identity)
+static int process_pidfd_active(int pidfd, int* active)
 {
-	return process->pid == identity->pid &&
-		process->snapshot.start_time == identity->start_time;
+	struct pollfd descriptor = {
+		.fd = pidfd,
+		.events = POLLIN,
+	};
+	int result;
+	do {
+		result = poll(&descriptor, 1, 0);
+	} while (result < 0 && errno == EINTR);
+	if (result < 0)
+		return -errno;
+	if ((descriptor.revents & POLLNVAL) != 0)
+		return -EBADF;
+	*active = result == 0;
+	return 0;
 }
 
-static int ledger_contains(const struct process_ledger* ledger,
-	const struct process_record* process)
+static int pid_list_contains(const pid_t* members, size_t count, pid_t pid)
 {
-	for (size_t index = 0; index < ledger->count; ++index) {
-		if (process_matches_identity(process, &ledger->identities[index]))
+	for (size_t index = 0; index < count; ++index) {
+		if (members[index] == pid)
 			return 1;
 	}
 	return 0;
 }
 
-static int ledger_add(struct process_ledger* ledger,
-	const struct process_record* process)
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+static void (*pidfd_open_checkpoint)(pid_t);
+
+void rootless_shutdown_test_set_pidfd_open_checkpoint(void (*checkpoint)(pid_t))
 {
-	if (ledger_contains(ledger, process))
+	pidfd_open_checkpoint = checkpoint;
+}
+#endif
+
+static int ledger_add(struct process_ledger* ledger, pid_t pid,
+	const struct process_snapshot* snapshot, int pidfd)
+{
+	if (ledger_find(ledger, pid, snapshot) != NULL) {
+		close(pidfd);
 		return 0;
+	}
 	if (ledger->count == ledger->capacity) {
 		size_t capacity = ledger->capacity == 0 ? 16 : ledger->capacity * 2;
 		if (capacity < ledger->capacity ||
@@ -645,10 +625,82 @@ static int ledger_add(struct process_ledger* ledger,
 		ledger->capacity = capacity;
 	}
 	ledger->identities[ledger->count++] = (struct process_identity) {
-		.pid = process->pid,
-		.start_time = process->snapshot.start_time,
+		.pid = pid,
+		.start_time = snapshot->start_time,
+		.pidfd = pidfd,
 	};
 	return 0;
+}
+
+static void ledger_release(struct process_ledger* ledger)
+{
+	for (size_t index = 0; index < ledger->count; ++index) {
+		if (ledger->identities[index].pidfd >= 0)
+			close(ledger->identities[index].pidfd);
+	}
+	free(ledger->identities);
+	*ledger = (struct process_ledger){0};
+}
+
+/*
+ * Capture one cgroup member as an identity-bound capability. The snapshot
+ * before pidfd_open detects PID reuse across acquisition; the second cgroup
+ * read proves that the exact numeric identity was still a member after the
+ * pidfd became authoritative. Once retained, only pidfd_send_signal is used.
+ */
+static int ledger_capture_member(struct process_ledger* ledger,
+	const struct rootless_shutdown_closure_capability* closure, pid_t pid)
+{
+	struct process_snapshot before;
+	int status = process_snapshot_for_pid(pid, &before);
+	if (status == -ENOENT || status == -ESRCH)
+		return 0;
+	if (status != 0)
+		return status;
+	if (!process_is_active(&before))
+		return 0;
+	if (ledger_find(ledger, pid, &before) != NULL)
+		return 0;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (pidfd_open_checkpoint != NULL)
+		pidfd_open_checkpoint(pid);
+#endif
+	int pidfd = open_process_pidfd(pid);
+	if (pidfd == -ENOENT || pidfd == -ESRCH)
+		return 0;
+	if (pidfd < 0)
+		return pidfd;
+	struct process_snapshot after;
+	status = process_snapshot_for_pid(pid, &after);
+	if (status == -ENOENT || status == -ESRCH) {
+		close(pidfd);
+		return 0;
+	}
+	if (status != 0) {
+		close(pidfd);
+		return status;
+	}
+	if (after.start_time != before.start_time || !process_is_active(&after)) {
+		close(pidfd);
+		return 0;
+	}
+	pid_t* members = NULL;
+	size_t member_count = 0;
+	status = cgroup_read_pids(closure->directory_fd, &members, &member_count);
+	if (status != 0) {
+		close(pidfd);
+		return status;
+	}
+	int still_member = pid_list_contains(members, member_count, pid);
+	free(members);
+	if (!still_member) {
+		close(pidfd);
+		return 0;
+	}
+	status = ledger_add(ledger, pid, &after, pidfd);
+	if (status != 0)
+		close(pidfd);
+	return status;
 }
 
 /*
@@ -672,56 +724,38 @@ static int signal_runtime_closure(pid_t init_process,
 	status = cgroup_read_pids(closure->directory_fd, &members, &member_count);
 	if (status != 0)
 		return status;
-	struct process_record* records = NULL;
-	size_t count = 0;
-	status = read_process_table(&records, &count);
-	if (status != 0) {
-		free(members);
-		return status;
-	}
-	unsigned char* selected = count == 0 ? NULL : calloc(count, 1);
-	if (count != 0 && selected == NULL) {
-		free(members);
-		free(records);
-		return -ENOMEM;
-	}
-
-	for (size_t index = 0; index < count; ++index) {
-		int member = 0;
-		for (size_t member_index = 0; member_index < member_count; ++member_index)
-			member |= members[member_index] == records[index].pid;
-		if (member || ledger_contains(ledger, &records[index]) ||
-			(records[index].pid == init_process &&
-			 records[index].snapshot.start_time == init_start_time))
-			selected[index] = 1;
-	}
-
-	unsigned descendants = 0;
-	const struct process_record* root = NULL;
-	for (size_t index = 0; index < count; ++index) {
-		if (!selected[index])
-			continue;
-		status = ledger_add(ledger, &records[index]);
+	for (size_t index = 0; index < member_count; ++index) {
+		status = ledger_capture_member(ledger, closure, members[index]);
 		if (status != 0)
 			goto out;
-		if (!process_is_active(&records[index].snapshot))
+	}
+	unsigned descendants = 0;
+	struct process_identity* root = NULL;
+	*active = 0;
+	for (size_t index = 0; index < ledger->count; ++index) {
+		struct process_identity* identity = &ledger->identities[index];
+		int identity_active = 0;
+		status = process_pidfd_active(identity->pidfd, &identity_active);
+		if (status != 0)
+			goto out;
+		if (!identity_active)
 			continue;
-		if (records[index].pid == init_process &&
-			records[index].snapshot.start_time == init_start_time) {
-			root = &records[index];
+		(*active)++;
+		if (identity->pid == init_process && init_start_time != 0 &&
+			identity->start_time == init_start_time) {
+			root = identity;
 			continue;
 		}
 		descendants++;
-		status = signal_identity_bound_process(&records[index], signal_number);
+		status = signal_process_pidfd(identity->pidfd, signal_number);
 		if (status != 0)
 			goto out;
 	}
 	if (descendants == 0 && root != NULL) {
-		status = signal_identity_bound_process(root, signal_number);
+		status = signal_process_pidfd(root->pidfd, signal_number);
 		if (status != 0)
 			goto out;
 	}
-	*active = descendants + (root != NULL ? 1U : 0U);
 	if (*active == 0) {
 		int populated = 1;
 		status = cgroup_populated_fd(closure->directory_fd, &populated);
@@ -731,8 +765,6 @@ static int signal_runtime_closure(pid_t init_process,
 
 out:
 	free(members);
-	free(selected);
-	free(records);
 	return status;
 }
 
@@ -756,26 +788,14 @@ static void sleep_milliseconds(unsigned milliseconds)
 		;
 }
 
-static int process_identity_active(pid_t pid,
-	unsigned long long start_time, int* active)
-{
-	struct process_snapshot snapshot;
-	int status = process_snapshot_for_pid(pid, &snapshot);
-	if (status == -ESRCH) {
-		*active = 0;
-		return 0;
-	}
-	if (status != 0)
-		return status;
-	*active = snapshot.start_time == start_time && process_is_active(&snapshot);
-	return 0;
-}
-
-static int quiesce_session_member(pid_t pid,
-	unsigned long long start_time, unsigned timeout_ms,
+static int quiesce_session_member(struct process_ledger* ledger, pid_t pid,
+	const struct process_snapshot* snapshot, unsigned timeout_ms,
 	unsigned poll_interval_ms, unsigned* rounds)
 {
 	if (pid <= 0 || timeout_ms == 0)
+		return 0;
+	struct process_identity* identity = ledger_find(ledger, pid, snapshot);
+	if (identity == NULL)
 		return 0;
 	unsigned long long now;
 	int status = monotonic_milliseconds(&now);
@@ -784,7 +804,7 @@ static int quiesce_session_member(pid_t pid,
 	const unsigned long long deadline = now + timeout_ms;
 	for (;;) {
 		int active = 0;
-		status = process_identity_active(pid, start_time, &active);
+		status = process_pidfd_active(identity->pidfd, &active);
 		if (status != 0 || !active)
 			return status;
 		(*rounds)++;
@@ -836,89 +856,33 @@ static int drain_until(pid_t init_process,
 	}
 }
 
-static int bind_runtime_closure(pid_t init_process,
-	const darling_runtime_prefix prefix,
+static int bind_runtime_closure(const darling_runtime_prefix prefix,
 	struct rootless_shutdown_closure_capability* capability,
 	char* error, size_t error_size)
 {
-	char path[PATH_MAX];
-	char expected_leaf[NAME_MAX + 1];
-	int status = cgroup_path_for_pid(init_process, path, sizeof(path));
-	if (status != 0)
-		goto fail_without_capability;
-	status = cgroup_leaf_for_prefix(prefix, expected_leaf, sizeof(expected_leaf));
-	if (status != 0)
-		goto fail_without_capability;
-	char copy[PATH_MAX];
-	strcpy(copy, path);
-	int current = open("/sys/fs/cgroup",
-		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-	if (current < 0) {
-		status = -errno;
-		goto fail_without_capability;
-	}
 	struct rootless_shutdown_closure_capability local =
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
-	char* save = NULL;
-	char* component = strtok_r(copy, "/", &save);
-	if (component == NULL) {
-		status = -EPROTO;
+	int status = cgroup_leaf_for_prefix(prefix, local.leaf, sizeof(local.leaf));
+	if (status != 0)
 		goto fail;
-	}
-	for (;;) {
-		char* next_component = strtok_r(NULL, "/", &save);
-		if (next_component == NULL) {
-			if (strcmp(component, expected_leaf) != 0) {
-				status = -EPROTO;
-				goto fail;
-			}
-			local.parent_fd = duplicate_cloexec(current);
-			if (local.parent_fd < 0) {
-				status = local.parent_fd;
-				local.parent_fd = -1;
-				goto fail;
-			}
-			local.directory_fd = openat(current, component,
-				O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-			if (local.directory_fd < 0) {
-				status = -errno;
-				goto fail;
-			}
-			strcpy(local.leaf, component);
-			break;
-		}
-		int next = openat(current, component,
-			O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-		if (next < 0) {
-			status = -errno;
-			goto fail;
-		}
-		close(current);
-		current = next;
-		component = next_component;
-	}
-	struct stat opened;
-	struct stat named;
-	if (fstat(local.directory_fd, &opened) != 0 ||
-		fstatat(local.parent_fd, local.leaf, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+	status = open_delegated_cgroup_parent(&local.parent_fd);
+	if (status != 0)
+		goto fail;
+	local.directory_fd = openat(local.parent_fd, local.leaf,
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (local.directory_fd < 0) {
 		status = -errno;
 		goto fail;
 	}
-	if (!S_ISDIR(opened.st_mode) || !S_ISDIR(named.st_mode) ||
-		opened.st_dev != named.st_dev || opened.st_ino != named.st_ino ||
-		opened.st_uid != geteuid()) {
-		status = -EPERM;
+	status = closure_named_identity(&local);
+	if (status != 0)
 		goto fail;
-	}
-	close(current);
 	*capability = local;
 	if (error != NULL && error_size != 0)
 		error[0] = '\0';
 	return 0;
 fail:
-	close(current);
 	rootless_shutdown_release_closure(&local);
-fail_without_capability:
 	return shutdown_error(error, error_size, -status,
 		"cannot bind rootless shutdown cgroup: %s", strerror(-status));
 }
@@ -1010,8 +974,8 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 	struct process_ledger ledger = {0};
 	struct rootless_shutdown_closure_capability closure =
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
-	struct process_snapshot member_snapshot;
-	struct process_snapshot init_snapshot;
+	struct process_snapshot member_snapshot = {0};
+	struct process_snapshot init_snapshot = {0};
 	int outcome = 0;
 	const struct rootless_shutdown_policy* policy = requested_policy != NULL
 		? requested_policy : &default_policy;
@@ -1023,10 +987,11 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 	}
 	*result = local;
 	int member_present = session_member > 0;
+	int init_present = 1;
 	int status = 0;
 	if (member_present) {
 		status = process_snapshot_for_pid(session_member, &member_snapshot);
-		if (status == -ESRCH)
+		if (status == -ENOENT || status == -ESRCH)
 			member_present = 0;
 		else if (status != 0)
 			return shutdown_error(error, error_size, -status,
@@ -1034,11 +999,18 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 				strerror(-status));
 	}
 	status = process_snapshot_for_pid(init_process, &init_snapshot);
-	if (status != 0)
+	if (status == -ENOENT || status == -ESRCH)
+		init_present = 0;
+	else if (status != 0)
 		return shutdown_error(error, error_size, -status,
 			"cannot inspect Darling init process: %s", strerror(-status));
-	local.session = member_present ? member_snapshot.session : init_snapshot.session;
-	status = bind_runtime_closure(init_process, prefix, &closure,
+	if (init_present && !process_is_active(&init_snapshot))
+		init_present = 0;
+	if (member_present && !process_is_active(&member_snapshot))
+		member_present = 0;
+	local.session = member_present ? member_snapshot.session :
+		(init_present ? init_snapshot.session : 0);
+	status = bind_runtime_closure(prefix, &closure,
 		error, error_size);
 	if (status != 0)
 		return status;
@@ -1049,14 +1021,10 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 		goto finish;
 	}
 	local.closure_inode = closure_identity.st_ino;
-	if (!process_is_active(&init_snapshot)) {
-		outcome = shutdown_error(error, error_size, ESRCH,
-			"Darling init process is no longer active");
-		goto finish;
-	}
-	if (rootless_shutdown_closure_contains(&closure, init_process,
-			error, error_size) != 0 ||
-		(member_present && process_is_active(&member_snapshot) &&
+	if ((init_present &&
+		 rootless_shutdown_closure_contains(&closure, init_process,
+			error, error_size) != 0) ||
+		(member_present &&
 		 rootless_shutdown_closure_contains(&closure, session_member,
 			error, error_size) != 0)) {
 		outcome = -1;
@@ -1071,23 +1039,25 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 		case ROOTLESS_SHUTDOWN_CLOSURE_BOUND: {
 			unsigned active = 0;
 			status = signal_runtime_closure(init_process,
-				init_snapshot.start_time, &closure,
+				init_present ? init_snapshot.start_time : 0, &closure,
 				&ledger, 0, &active);
 			local.identities_observed = ledger.count;
-			if (status != 0 || active == 0) {
+			if (status != 0) {
 				outcome = shutdown_error(error, error_size,
-					status != 0 ? -status : ESRCH,
+					-status,
 					"cannot bind rootless shutdown closure: %s",
-					strerror(status != 0 ? -status : ESRCH));
+					strerror(-status));
 				goto finish;
 			}
-			local.phase = ROOTLESS_SHUTDOWN_QUIESCING;
+			local.phase = active == 0
+				? ROOTLESS_SHUTDOWN_DRAINED
+				: ROOTLESS_SHUTDOWN_QUIESCING;
 			break;
 		}
 		case ROOTLESS_SHUTDOWN_QUIESCING:
 			status = member_present
-				? quiesce_session_member(session_member,
-					member_snapshot.start_time,
+				? quiesce_session_member(&ledger, session_member,
+					&member_snapshot,
 					policy->quiesce_timeout_ms,
 					policy->poll_interval_ms,
 					&local.quiesce_rounds)
@@ -1103,7 +1073,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 		case ROOTLESS_SHUTDOWN_TERM: {
 			unsigned active = 0;
 			status = signal_runtime_closure(init_process,
-				init_snapshot.start_time, &closure,
+				init_present ? init_snapshot.start_time : 0, &closure,
 				&ledger, SIGTERM, &active);
 			local.term_rounds++;
 			local.identities_observed = ledger.count;
@@ -1118,7 +1088,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 		}
 		case ROOTLESS_SHUTDOWN_DRAINING:
 			status = drain_until(init_process,
-				init_snapshot.start_time, &closure,
+				init_present ? init_snapshot.start_time : 0, &closure,
 				&ledger, SIGTERM,
 				policy->term_timeout_ms, policy->poll_interval_ms,
 				&local.term_rounds);
@@ -1139,7 +1109,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 			if (policy->kill_timeout_ms == 0) {
 				unsigned active = 0;
 				status = signal_runtime_closure(init_process,
-					init_snapshot.start_time, &closure,
+					init_present ? init_snapshot.start_time : 0, &closure,
 					&ledger, SIGKILL, &active);
 				local.kill_rounds++;
 				local.identities_observed = ledger.count;
@@ -1154,7 +1124,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 				goto finish;
 			}
 			status = drain_until(init_process,
-				init_snapshot.start_time, &closure,
+				init_present ? init_snapshot.start_time : 0, &closure,
 				&ledger, SIGKILL,
 				policy->kill_timeout_ms, policy->poll_interval_ms,
 				&local.kill_rounds);
@@ -1207,7 +1177,7 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 	}
 
 finish:
-	free(ledger.identities);
+	ledger_release(&ledger);
 	rootless_shutdown_release_closure(&closure);
 	*result = local;
 	return outcome;

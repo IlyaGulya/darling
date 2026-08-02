@@ -1,6 +1,7 @@
 #include "../rootless_shutdown.h"
 #include "../runtime_mode_prefix.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -22,6 +23,8 @@ enum fixture_mode {
 	FIXTURE_LATE_FORK,
 	FIXTURE_ROOT_LATE_FORK,
 	FIXTURE_ZOMBIE_SESSION,
+	FIXTURE_INIT_EXITED,
+	FIXTURE_PIDFD_EXIT,
 };
 
 struct fixture_payload {
@@ -39,6 +42,30 @@ struct session_fixture {
 static void cleanup_fixture(struct session_fixture* fixture);
 
 static int late_fork_pipe = -1;
+static pid_t pidfd_exit_target = -1;
+static int pidfd_exit_reaped;
+static volatile sig_atomic_t proc_root_scan_attempts;
+
+extern DIR* __real_opendir(const char* path);
+
+DIR* __wrap_opendir(const char* path)
+{
+	if (strcmp(path, "/proc") == 0) {
+		proc_root_scan_attempts++;
+		errno = EACCES;
+		return NULL;
+	}
+	return __real_opendir(path);
+}
+
+static void exit_at_pidfd_open(pid_t pid)
+{
+	if (pid != pidfd_exit_target)
+		return;
+	pidfd_exit_target = -1;
+	if (kill(pid, SIGKILL) == 0 && waitpid(pid, NULL, 0) == pid)
+		pidfd_exit_reaped = 1;
+}
 
 static void late_fork_handler(int signal_number)
 {
@@ -223,7 +250,9 @@ static struct session_fixture spawn_fixture(
 			if (sigaction(SIGTERM, &action, NULL) != 0)
 				_exit(15);
 		} else if (mode != FIXTURE_GRACEFUL &&
-			mode != FIXTURE_ZOMBIE_SESSION) {
+			mode != FIXTURE_ZOMBIE_SESSION &&
+			mode != FIXTURE_INIT_EXITED &&
+			mode != FIXTURE_PIDFD_EXIT) {
 			signal(SIGTERM, SIG_IGN);
 		}
 		pid_t leader = fork();
@@ -262,6 +291,8 @@ static struct session_fixture spawn_fixture(
 			for (;;)
 				pause();
 		}
+		if (mode == FIXTURE_INIT_EXITED)
+			_exit(0);
 		for (;;)
 			pause();
 	}
@@ -280,7 +311,8 @@ static struct session_fixture spawn_fixture(
 			? pipefd[0] : -1;
 	if (fixture.late_pipe < 0)
 		close(pipefd[0]);
-	if (rootless_shutdown_closure_contains(&closure, fixture.init,
+	if (mode != FIXTURE_INIT_EXITED &&
+		rootless_shutdown_closure_contains(&closure, fixture.init,
 			error, sizeof(error)) != 0) {
 		fprintf(stderr, "fixture closure membership failed: %s\n", error);
 		cleanup_fixture(&fixture);
@@ -350,21 +382,40 @@ static int run_shutdown_case(
 	struct session_fixture fixture = spawn_fixture(mode, prefix);
 	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
 		return 21;
+	pid_t shutdown_init = fixture.init;
+	if (mode == FIXTURE_INIT_EXITED) {
+		if (waitpid(fixture.init, NULL, 0) != fixture.init) {
+			cleanup_fixture(&fixture);
+			return 22;
+		}
+		fixture.init = -1;
+	}
 	if (mode == FIXTURE_ZOMBIE_SESSION &&
 		wait_pid_state(fixture.leader, 'Z') != 0) {
 		cleanup_fixture(&fixture);
 		return 22;
 	}
+	if (mode == FIXTURE_PIDFD_EXIT) {
+		pidfd_exit_target = fixture.init;
+		pidfd_exit_reaped = 0;
+		rootless_shutdown_test_set_pidfd_open_checkpoint(exit_at_pidfd_open);
+	}
 	struct rootless_shutdown_result result;
 	char error[512] = {0};
 	int rc = shutdown_rootless_runtime(
 		fixture.leader,
-		fixture.init,
+		shutdown_init,
 		prefix,
 		NULL,
 		&result,
 		error,
 		sizeof(error));
+	if (mode == FIXTURE_PIDFD_EXIT) {
+		rootless_shutdown_test_set_pidfd_open_checkpoint(NULL);
+		pidfd_exit_target = -1;
+		if (pidfd_exit_reaped)
+			fixture.init = -1;
+	}
 	pid_t late_pid = -1;
 	if (mode == FIXTURE_LATE_FORK || mode == FIXTURE_ROOT_LATE_FORK) {
 		struct pollfd pollfd = { .fd = fixture.late_pipe, .events = POLLIN };
@@ -377,6 +428,7 @@ static int run_shutdown_case(
 	if (rc != 0 || result.phase != ROOTLESS_SHUTDOWN_STOPPED ||
 		!!result.kill_rounds != !!expect_kill || !endpoints_removed(prefix_path) ||
 		result.closure_inode == 0 ||
+		(mode == FIXTURE_PIDFD_EXIT && !pidfd_exit_reaped) ||
 		(mode == FIXTURE_ROOT_LATE_FORK && result.identities_observed < 4) ||
 		(late_pid > 0 && wait_pid_gone(late_pid) != 0)) {
 		fprintf(stderr, "shutdown case failed mode=%d rc=%d phase=%d "
@@ -388,8 +440,10 @@ static int run_shutdown_case(
 		cleanup_fixture(&fixture);
 		return 22;
 	}
-	(void)waitpid(fixture.init, NULL, 0);
-	fixture.init = -1;
+	if (fixture.init > 0) {
+		(void)waitpid(fixture.init, NULL, 0);
+		fixture.init = -1;
+	}
 	if (wait_pid_gone(fixture.leader) != 0 ||
 		wait_pid_gone(fixture.worker) != 0 ||
 		(late_pid > 0 && wait_pid_gone(late_pid) != 0)) {
@@ -427,6 +481,12 @@ int main(void)
 		return 32;
 	if (run_shutdown_case(prefix_path, prefix, FIXTURE_ZOMBIE_SESSION, 0) != 0)
 		return 33;
+	if (run_shutdown_case(prefix_path, prefix, FIXTURE_INIT_EXITED, 0) != 0)
+		return 53;
+	if (run_shutdown_case(prefix_path, prefix, FIXTURE_PIDFD_EXIT, 0) != 0)
+		return 54;
+	if (proc_root_scan_attempts != 0)
+		return 55;
 
 	/* Missing endpoint parents mean the endpoints are already absent. */
 	char missing_path[512];
@@ -589,6 +649,8 @@ int main(void)
 		return 48;
 	puts("ROOTLESS_SHUTDOWN_LIFECYCLE_OK cycles=3 stubborn=PASS "
 		"late_fork=PASS root_late_fork=PASS zombie_session=PASS "
-		"timeout=PASS endpoints=5 guest_endpoint_fail_closed=PASS");
+		"init_enoent=PASS pidfd_exit_race=PASS proc_root_scan=ABSENT "
+		"timeout=PASS endpoints=5 "
+		"guest_endpoint_fail_closed=PASS");
 	return 0;
 }

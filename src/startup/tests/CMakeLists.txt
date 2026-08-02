@@ -12,6 +12,12 @@ foreach(shutdown_test IN ITEMS session lifecycle shared_session)
 		../runtime_mode.c
 		../runtime_mode_prefix.c)
 	target_compile_definitions(${shutdown_target} PRIVATE _GNU_SOURCE)
+	if(shutdown_test STREQUAL "lifecycle")
+		target_compile_definitions(${shutdown_target} PRIVATE
+			DARLING_ROOTLESS_SHUTDOWN_TESTING)
+		target_link_options(${shutdown_target} PRIVATE
+			-Wl,--wrap=opendir)
+	endif()
 	target_compile_options(${shutdown_target} PRIVATE
 		-Wall -Wextra -Werror -Wno-c23-extensions)
 	target_include_directories(${shutdown_target} PRIVATE ..)
