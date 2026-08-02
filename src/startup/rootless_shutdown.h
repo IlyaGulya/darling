@@ -110,6 +110,18 @@ void rootless_shutdown_test_set_snapshot_replacement(pid_t pid, int enabled);
 void rootless_shutdown_test_set_pidfd_preflight_error(int error_number);
 void rootless_shutdown_test_set_parent_lookup_error(int error_number);
 void rootless_shutdown_test_set_membership_checkpoint(void (*checkpoint)(void));
+void rootless_shutdown_test_set_membership_read_checkpoint(
+	void (*checkpoint)(size_t)
+);
+void rootless_shutdown_test_set_snapshot_sorted_checkpoint(
+	void (*checkpoint)(unsigned)
+);
+void rootless_shutdown_test_set_monotonic_clock(
+	int (*clock)(unsigned long long*)
+);
+void rootless_shutdown_test_set_session_publish_checkpoint(
+	void (*checkpoint)(void)
+);
 #endif
 
 #endif

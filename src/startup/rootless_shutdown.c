@@ -60,6 +60,10 @@ static int delegated_parent_lookup_error;
 static pid_t snapshot_replacement_pid = -1;
 static int snapshot_replacement_enabled;
 static void (*membership_checkpoint)(void);
+static void (*membership_read_checkpoint)(size_t);
+static void (*snapshot_sorted_checkpoint)(unsigned);
+static int (*test_monotonic_clock)(unsigned long long*);
+static void (*session_publish_checkpoint)(void);
 
 void rootless_shutdown_test_set_snapshot_replacement(pid_t pid, int enabled)
 {
@@ -80,6 +84,30 @@ void rootless_shutdown_test_set_parent_lookup_error(int error_number)
 void rootless_shutdown_test_set_membership_checkpoint(void (*checkpoint)(void))
 {
 	membership_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_membership_read_checkpoint(
+	void (*checkpoint)(size_t))
+{
+	membership_read_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_snapshot_sorted_checkpoint(
+	void (*checkpoint)(unsigned))
+{
+	snapshot_sorted_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_monotonic_clock(
+	int (*clock)(unsigned long long*))
+{
+	test_monotonic_clock = clock;
+}
+
+void rootless_shutdown_test_set_session_publish_checkpoint(
+	void (*checkpoint)(void))
+{
+	session_publish_checkpoint = checkpoint;
 }
 #endif
 
@@ -124,6 +152,8 @@ static int rootless_shutdown_pidfd_preflight(void)
 
 static int monotonic_milliseconds(unsigned long long* milliseconds);
 static void sleep_milliseconds(unsigned milliseconds);
+static int derive_pidfd_budget(
+	const struct rootless_shutdown_policy* policy, size_t* budget);
 
 static const char* const host_runtime_endpoints[] = {
 	".init.pid",
@@ -532,7 +562,7 @@ static int publish_session_state(
 	if (length < 0 || (size_t)length >= sizeof(temporary))
 		return -ENAMETOOLONG;
 	int fd = openat(prefix->directory_fd, temporary,
-		O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+		O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd < 0)
 		return -errno;
 	status = fchmod(fd, 0600) == 0 ? write_all_fd(fd, content) : -errno;
@@ -547,9 +577,6 @@ static int publish_session_state(
 		(written.st_mode & 0777) != 0600 ||
 		written.st_uid != prefix_identity.st_uid))
 		status = -EPERM;
-	int saved_errno = errno;
-	close(fd);
-	errno = saved_errno;
 	int published = 0;
 	if (status == 0 && renameat2(prefix->directory_fd, temporary,
 			prefix->directory_fd, ROOTLESS_SHUTDOWN_SESSION_STATE_NAME,
@@ -557,12 +584,15 @@ static int publish_session_state(
 		status = -errno;
 	else if (status == 0)
 		published = 1;
-	if (status == 0)
-		capability->state_fd = openat(prefix->directory_fd,
-		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME,
-		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-	if (status == 0 && capability->state_fd < 0)
-		status = -errno;
+
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (status == 0 && session_publish_checkpoint != NULL)
+		session_publish_checkpoint();
+#endif
+	if (status == 0) {
+		capability->state_fd = fd;
+		fd = -1;
+	}
 	struct stat state_identity;
 	if (status == 0 && fstat(capability->state_fd, &state_identity) != 0)
 		status = -errno;
@@ -592,6 +622,8 @@ static int publish_session_state(
 	}
 	capability->state_device = 0;
 	capability->state_inode = 0;
+	if (fd >= 0)
+		close(fd);
 	return status;
 }
 
@@ -771,6 +803,10 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		goto fail;
 	}
 	created = 1;
+	if (fchmodat(local.parent_fd, local.leaf, 0700, 0) != 0) {
+		status = -errno;
+		goto fail;
+	}
 	int length = snprintf(local.path, sizeof(local.path), "%s/%s",
 		parent_path, local.leaf);
 	if (length < 0 || (size_t)length >= sizeof(local.path)) {
@@ -796,6 +832,11 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	if (fstat(local.prefix_fd, &prefix_identity) != 0 ||
 		fstat(local.directory_fd, &cgroup_identity) != 0) {
 		status = -errno;
+		goto fail;
+	}
+	if ((cgroup_identity.st_mode & 0777) != 0700 ||
+		cgroup_identity.st_uid != geteuid()) {
+		status = -EPERM;
 		goto fail;
 	}
 	local.cgroup_device = cgroup_identity.st_dev;
@@ -866,7 +907,17 @@ int rootless_shutdown_enter_closure(
 	return 0;
 }
 
-static int cgroup_read_pids(int directory_fd, pid_t** output, size_t* count)
+static int deadline_not_expired(unsigned long long deadline)
+{
+	unsigned long long now = 0;
+	int status = monotonic_milliseconds(&now);
+	if (status != 0)
+		return status;
+	return now < deadline ? 0 : -ETIMEDOUT;
+}
+
+static int cgroup_read_pids(int directory_fd, pid_t** output, size_t* count,
+	size_t pidfd_budget, unsigned long long deadline)
 {
 	int fd = openat(directory_fd, "cgroup.procs",
 		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -880,10 +931,17 @@ static int cgroup_read_pids(int directory_fd, pid_t** output, size_t* count)
 	}
 	*output = NULL;
 	*count = 0;
+	size_t output_capacity = 0;
 	char* line = NULL;
 	size_t capacity = 0;
 	int status = 0;
-	while (getline(&line, &capacity, stream) >= 0) {
+	for (;;) {
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			break;
+		ssize_t length = getline(&line, &capacity, stream);
+		if (length < 0)
+			break;
 		char* end = NULL;
 		errno = 0;
 		long value = strtol(line, &end, 10);
@@ -893,16 +951,43 @@ static int cgroup_read_pids(int directory_fd, pid_t** output, size_t* count)
 			status = -EPROTO;
 			break;
 		}
-		pid_t* grown = realloc(*output, (*count + 1) * sizeof(**output));
-		if (grown == NULL) {
-			status = -ENOMEM;
+		if (*count == output_capacity) {
+			size_t maximum = pidfd_budget == SIZE_MAX
+				? SIZE_MAX : pidfd_budget + 1;
+			size_t grown_capacity = output_capacity == 0 ? 16
+				: output_capacity <= SIZE_MAX / 2
+					? output_capacity * 2 : SIZE_MAX;
+			if (grown_capacity > maximum)
+				grown_capacity = maximum;
+			if (grown_capacity <= output_capacity ||
+				grown_capacity > SIZE_MAX / sizeof(**output)) {
+				status = -EMFILE;
+				break;
+			}
+			pid_t* grown = realloc(*output,
+				grown_capacity * sizeof(**output));
+			if (grown == NULL) {
+				status = -ENOMEM;
+				break;
+			}
+			*output = grown;
+			output_capacity = grown_capacity;
+		}
+		(*output)[(*count)++] = (pid_t)value;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (membership_read_checkpoint != NULL)
+			membership_read_checkpoint(*count);
+#endif
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			break;
+		if (*count > pidfd_budget) {
+			status = -EMFILE;
 			break;
 		}
-		*output = grown;
-		(*output)[(*count)++] = (pid_t)value;
 	}
 	if (status == 0 && ferror(stream))
-		status = -errno;
+		status = errno != 0 ? -errno : -EIO;
 	free(line);
 	fclose(stream);
 	if (status != 0) {
@@ -926,7 +1011,14 @@ int rootless_shutdown_closure_contains(
 			"rootless shutdown cgroup identity changed");
 	pid_t* members = NULL;
 	size_t count = 0;
-	int status = cgroup_read_pids(capability->directory_fd, &members, &count);
+	size_t budget = 0;
+	int status = derive_pidfd_budget(&default_policy, &budget);
+	unsigned long long now = 0;
+	if (status == 0)
+		status = monotonic_milliseconds(&now);
+	if (status == 0)
+		status = cgroup_read_pids(capability->directory_fd, &members, &count,
+			budget, now + default_policy.acquisition_timeout_ms);
 	if (status != 0)
 		return shutdown_error(error, error_size, -status,
 			"cannot read rootless shutdown cgroup: %s", strerror(-status));
@@ -1320,14 +1412,19 @@ static int acquire_runtime_closure(
 		size_t before_count = 0;
 		size_t after_count = 0;
 		status = cgroup_read_pids(closure->directory_fd,
-			&before, &before_count);
+			&before, &before_count, pidfd_budget, deadline);
 		if (status != 0)
 			goto round_done;
 		sort_pid_list(before, before_count);
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (snapshot_sorted_checkpoint != NULL)
+			snapshot_sorted_checkpoint(1);
 		if (membership_checkpoint != NULL)
 			membership_checkpoint();
 #endif
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			goto round_done;
 		status = ledger_compact(ledger, before, before_count);
 		if (status != 0)
 			goto round_done;
@@ -1347,10 +1444,17 @@ static int acquire_runtime_closure(
 				goto round_done;
 		}
 		status = cgroup_read_pids(closure->directory_fd,
-			&after, &after_count);
+			&after, &after_count, pidfd_budget, deadline);
 		if (status != 0)
 			goto round_done;
 		sort_pid_list(after, after_count);
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (snapshot_sorted_checkpoint != NULL)
+			snapshot_sorted_checkpoint(2);
+#endif
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			goto round_done;
 		status = ledger_compact(ledger, after, after_count);
 		if (status != 0)
 			goto round_done;
@@ -1438,6 +1542,10 @@ static int signal_runtime_closure(pid_t init_process,
 
 static int monotonic_milliseconds(unsigned long long* milliseconds)
 {
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (test_monotonic_clock != NULL)
+		return test_monotonic_clock(milliseconds);
+#endif
 	struct timespec time;
 	if (clock_gettime(CLOCK_MONOTONIC, &time) != 0)
 		return -errno;

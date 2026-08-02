@@ -55,6 +55,13 @@ static int churn_command_fd = -1;
 static int churn_reply_fd = -1;
 static pid_t churn_latest_pid = -1;
 static int churn_checkpoint_failed;
+static unsigned long long test_monotonic_now;
+static size_t membership_read_count;
+static size_t membership_read_advance_at;
+static unsigned snapshot_sorted_count;
+static unsigned snapshot_sorted_advance_at;
+static int publish_swap_prefix_fd = -1;
+static int publish_swap_performed;
 
 extern DIR* __real_opendir(const char* path);
 
@@ -75,6 +82,61 @@ static void exit_at_pidfd_open(pid_t pid)
 	pidfd_exit_target = -1;
 	if (kill(pid, SIGKILL) == 0 && waitpid(pid, NULL, 0) == pid)
 		pidfd_exit_reaped = 1;
+}
+
+static int test_monotonic_clock(unsigned long long* milliseconds)
+{
+	*milliseconds = test_monotonic_now;
+	return 0;
+}
+
+static void observe_membership_read(size_t count)
+{
+	membership_read_count = count;
+	if (membership_read_advance_at != 0 &&
+		count >= membership_read_advance_at)
+		test_monotonic_now += 2;
+}
+
+static void observe_snapshot_sorted(unsigned ordinal)
+{
+	snapshot_sorted_count = ordinal;
+	if (snapshot_sorted_advance_at != 0 &&
+		ordinal >= snapshot_sorted_advance_at)
+		test_monotonic_now += 2;
+}
+
+static void replace_published_session_state(void)
+{
+	char content[8192];
+	int source = openat(publish_swap_prefix_fd,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME,
+		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (source < 0)
+		return;
+	ssize_t length = read(source, content, sizeof(content));
+	close(source);
+	if (length <= 0)
+		return;
+	const char* replacement = ".rootless-shutdown-session-v1.replacement";
+	(void)unlinkat(publish_swap_prefix_fd, replacement, 0);
+	int target = openat(publish_swap_prefix_fd, replacement,
+		O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (target < 0)
+		return;
+	int valid = fchmod(target, 0600) == 0 &&
+		write(target, content, (size_t)length) == length && fsync(target) == 0;
+	close(target);
+	if (!valid)
+		return;
+	if (unlinkat(publish_swap_prefix_fd,
+			ROOTLESS_SHUTDOWN_SESSION_STATE_NAME, 0) == 0 &&
+		renameat(publish_swap_prefix_fd, replacement,
+			publish_swap_prefix_fd,
+			ROOTLESS_SHUTDOWN_SESSION_STATE_NAME) == 0) {
+		(void)fsync(publish_swap_prefix_fd);
+		publish_swap_performed = 1;
+	}
 }
 
 static void late_fork_handler(int signal_number)
@@ -754,6 +816,122 @@ static int low_rlimit_case(
 	return rc == 0 && restore == 0 ? 0 : 3;
 }
 
+static int hostile_umask_cgroup_case(darling_runtime_prefix prefix)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	mode_t previous = umask(0777);
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	int saved_errno = errno;
+	umask(previous);
+	errno = saved_errno;
+	struct stat state = {0};
+	int mode_ok = rc == 0 && fstat(closure.directory_fd, &state) == 0 &&
+		(state.st_mode & 0777) == 0700;
+	if (rc == 0)
+		rc = rootless_shutdown_cleanup_empty_closure(&closure,
+			error, sizeof(error));
+	rootless_shutdown_release_closure(&closure);
+	if (!mode_ok || rc != 0) {
+		fprintf(stderr, "hostile umask cgroup contract failed rc=%d mode=%04o %s\n",
+			rc, (unsigned)(state.st_mode & 0777), error);
+		return 1;
+	}
+	return 0;
+}
+
+static int session_publication_swap_case(
+	const char* prefix_path, darling_runtime_prefix prefix)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	publish_swap_prefix_fd = prefix->directory_fd;
+	publish_swap_performed = 0;
+	rootless_shutdown_test_set_session_publish_checkpoint(
+		replace_published_session_state);
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	rootless_shutdown_test_set_session_publish_checkpoint(NULL);
+	publish_swap_prefix_fd = -1;
+	struct stat replacement = {0};
+	int replacement_survived = fstatat(prefix->directory_fd,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME, &replacement,
+		AT_SYMLINK_NOFOLLOW) == 0;
+	if (replacement_survived) {
+		(void)unlinkat(prefix->directory_fd,
+			ROOTLESS_SHUTDOWN_SESSION_STATE_NAME, 0);
+		(void)fsync(prefix->directory_fd);
+	}
+	rootless_shutdown_release_closure(&closure);
+	if (rc != -ESTALE || !publish_swap_performed || !replacement_survived) {
+		fprintf(stderr, "session publication swap contract failed rc=%d "
+			"swapped=%d survived=%d prefix=%s error=%s\n", rc,
+			publish_swap_performed, replacement_survived, prefix_path, error);
+		return 1;
+	}
+	return 0;
+}
+
+static int bounded_acquisition_case(
+	const char* prefix_path, darling_runtime_prefix prefix,
+	size_t pidfd_budget, size_t deadline_after_read,
+	unsigned deadline_after_sorted, size_t maximum_reads)
+{
+	if (prepare_endpoints(prefix_path, 0) != 0)
+		return 1;
+	struct session_fixture fixture = spawn_fixture(FIXTURE_GRACEFUL, prefix);
+	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
+		return 2;
+	test_monotonic_now = 1000;
+	membership_read_count = 0;
+	membership_read_advance_at = deadline_after_read;
+	snapshot_sorted_count = 0;
+	snapshot_sorted_advance_at = deadline_after_sorted;
+	rootless_shutdown_test_set_monotonic_clock(test_monotonic_clock);
+	rootless_shutdown_test_set_membership_read_checkpoint(
+		observe_membership_read);
+	rootless_shutdown_test_set_snapshot_sorted_checkpoint(
+		observe_snapshot_sorted);
+	const struct rootless_shutdown_policy policy = {
+		.acquisition_timeout_ms = 1,
+		.pidfd_budget = pidfd_budget,
+		.term_timeout_ms = 100,
+		.kill_timeout_ms = 100,
+		.poll_interval_ms = 1,
+	};
+	struct rootless_shutdown_result result;
+	char error[512] = {0};
+	int rc = shutdown_rootless_runtime(fixture.leader, fixture.init,
+		prefix, &policy, &result, error, sizeof(error));
+	rootless_shutdown_test_set_snapshot_sorted_checkpoint(NULL);
+	rootless_shutdown_test_set_membership_read_checkpoint(NULL);
+	rootless_shutdown_test_set_monotonic_clock(NULL);
+	membership_read_advance_at = 0;
+	snapshot_sorted_advance_at = 0;
+	int expected = pidfd_budget != 0 ? -EMFILE : -ETIMEDOUT;
+	int all_survived = kill(fixture.init, 0) == 0 &&
+		kill(fixture.leader, 0) == 0 && kill(fixture.worker, 0) == 0;
+	if (rc != expected || result.phase != ROOTLESS_SHUTDOWN_CLOSURE_BOUND ||
+		!all_survived || (maximum_reads != 0 &&
+		 membership_read_count > maximum_reads) ||
+		(deadline_after_sorted != 0 &&
+		 snapshot_sorted_count < deadline_after_sorted)) {
+		fprintf(stderr, "bounded acquisition contract failed budget=%zu rc=%d "
+			"phase=%d reads=%zu sorted=%u survived=%d error=%s\n",
+			pidfd_budget, rc, result.phase, membership_read_count,
+			snapshot_sorted_count, all_survived, error);
+		cleanup_fixture(&fixture);
+		return 3;
+	}
+	if (finish_fixture_after_failed_acquisition(
+			prefix_path, prefix, &fixture) != 0)
+		return 4;
+	return 0;
+}
+
 int main(void)
 {
 	char prefix_path[] = "/tmp/darling-rootless-shutdown.XXXXXX";
@@ -772,6 +950,16 @@ int main(void)
 		return 57;
 	if (missing_session_identity_case(prefix) != 0)
 		return 64;
+	if (hostile_umask_cgroup_case(prefix) != 0)
+		return 65;
+	if (session_publication_swap_case(prefix_path, prefix) != 0)
+		return 66;
+	if (bounded_acquisition_case(prefix_path, prefix, 2, 0, 0, 3) != 0)
+		return 67;
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 1, 0, 1) != 0)
+		return 68;
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 0, 2, 0) != 0)
+		return 69;
 
 	for (int cycle = 0; cycle < 3; ++cycle) {
 		int rc = run_shutdown_case(
