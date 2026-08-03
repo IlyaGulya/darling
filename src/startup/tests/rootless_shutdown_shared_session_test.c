@@ -86,13 +86,11 @@ int main(void)
 			for (;;)
 				pause();
 		}
-		pid_t root = fork();
+		pid_t root = rootless_shutdown_fork_runtime(&closure,
+			error, sizeof(error));
 		if (root < 0)
 			_exit(12);
 		if (root == 0) {
-			if (rootless_shutdown_enter_closure(&closure,
-					error, sizeof(error)) != 0)
-				_exit(15);
 			rootless_shutdown_release_closure(&closure);
 			pid_t worker = fork();
 			if (worker < 0)

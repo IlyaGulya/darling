@@ -25,6 +25,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <alloca.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -423,20 +424,6 @@ int main(int argc, char ** argv)
 		// TODO: when we have a working launchd,
 		// this is where we ask it to shut down nicely
 
-		char path_buf[128];
-		FILE* file;
-		pid_t launchd_pid;
-		snprintf(path_buf, sizeof(path_buf), "/proc/%d/task/%d/children", pidInit, pidInit);
-		file = fopen(path_buf, "r");
-		if (!file || fscanf(file, "%d", &launchd_pid) != 1) {
-			fprintf(stderr, "Failed to shutdown Darling container\n");
-			if (file) {
-				fclose(file);
-			}
-			return 1;
-		}
-		fclose(file);
-
 		if (rootless) {
 			int graceful_request = requestRootlessLaunchdShutdown(pidInit);
 			const struct rootless_shutdown_policy shutdown_policy = {
@@ -448,7 +435,7 @@ int main(int argc, char ** argv)
 			};
 			struct rootless_shutdown_result shutdown_state;
 			int shutdown_result = shutdown_rootless_runtime(
-				launchd_pid, pidInit, g_runtimePrefix, &shutdown_policy,
+				pidInit, pidInit, g_runtimePrefix, &shutdown_policy,
 				&shutdown_state, runtimeModeError,
 				sizeof(runtimeModeError));
 			if (graceful_request != 0) {
@@ -466,7 +453,30 @@ int main(int argc, char ** argv)
 						? strerror(-shutdown_result) : runtimeModeError);
 				return 1;
 			}
+			printf("ROOTLESS_SHUTDOWN backend=%s phase=%s "
+				"capability_device=%ju capability_inode=%ju "
+				"anchor_pid=%d anchor_start_time=%llu identities=%zu\n",
+				rootless_shutdown_backend_name(shutdown_state.backend),
+				rootless_shutdown_phase_name(shutdown_state.phase),
+				(uintmax_t)shutdown_state.capability_device,
+				(uintmax_t)shutdown_state.capability_inode,
+				(int)shutdown_state.anchor_pid,
+				shutdown_state.anchor_start_time,
+				shutdown_state.identities_observed);
 		} else {
+			char path_buf[128];
+			FILE* file;
+			pid_t launchd_pid;
+			snprintf(path_buf, sizeof(path_buf),
+				"/proc/%d/task/%d/children", pidInit, pidInit);
+			file = fopen(path_buf, "r");
+			if (!file || fscanf(file, "%d", &launchd_pid) != 1) {
+				fprintf(stderr, "Failed to shutdown Darling container\n");
+				if (file)
+					fclose(file);
+				return 1;
+			}
+			fclose(file);
 			kill(launchd_pid, SIGKILL);
 			kill(pidInit, SIGKILL);
 			removePrivilegedRuntimeStateFiles();
@@ -1283,7 +1293,10 @@ pid_t spawnInitProcess(void)
 		}
 	}
 
-	pid = fork();
+	pid = rootlessModeEnabled()
+		? rootless_shutdown_fork_runtime(&shutdown_closure,
+			error, sizeof(error))
+		: fork();
 
 	if (pid < 0)
 	{
@@ -1297,12 +1310,6 @@ pid_t spawnInitProcess(void)
 	if (pid == 0)
 	{
 		// The child
-		if (rootlessModeEnabled() && rootless_shutdown_enter_closure(
-				&shutdown_closure, error, sizeof(error)) != 0) {
-			fprintf(stderr,
-				"Cannot enter the rootless shutdown closure: %s\n", error);
-			_exit(1);
-		}
 		rootless_shutdown_release_closure(&shutdown_closure);
 
 		char uid_str[21];
@@ -1366,10 +1373,19 @@ pid_t spawnInitProcess(void)
 		fprintf(stderr,
 			"Darlingserver did not retain its rootless shutdown closure: %s\n",
 			error[0] == '\0' ? "startup handshake failed" : error);
-		kill(pid, SIGKILL);
-		(void)waitpid(pid, NULL, 0);
-		(void)rootless_shutdown_cleanup_empty_closure(
-			&shutdown_closure, NULL, 0);
+		rootless_shutdown_release_closure(&shutdown_closure);
+		const struct rootless_shutdown_policy abort_policy = {
+			.acquisition_timeout_ms = 1000,
+			.term_timeout_ms = 0,
+			.kill_timeout_ms = 5000,
+			.poll_interval_ms = 20,
+		};
+		struct rootless_shutdown_result abort_result;
+		if (shutdown_rootless_runtime(pid, pid, g_runtimePrefix,
+				&abort_policy, &abort_result, error, sizeof(error)) != 0)
+			fprintf(stderr,
+				"Cannot drain failed rootless startup at phase %s: %s\n",
+				rootless_shutdown_phase_name(abort_result.phase), error);
 		exit(1);
 	}
 	rootless_shutdown_release_closure(&shutdown_closure);

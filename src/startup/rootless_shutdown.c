@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/magic.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -13,8 +14,11 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/inotify.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,10 +28,26 @@ struct process_snapshot {
 	char state;
 };
 
+enum process_barrier_result {
+	PROCESS_BARRIER_UNKNOWN,
+	PROCESS_BARRIER_STOPPED,
+	PROCESS_BARRIER_GONE,
+};
+
+enum process_capture_result {
+	PROCESS_CAPTURE_GONE,
+	PROCESS_CAPTURE_INACTIVE,
+	PROCESS_CAPTURE_RETAINED,
+};
+
 struct process_identity {
 	pid_t pid;
 	unsigned long long start_time;
 	int pidfd;
+	int proc_directory_fd;
+	int stopped_by_us;
+	int termination_requested;
+	enum process_barrier_result barrier;
 };
 
 struct process_ledger {
@@ -38,19 +58,60 @@ struct process_ledger {
 };
 
 struct rootless_shutdown_session_state {
+	enum rootless_shutdown_backend backend;
 	dev_t prefix_device;
 	ino_t prefix_inode;
 	uid_t owner_uid;
 	dev_t cgroup_device;
 	ino_t cgroup_inode;
 	char cgroup_path[PATH_MAX];
+	dev_t proc_device;
+	ino_t proc_inode;
+	pid_t anchor_pid;
+	unsigned long long anchor_start_time;
 };
+
+static int process_snapshot_for_pid(pid_t pid,
+	struct process_snapshot* snapshot);
+static int process_snapshot_for_pid_at(int proc_fd, pid_t pid,
+	struct process_snapshot* snapshot);
+static int process_is_active(const struct process_snapshot* snapshot);
+static int process_pidfd_active(int pidfd, int* active);
+static int inspect_identity_barrier(struct process_identity* identity,
+	enum process_barrier_result* result);
+static void sleep_milliseconds(unsigned milliseconds);
+static int deadline_not_expired(unsigned long long deadline);
+static int ledger_capture_member(struct process_ledger* ledger, int proc_fd,
+	pid_t pid, size_t pidfd_budget, enum process_capture_result* result);
+static struct process_identity* ledger_find_pid(
+	struct process_ledger* ledger, pid_t pid);
+static int resume_stopped_identities(struct process_ledger* ledger);
+static void ledger_release(struct process_ledger* ledger);
+static int acquire_subreaper_closure(
+	const struct rootless_shutdown_closure_capability* closure,
+	struct process_ledger* ledger, size_t pidfd_budget,
+	unsigned long long deadline, unsigned retry_interval_ms);
+static int signal_subreaper_closure(pid_t init_process,
+	unsigned long long init_start_time,
+	const struct rootless_shutdown_closure_capability* closure,
+	struct process_ledger* ledger, int signal_number, size_t pidfd_budget,
+	unsigned long long deadline, unsigned retry_interval_ms,
+	unsigned* active);
 
 #ifndef DARLING_ROOTLESS_SHUTDOWN_TESTING
 enum rootless_shutdown_cgroup_create_phase {
 	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN = 1,
 	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE = 2,
 	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN = 3,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_EVENTS = 4,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MEMBERSHIP = 5,
+};
+
+enum rootless_shutdown_startup_phase {
+	ROOTLESS_SHUTDOWN_TEST_STARTUP_CONTROLLER_READY = 1,
+	ROOTLESS_SHUTDOWN_TEST_STARTUP_SESSION_PUBLISHED = 2,
+	ROOTLESS_SHUTDOWN_TEST_STARTUP_COMMAND_SENT = 3,
+	ROOTLESS_SHUTDOWN_TEST_STARTUP_RUNTIME_REPORTED = 4,
 };
 #endif
 
@@ -66,6 +127,8 @@ static const struct rootless_shutdown_policy default_policy = {
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
 static int pidfd_preflight_error;
 static int delegated_parent_lookup_error;
+static int delegated_parent_override_fd = -1;
+static char delegated_parent_override_path[PATH_MAX];
 static pid_t snapshot_replacement_pid = -1;
 static int snapshot_replacement_enabled;
 static void (*membership_checkpoint)(void);
@@ -81,6 +144,14 @@ static unsigned cgroup_create_error_phase;
 static int cgroup_create_error_number;
 static size_t prebind_event_budget_override;
 static void (*prebind_event_checkpoint)(size_t);
+static void (*startup_checkpoint)(unsigned);
+static unsigned startup_error_phase;
+static int startup_error_number;
+static int close_range_error;
+static void (*proc_barrier_checkpoint)(pid_t, int);
+static void (*proc_children_checkpoint)(pid_t);
+static enum rootless_shutdown_backend forced_backend;
+static int forced_backend_enabled;
 
 void rootless_shutdown_test_set_snapshot_replacement(pid_t pid, int enabled)
 {
@@ -96,6 +167,27 @@ void rootless_shutdown_test_set_pidfd_preflight_error(int error_number)
 void rootless_shutdown_test_set_parent_lookup_error(int error_number)
 {
 	delegated_parent_lookup_error = error_number;
+}
+
+void rootless_shutdown_test_set_delegated_parent_override(
+	int directory_fd, const char* path)
+{
+	delegated_parent_override_fd = directory_fd;
+	delegated_parent_override_path[0] = '\0';
+	if (path != NULL && strlen(path) < sizeof(delegated_parent_override_path))
+		strcpy(delegated_parent_override_path, path);
+}
+
+void rootless_shutdown_test_force_backend(enum rootless_shutdown_backend backend)
+{
+	forced_backend = backend;
+	forced_backend_enabled = 1;
+}
+
+void rootless_shutdown_test_clear_forced_backend(void)
+{
+	forced_backend = ROOTLESS_SHUTDOWN_BACKEND_UNSUPPORTED;
+	forced_backend_enabled = 0;
 }
 
 void rootless_shutdown_test_set_membership_checkpoint(void (*checkpoint)(void))
@@ -168,7 +260,50 @@ void rootless_shutdown_test_set_prebind_event_checkpoint(
 {
 	prebind_event_checkpoint = checkpoint;
 }
+
+void rootless_shutdown_test_set_startup_checkpoint(
+	void (*checkpoint)(unsigned))
+{
+	startup_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_startup_error(
+	unsigned phase, int error_number)
+{
+	startup_error_phase = phase;
+	startup_error_number = error_number;
+}
+
+void rootless_shutdown_test_set_close_range_error(int error_number)
+{
+	close_range_error = error_number;
+}
+
+void rootless_shutdown_test_set_proc_barrier_checkpoint(
+	void (*checkpoint)(pid_t, int))
+{
+	proc_barrier_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_proc_children_checkpoint(
+	void (*checkpoint)(pid_t))
+{
+	proc_children_checkpoint = checkpoint;
+}
 #endif
+
+const char* rootless_shutdown_backend_name(enum rootless_shutdown_backend backend)
+{
+	switch (backend) {
+	case ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED:
+		return "CGROUP_DELEGATED";
+	case ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER:
+		return "PIDFD_SUBREAPER";
+	case ROOTLESS_SHUTDOWN_BACKEND_UNSUPPORTED:
+		return "UNSUPPORTED";
+	}
+	return "UNSUPPORTED";
+}
 
 static int open_process_pidfd(pid_t pid)
 {
@@ -379,6 +514,17 @@ static int open_delegated_cgroup_parent(int* output_fd,
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
 	if (delegated_parent_lookup_error != 0)
 		return -delegated_parent_lookup_error;
+	if (delegated_parent_override_fd >= 0) {
+		if (delegated_parent_override_path[0] == '\0' ||
+			strlen(delegated_parent_override_path) + 1 > output_path_size)
+			return -EINVAL;
+		int duplicate = duplicate_cloexec(delegated_parent_override_fd);
+		if (duplicate < 0)
+			return duplicate;
+		*output_fd = duplicate;
+		strcpy(output_path, delegated_parent_override_path);
+		return 0;
+	}
 #endif
 	char path[PATH_MAX];
 	int status = cgroup_path_for_pid(0, path, sizeof(path));
@@ -446,6 +592,10 @@ void rootless_shutdown_release_closure(
 		return;
 	if (capability->state_fd >= 0)
 		close(capability->state_fd);
+	if (capability->anchor_pidfd >= 0)
+		close(capability->anchor_pidfd);
+	if (capability->proc_fd >= 0)
+		close(capability->proc_fd);
 	if (capability->membership_fd >= 0)
 		close(capability->membership_fd);
 	if (capability->directory_fd >= 0)
@@ -478,20 +628,30 @@ static int format_session_state(
 	char* content, size_t content_size)
 {
 	int length = snprintf(content, content_size,
-		"DARLING_ROOTLESS_SHUTDOWN_SESSION_V1\n"
-		"version=1\n"
+		"DARLING_ROOTLESS_SHUTDOWN_SESSION_V2\n"
+		"version=2\n"
+		"backend=%s\n"
 		"prefix_device=%" PRIuMAX "\n"
 		"prefix_inode=%" PRIuMAX "\n"
 		"owner_uid=%" PRIuMAX "\n"
 		"cgroup_device=%" PRIuMAX "\n"
 		"cgroup_inode=%" PRIuMAX "\n"
-		"cgroup_path=%s\n",
+		"cgroup_path=%s\n"
+		"proc_device=%" PRIuMAX "\n"
+		"proc_inode=%" PRIuMAX "\n"
+		"anchor_pid=%ju\n"
+		"anchor_start_time=%ju\n",
+		rootless_shutdown_backend_name(state->backend),
 		(uintmax_t)state->prefix_device,
 		(uintmax_t)state->prefix_inode,
 		(uintmax_t)state->owner_uid,
 		(uintmax_t)state->cgroup_device,
 		(uintmax_t)state->cgroup_inode,
-		state->cgroup_path);
+		state->cgroup_path[0] != '\0' ? state->cgroup_path : "-",
+		(uintmax_t)state->proc_device,
+		(uintmax_t)state->proc_inode,
+		(uintmax_t)state->anchor_pid,
+		(uintmax_t)state->anchor_start_time);
 	return length < 0 || (size_t)length >= content_size
 		? -EOVERFLOW : 0;
 }
@@ -533,7 +693,7 @@ static int validate_cgroup_path(const char* path)
 static int parse_session_state(char* content,
 	struct rootless_shutdown_session_state* state)
 {
-	char* lines[8] = {0};
+	char* lines[13] = {0};
 	size_t count = 0;
 	char* cursor = content;
 	while (*cursor != '\0') {
@@ -546,38 +706,100 @@ static int parse_session_state(char* content,
 		*newline = '\0';
 		cursor = newline + 1;
 	}
-	if (count != sizeof(lines) / sizeof(lines[0]) ||
-		strcmp(lines[0], "DARLING_ROOTLESS_SHUTDOWN_SESSION_V1") != 0 ||
-		strcmp(lines[1], "version=1") != 0)
+	if (count == 8 &&
+		strcmp(lines[0], "DARLING_ROOTLESS_SHUTDOWN_SESSION_V1") == 0 &&
+		strcmp(lines[1], "version=1") == 0) {
+		uintmax_t prefix_device, prefix_inode, owner_uid;
+		uintmax_t cgroup_device, cgroup_inode;
+		if (parse_uintmax_line(lines[2], "prefix_device=", &prefix_device) != 0 ||
+			parse_uintmax_line(lines[3], "prefix_inode=", &prefix_inode) != 0 ||
+			parse_uintmax_line(lines[4], "owner_uid=", &owner_uid) != 0 ||
+			parse_uintmax_line(lines[5], "cgroup_device=", &cgroup_device) != 0 ||
+			parse_uintmax_line(lines[6], "cgroup_inode=", &cgroup_inode) != 0 ||
+			strncmp(lines[7], "cgroup_path=", 12) != 0 || lines[7][12] == '\0' ||
+			prefix_device != (uintmax_t)(dev_t)prefix_device ||
+			prefix_inode != (uintmax_t)(ino_t)prefix_inode ||
+			owner_uid != (uintmax_t)(uid_t)owner_uid ||
+			cgroup_device != (uintmax_t)(dev_t)cgroup_device ||
+			cgroup_inode != (uintmax_t)(ino_t)cgroup_inode ||
+			strlen(lines[7] + 12) >= sizeof(state->cgroup_path) ||
+			validate_cgroup_path(lines[7] + 12) != 0)
+			return -EPROTO;
+		*state = (struct rootless_shutdown_session_state) {
+			.backend = ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED,
+			.prefix_device = (dev_t)prefix_device,
+			.prefix_inode = (ino_t)prefix_inode,
+			.owner_uid = (uid_t)owner_uid,
+			.cgroup_device = (dev_t)cgroup_device,
+			.cgroup_inode = (ino_t)cgroup_inode,
+		};
+		strcpy(state->cgroup_path, lines[7] + 12);
+		return 0;
+	}
+	if (count != 13 ||
+		strcmp(lines[0], "DARLING_ROOTLESS_SHUTDOWN_SESSION_V2") != 0 ||
+		strcmp(lines[1], "version=2") != 0 ||
+		strncmp(lines[2], "backend=", 8) != 0)
+		return -EPROTO;
+	enum rootless_shutdown_backend backend;
+	if (strcmp(lines[2] + 8, "CGROUP_DELEGATED") == 0)
+		backend = ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED;
+	else if (strcmp(lines[2] + 8, "PIDFD_SUBREAPER") == 0)
+		backend = ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER;
+	else
 		return -EPROTO;
 	uintmax_t prefix_device;
 	uintmax_t prefix_inode;
 	uintmax_t owner_uid;
 	uintmax_t cgroup_device;
 	uintmax_t cgroup_inode;
-	if (parse_uintmax_line(lines[2], "prefix_device=", &prefix_device) != 0 ||
-		parse_uintmax_line(lines[3], "prefix_inode=", &prefix_inode) != 0 ||
-		parse_uintmax_line(lines[4], "owner_uid=", &owner_uid) != 0 ||
-		parse_uintmax_line(lines[5], "cgroup_device=", &cgroup_device) != 0 ||
-		parse_uintmax_line(lines[6], "cgroup_inode=", &cgroup_inode) != 0 ||
-		strncmp(lines[7], "cgroup_path=", 12) != 0 ||
-		lines[7][12] == '\0' ||
+	uintmax_t proc_device;
+	uintmax_t proc_inode;
+	uintmax_t anchor_pid;
+	uintmax_t anchor_start_time;
+	if (parse_uintmax_line(lines[3], "prefix_device=", &prefix_device) != 0 ||
+		parse_uintmax_line(lines[4], "prefix_inode=", &prefix_inode) != 0 ||
+		parse_uintmax_line(lines[5], "owner_uid=", &owner_uid) != 0 ||
+		parse_uintmax_line(lines[6], "cgroup_device=", &cgroup_device) != 0 ||
+		parse_uintmax_line(lines[7], "cgroup_inode=", &cgroup_inode) != 0 ||
+		strncmp(lines[8], "cgroup_path=", 12) != 0 ||
+		parse_uintmax_line(lines[9], "proc_device=", &proc_device) != 0 ||
+		parse_uintmax_line(lines[10], "proc_inode=", &proc_inode) != 0 ||
+		parse_uintmax_line(lines[11], "anchor_pid=", &anchor_pid) != 0 ||
+		parse_uintmax_line(lines[12], "anchor_start_time=", &anchor_start_time) != 0 ||
 		prefix_device != (uintmax_t)(dev_t)prefix_device ||
 		prefix_inode != (uintmax_t)(ino_t)prefix_inode ||
 		owner_uid != (uintmax_t)(uid_t)owner_uid ||
 		cgroup_device != (uintmax_t)(dev_t)cgroup_device ||
 		cgroup_inode != (uintmax_t)(ino_t)cgroup_inode ||
-		strlen(lines[7] + 12) >= sizeof(state->cgroup_path) ||
-		validate_cgroup_path(lines[7] + 12) != 0)
+		proc_device != (uintmax_t)(dev_t)proc_device ||
+		proc_inode != (uintmax_t)(ino_t)proc_inode ||
+		anchor_pid != (uintmax_t)(pid_t)anchor_pid ||
+		strlen(lines[8] + 12) >= sizeof(state->cgroup_path))
 		return -EPROTO;
 	*state = (struct rootless_shutdown_session_state) {
+		.backend = backend,
 		.prefix_device = (dev_t)prefix_device,
 		.prefix_inode = (ino_t)prefix_inode,
 		.owner_uid = (uid_t)owner_uid,
 		.cgroup_device = (dev_t)cgroup_device,
 		.cgroup_inode = (ino_t)cgroup_inode,
+		.proc_device = (dev_t)proc_device,
+		.proc_inode = (ino_t)proc_inode,
+		.anchor_pid = (pid_t)anchor_pid,
+		.anchor_start_time = anchor_start_time,
 	};
-	strcpy(state->cgroup_path, lines[7] + 12);
+	if (strcmp(lines[8] + 12, "-") != 0)
+		strcpy(state->cgroup_path, lines[8] + 12);
+	if ((backend == ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED &&
+		(state->cgroup_path[0] == '\0' ||
+		 validate_cgroup_path(state->cgroup_path) != 0 ||
+		 state->cgroup_device == 0 || state->cgroup_inode == 0)) ||
+		(backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER &&
+		(state->proc_device == 0 || state->proc_inode == 0 ||
+		 state->anchor_pid <= 0 || state->anchor_start_time == 0 ||
+		 state->cgroup_path[0] != '\0')))
+		return -EPROTO;
 	return 0;
 }
 
@@ -727,8 +949,25 @@ static int load_session_state(const darling_runtime_prefix prefix,
 static int closure_named_identity(
 	const struct rootless_shutdown_closure_capability* capability)
 {
-	if (capability == NULL || capability->parent_fd < 0 ||
-		capability->directory_fd < 0 || capability->leaf[0] == '\0')
+	if (capability == NULL)
+		return -EINVAL;
+	if (capability->backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		if (capability->proc_fd < 0 || capability->anchor_pidfd < 0 ||
+			capability->anchor_pid <= 0 || capability->anchor_start_time == 0)
+			return -EINVAL;
+		struct stat proc;
+		if (fstat(capability->proc_fd, &proc) != 0)
+			return -errno;
+		if (!S_ISDIR(proc.st_mode) || proc.st_dev != capability->proc_device ||
+			proc.st_ino != capability->proc_inode)
+			return -ESTALE;
+		if (capability->state_fd >= 0)
+			return session_state_named_identity(capability);
+		return 0;
+	}
+	if (capability->backend != ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED ||
+		capability->parent_fd < 0 || capability->directory_fd < 0 ||
+		capability->leaf[0] == '\0')
 		return -EINVAL;
 	struct stat opened;
 	struct stat named;
@@ -805,6 +1044,7 @@ static int cgroup_prebind_watch_finish(struct cgroup_prebind_watch* watch,
 	int status = 0;
 	size_t event_count = 0;
 	size_t event_budget = CGROUP_PREBIND_EVENT_BUDGET;
+	int saw_ignored = 0;
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
 	if (prebind_event_budget_override != 0)
 		event_budget = prebind_event_budget_override;
@@ -820,7 +1060,6 @@ static int cgroup_prebind_watch_finish(struct cgroup_prebind_watch* watch,
 		goto out;
 	}
 	watch->watch = -1;
-	int saw_ignored = 0;
 	for (;;) {
 		status = monotonic_milliseconds(&now);
 		if (status != 0)
@@ -1024,7 +1263,106 @@ static int open_recorded_cgroup(
 	capability->cgroup_device = state->cgroup_device;
 	capability->cgroup_inode = state->cgroup_inode;
 	strcpy(capability->path, state->cgroup_path);
+	int identity_status = closure_named_identity(capability);
+	if (identity_status != 0)
+		return identity_status;
+	capability->proc_fd = open("/proc",
+		O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	return capability->proc_fd < 0 ? -errno : 0;
+}
+
+static int open_recorded_subreaper(
+	const struct rootless_shutdown_session_state* state,
+	struct rootless_shutdown_closure_capability* capability)
+{
+	capability->proc_fd = open("/proc",
+		O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (capability->proc_fd < 0)
+		return -errno;
+	struct statfs filesystem;
+	struct stat proc;
+	if (fstatfs(capability->proc_fd, &filesystem) != 0 ||
+		fstat(capability->proc_fd, &proc) != 0)
+		return -errno;
+	if ((unsigned long)filesystem.f_type != (unsigned long)PROC_SUPER_MAGIC ||
+		!S_ISDIR(proc.st_mode) || proc.st_dev != state->proc_device ||
+		proc.st_ino != state->proc_inode)
+		return -ESTALE;
+	struct process_snapshot snapshot;
+	int status = process_snapshot_for_pid_at(capability->proc_fd,
+		state->anchor_pid, &snapshot);
+	if (status != 0)
+		return status;
+	capability->anchor_pidfd = open_process_pidfd(state->anchor_pid);
+	if (capability->anchor_pidfd < 0)
+		return capability->anchor_pidfd;
+	struct process_snapshot verified;
+	status = process_snapshot_for_pid_at(capability->proc_fd,
+		state->anchor_pid, &verified);
+	if (status != 0 || snapshot.start_time != state->anchor_start_time ||
+		verified.start_time != state->anchor_start_time ||
+		!process_is_active(&verified))
+		return status != 0 ? status : -ESTALE;
+	capability->backend = ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER;
+	capability->proc_device = state->proc_device;
+	capability->proc_inode = state->proc_inode;
+	capability->anchor_pid = state->anchor_pid;
+	capability->anchor_start_time = state->anchor_start_time;
 	return closure_named_identity(capability);
+}
+
+static int prepare_subreaper_capability(
+	struct rootless_shutdown_closure_capability* capability)
+{
+	int subreaper = 0;
+	if (prctl(PR_GET_CHILD_SUBREAPER, &subreaper) != 0)
+		return -errno;
+	pid_t probe = fork();
+	if (probe < 0)
+		return -errno;
+	if (probe == 0)
+		_exit(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0 ? 0 : 125);
+	int probe_status = 0;
+	while (waitpid(probe, &probe_status, 0) < 0) {
+		if (errno != EINTR)
+			return -errno;
+	}
+	if (!WIFEXITED(probe_status) || WEXITSTATUS(probe_status) != 0)
+		return -EOPNOTSUPP;
+	if (capability->proc_fd < 0)
+		capability->proc_fd = open("/proc",
+			O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (capability->proc_fd < 0)
+		return -errno;
+	struct statfs filesystem;
+	struct stat identity;
+	if (fstatfs(capability->proc_fd, &filesystem) != 0 ||
+		fstat(capability->proc_fd, &identity) != 0)
+		return -errno;
+	if ((unsigned long)filesystem.f_type != (unsigned long)PROC_SUPER_MAGIC ||
+		!S_ISDIR(identity.st_mode))
+		return -EPROTONOSUPPORT;
+	capability->backend = ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER;
+	capability->proc_device = identity.st_dev;
+	capability->proc_inode = identity.st_ino;
+	return 0;
+}
+
+static int cgroup_fallback_error(int status)
+{
+	return status == -EACCES || status == -EPERM || status == -EROFS ||
+		status == -ENOENT || status == -ENOSYS ||
+		status == -EPROTONOSUPPORT;
+}
+
+static int cgroup_backend_is_forced(void)
+{
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	return forced_backend_enabled &&
+		forced_backend == ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED;
+#else
+	return 0;
+#endif
 }
 
 int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
@@ -1034,7 +1372,8 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	if (capability == NULL || prefix == NULL || prefix->directory_fd < 0 ||
 		capability->prefix_fd >= 0 || capability->parent_fd >= 0 ||
 		capability->directory_fd >= 0 || capability->membership_fd >= 0 ||
-		capability->state_fd >= 0)
+		capability->state_fd >= 0 || capability->proc_fd >= 0 ||
+		capability->anchor_pidfd >= 0)
 		return shutdown_error(error, error_size, EINVAL,
 			"rootless shutdown closure capability is already owned");
 	struct rootless_shutdown_closure_capability local =
@@ -1047,6 +1386,7 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	struct cgroup_prebind_watch prebind_watch =
 		CGROUP_PREBIND_WATCH_INITIALIZER;
 	int state_published = 0;
+	int cgroup_capability_complete = 0;
 	int status = rootless_shutdown_pidfd_preflight();
 	if (status != 0)
 		goto fail;
@@ -1055,14 +1395,48 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		status = local.prefix_fd;
 		goto fail;
 	}
+	local.proc_fd = open("/proc",
+		O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (local.proc_fd < 0) {
+		status = -errno;
+		goto fail;
+	}
+	#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (forced_backend_enabled &&
+		forced_backend == ROOTLESS_SHUTDOWN_BACKEND_UNSUPPORTED) {
+		status = -EOPNOTSUPP;
+		goto fail;
+	}
+	if (forced_backend_enabled &&
+		forced_backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		status = prepare_subreaper_capability(&local);
+		if (status != 0)
+			goto fail;
+		*capability = local;
+		if (error != NULL && error_size != 0)
+			error[0] = '\0';
+		return 0;
+	}
+	#endif
 	status = cgroup_leaf_for_prefix(prefix, local.leaf, sizeof(local.leaf));
 	if (status != 0)
 		goto fail;
 	char parent_path[PATH_MAX];
 	status = open_delegated_cgroup_parent(&local.parent_fd,
 		parent_path, sizeof(parent_path));
+	if (status != 0 && cgroup_fallback_error(status) &&
+		!cgroup_backend_is_forced()) {
+		status = prepare_subreaper_capability(&local);
+		if (status != 0)
+			goto fail;
+		*capability = local;
+		if (error != NULL && error_size != 0)
+			error[0] = '\0';
+		return 0;
+	}
 	if (status != 0)
 		goto fail;
+	local.backend = ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED;
 	/* Reserve one descriptor before mutation. If the first O_PATH acquisition
 	 * hits the descriptor limit, releasing this reserve makes the recovery
 	 * acquisition deterministic instead of leaving an unbound directory. */
@@ -1076,6 +1450,22 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		goto fail;
 	if (mkdirat(local.parent_fd, local.leaf, 0700) != 0) {
 		status = -errno;
+		if (cgroup_fallback_error(status) &&
+			!cgroup_backend_is_forced()) {
+			cgroup_prebind_watch_release(&prebind_watch);
+			close(prebind_reserve_fd);
+			prebind_reserve_fd = -1;
+			close(local.parent_fd);
+			local.parent_fd = -1;
+			local.leaf[0] = '\0';
+			status = prepare_subreaper_capability(&local);
+			if (status != 0)
+				goto fail;
+			*capability = local;
+			if (error != NULL && error_size != 0)
+				error[0] = '\0';
+			return 0;
+		}
 		goto fail;
 	}
 	created = 1;
@@ -1167,6 +1557,11 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		status = -errno;
 		goto fail;
 	}
+	status = cgroup_create_checkpoint_status(
+		ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_EVENTS,
+		local.parent_fd, local.leaf);
+	if (status != 0)
+		goto fail;
 	int populated = 0;
 	status = cgroup_populated_fd(local.directory_fd, &populated);
 	if (status != 0)
@@ -1197,6 +1592,11 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	}
 	local.cgroup_device = cgroup_identity.st_dev;
 	local.cgroup_inode = cgroup_identity.st_ino;
+	status = cgroup_create_checkpoint_status(
+		ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MEMBERSHIP,
+		local.parent_fd, local.leaf);
+	if (status != 0)
+		goto fail;
 	local.membership_fd = openat(local.directory_fd, "cgroup.procs",
 		O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
 	if (local.membership_fd < 0) {
@@ -1206,7 +1606,9 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	status = closure_named_identity(&local);
 	if (status != 0)
 		goto fail;
+	cgroup_capability_complete = 1;
 	struct rootless_shutdown_session_state state = {
+		.backend = ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED,
 		.prefix_device = prefix_identity.st_dev,
 		.prefix_inode = prefix_identity.st_ino,
 		.owner_uid = prefix_identity.st_uid,
@@ -1225,6 +1627,13 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		error[0] = '\0';
 	return 0;
 fail:
+	{
+		int original_status = status;
+		int fallback = created && !state_published &&
+			!cgroup_capability_complete &&
+			cgroup_fallback_error(original_status) &&
+			!cgroup_backend_is_forced();
+		int cleanup_status = 0;
 	cgroup_prebind_watch_release(&prebind_watch);
 	if (prebind_reserve_fd >= 0)
 		close(prebind_reserve_fd);
@@ -1236,28 +1645,427 @@ fail:
 		if (cleanup_fd >= 0 && created_identity_valid &&
 			named_directory_matches_fd(local.parent_fd, local.leaf,
 				cleanup_fd, &created_identity) == 0) {
-			int populated = 0;
-			if (local.directory_fd >= 0 &&
-				cgroup_populated_fd(local.directory_fd, &populated) != 0)
-				populated = 1;
-			if (!populated)
-				(void)remove_created_cgroup_if_owned(local.parent_fd,
-					local.leaf, cleanup_fd,
-					created_identity_valid ? &created_identity : NULL);
-		}
+			cleanup_status = remove_created_cgroup_if_owned(local.parent_fd,
+				local.leaf, cleanup_fd, &created_identity);
+		} else
+			cleanup_status = -ESTALE;
 	}
 	if (created_path_fd >= 0)
 		close(created_path_fd);
 	rootless_shutdown_release_closure(&local);
+	if (fallback && cleanup_status == 0) {
+		local = (struct rootless_shutdown_closure_capability)
+			ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+		local.prefix_fd = duplicate_cloexec(prefix->directory_fd);
+		if (local.prefix_fd >= 0)
+			status = prepare_subreaper_capability(&local);
+		else
+			status = local.prefix_fd;
+		if (status == 0) {
+			*capability = local;
+			if (error != NULL && error_size != 0)
+				error[0] = '\0';
+			return 0;
+		}
+		rootless_shutdown_release_closure(&local);
+	} else if (fallback && cleanup_status != 0)
+		status = cleanup_status;
+	else
+		status = original_status;
 	return shutdown_error(error, error_size, -status,
-		"cannot prepare rootless shutdown cgroup: %s", strerror(-status));
+		"cannot prepare rootless shutdown backend: %s", strerror(-status));
+	}
+}
+
+struct subreaper_start_message {
+	int status;
+	pid_t runtime_pid;
+};
+
+static int read_exact(int fd, void* output, size_t size)
+{
+	char* cursor = output;
+	while (size != 0) {
+		ssize_t received = read(fd, cursor, size);
+		if (received < 0 && errno == EINTR)
+			continue;
+		if (received <= 0)
+			return received < 0 ? -errno : -EPIPE;
+		cursor += received;
+		size -= (size_t)received;
+	}
+	return 0;
+}
+
+static int write_exact(int fd, const void* input, size_t size)
+{
+	const char* cursor = input;
+	while (size != 0) {
+		ssize_t written = write(fd, cursor, size);
+		if (written < 0 && errno == EINTR)
+			continue;
+		if (written <= 0)
+			return written < 0 ? -errno : -EPIPE;
+		cursor += written;
+		size -= (size_t)written;
+	}
+	return 0;
+}
+
+static void controller_close_descriptors(void)
+{
+#ifdef SYS_close_range
+	int close_range_status;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (close_range_error != 0) {
+		errno = close_range_error;
+		close_range_status = -1;
+	} else
+#endif
+		close_range_status = (int)syscall(
+			SYS_close_range, 3U, ~0U, 0U);
+	if (close_range_status == 0)
+		return;
+#endif
+	long maximum = sysconf(_SC_OPEN_MAX);
+	if (maximum < 0 || maximum > 1048576)
+		maximum = 65536;
+	for (int fd = 3; fd < maximum; ++fd)
+		close(fd);
+}
+
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+void rootless_shutdown_test_close_controller_descriptors(void)
+{
+	controller_close_descriptors();
+}
+#endif
+
+static void subreaper_controller_loop(void)
+{
+	for (;;) {
+		int status;
+		pid_t child = waitpid(-1, &status, 0);
+		if (child > 0)
+			continue;
+		if (child < 0 && errno == EINTR)
+			continue;
+		if (child < 0 && errno == ECHILD) {
+			/* The anchor is the closure authority, not a transient reaper.
+			 * It stays alive even when temporarily childless so shutdown can
+			 * prove an empty anchored tree before terminating it last. */
+			pause();
+			continue;
+		}
+		_exit(125);
+	}
+}
+
+static int publish_subreaper_session(
+	struct rootless_shutdown_closure_capability* capability, pid_t controller)
+{
+	struct process_snapshot before;
+	int status = process_snapshot_for_pid_at(capability->proc_fd,
+		controller, &before);
+	if (status != 0)
+		return status;
+	int pidfd = open_process_pidfd(controller);
+	if (pidfd < 0)
+		return pidfd;
+	struct process_snapshot after;
+	status = process_snapshot_for_pid_at(capability->proc_fd,
+		controller, &after);
+	if (status != 0 || before.start_time != after.start_time ||
+		!process_is_active(&after)) {
+		close(pidfd);
+		return status != 0 ? status : -ESTALE;
+	}
+	struct stat prefix;
+	if (fstat(capability->prefix_fd, &prefix) != 0) {
+		status = -errno;
+		close(pidfd);
+		return status;
+	}
+	capability->anchor_pid = controller;
+	capability->anchor_start_time = after.start_time;
+	capability->anchor_pidfd = pidfd;
+	struct rootless_shutdown_session_state state = {
+		.backend = ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER,
+		.prefix_device = prefix.st_dev,
+		.prefix_inode = prefix.st_ino,
+		.owner_uid = prefix.st_uid,
+		.proc_device = capability->proc_device,
+		.proc_inode = capability->proc_inode,
+		.anchor_pid = controller,
+		.anchor_start_time = after.start_time,
+	};
+	darling_runtime_prefix retained = DARLING_RUNTIME_PREFIX_INITIALIZER;
+	retained->directory_fd = capability->prefix_fd;
+	status = publish_session_state(retained, capability, &state);
+	retained->directory_fd = -1;
+	return status;
+}
+
+static int startup_checkpoint_status(unsigned phase)
+{
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (startup_checkpoint != NULL)
+		startup_checkpoint(phase);
+	if (startup_error_phase == phase && startup_error_number != 0)
+		return -startup_error_number;
+#else
+	(void)phase;
+#endif
+	sigset_t pending;
+	if (sigpending(&pending) != 0)
+		return -errno;
+	return sigismember(&pending, SIGINT) || sigismember(&pending, SIGTERM)
+		? -EINTR : 0;
+}
+
+static int wait_controller_reaped(pid_t controller,
+	unsigned long long deadline, unsigned retry_interval_ms)
+{
+	for (;;) {
+		int wait_status = 0;
+		pid_t waited = waitpid(controller, &wait_status, WNOHANG);
+		if (waited == controller || (waited < 0 && errno == ECHILD))
+			return 0;
+		if (waited < 0 && errno != EINTR)
+			return -errno;
+		int status = deadline_not_expired(deadline);
+		if (status != 0)
+			return status;
+		sleep_milliseconds(retry_interval_ms);
+	}
+}
+
+static int rollback_subreaper_startup(
+	struct rootless_shutdown_closure_capability* capability,
+	pid_t controller, int state_published, int runtime_possible)
+{
+	unsigned long long now = 0;
+	int status = monotonic_milliseconds(&now);
+	if (status != 0)
+		return status;
+	const unsigned long long deadline = now +
+		default_policy.kill_timeout_ms;
+	if (capability->anchor_pidfd < 0) {
+		capability->anchor_pidfd = open_process_pidfd(controller);
+		if (capability->anchor_pidfd < 0 &&
+			capability->anchor_pidfd != -ENOENT &&
+			capability->anchor_pidfd != -ESRCH)
+			return capability->anchor_pidfd;
+	}
+	struct process_ledger ledger = {0};
+	if (state_published && runtime_possible) {
+		size_t budget = 0;
+		status = derive_pidfd_budget(&default_policy, &budget);
+		while (status == 0) {
+			unsigned active = 0;
+			status = signal_subreaper_closure(0, 0, capability,
+				&ledger, SIGKILL, budget, deadline,
+				default_policy.poll_interval_ms, &active);
+			if (status != 0 || active == 0)
+				break;
+			status = deadline_not_expired(deadline);
+			if (status == 0)
+				sleep_milliseconds(default_policy.poll_interval_ms);
+		}
+	} else if (capability->anchor_pidfd >= 0) {
+		status = signal_process_pidfd(capability->anchor_pidfd, SIGKILL);
+		if (status == -ESRCH)
+			status = 0;
+	}
+	if (status == 0)
+		status = wait_controller_reaped(controller, deadline,
+			default_policy.poll_interval_ms);
+	if (status == 0 && state_published)
+		status = remove_owned_session_state(capability);
+	ledger_release(&ledger);
+	return status;
+}
+
+pid_t rootless_shutdown_fork_runtime(
+	struct rootless_shutdown_closure_capability* capability,
+	char* error, size_t error_size)
+{
+	if (capability == NULL)
+		return shutdown_error(error, error_size, EINVAL,
+			"rootless shutdown backend capability is missing");
+	switch (capability->backend) {
+	case ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED: {
+		pid_t child = fork();
+		if (child < 0)
+			return shutdown_error(error, error_size, errno,
+				"cannot fork rootless runtime: %s", strerror(errno));
+		if (child == 0 && rootless_shutdown_enter_closure(
+				capability, error, error_size) != 0)
+			_exit(126);
+		return child;
+	}
+	case ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER: {
+		int ready[2] = {-1, -1};
+		int command[2] = {-1, -1};
+		int runtime[2] = {-1, -1};
+		sigset_t blocked_signals;
+		sigset_t previous_signals;
+		sigemptyset(&blocked_signals);
+		sigaddset(&blocked_signals, SIGINT);
+		sigaddset(&blocked_signals, SIGTERM);
+		if (sigprocmask(SIG_BLOCK, &blocked_signals, &previous_signals) != 0)
+			return shutdown_error(error, error_size, errno,
+				"cannot block startup transaction signals: %s",
+				strerror(errno));
+		if (pipe2(ready, O_CLOEXEC) != 0 || pipe2(command, O_CLOEXEC) != 0 ||
+			pipe2(runtime, O_CLOEXEC) != 0) {
+			int saved = errno;
+			for (size_t index = 0; index < 2; ++index) {
+				if (ready[index] >= 0) close(ready[index]);
+				if (command[index] >= 0) close(command[index]);
+				if (runtime[index] >= 0) close(runtime[index]);
+			}
+			(void)sigprocmask(SIG_SETMASK, &previous_signals, NULL);
+			return shutdown_error(error, error_size, saved,
+				"cannot create subreaper control pipes: %s", strerror(saved));
+		}
+		pid_t controller = fork();
+		if (controller < 0) {
+			int saved = errno;
+			close(ready[0]); close(ready[1]);
+			close(command[0]); close(command[1]);
+			close(runtime[0]); close(runtime[1]);
+			(void)sigprocmask(SIG_SETMASK, &previous_signals, NULL);
+			return shutdown_error(error, error_size, saved,
+				"cannot fork subreaper controller: %s", strerror(saved));
+		}
+		if (controller == 0) {
+			close(ready[0]); close(command[1]); close(runtime[0]);
+			struct subreaper_start_message message = {0};
+			if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0)
+				message.status = -errno;
+			(void)write_exact(ready[1], &message, sizeof(message));
+			close(ready[1]);
+			char go = 0;
+			if (message.status != 0 ||
+				read_exact(command[0], &go, sizeof(go)) != 0 || go != 1)
+				_exit(124);
+			close(command[0]);
+			pid_t child = fork();
+			if (child < 0) {
+				message.status = -errno;
+				(void)write_exact(runtime[1], &message, sizeof(message));
+				_exit(123);
+			}
+			if (child == 0) {
+				close(runtime[1]);
+				if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0)
+					_exit(126);
+				return 0;
+			}
+			message.runtime_pid = child;
+			(void)write_exact(runtime[1], &message, sizeof(message));
+			close(runtime[1]);
+			rootless_shutdown_release_closure(capability);
+			controller_close_descriptors();
+			if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0)
+				_exit(126);
+			subreaper_controller_loop();
+		}
+		close(ready[1]); close(command[0]); close(runtime[1]);
+		struct subreaper_start_message message = {0};
+		int state_published = 0;
+		int runtime_possible = 0;
+		int status = read_exact(ready[0], &message, sizeof(message));
+		close(ready[0]);
+		if (status == 0)
+			status = message.status;
+		if (status == 0)
+			status = startup_checkpoint_status(
+				ROOTLESS_SHUTDOWN_TEST_STARTUP_CONTROLLER_READY);
+		if (status == 0) {
+			status = publish_subreaper_session(capability, controller);
+			state_published = status == 0;
+		}
+		if (status == 0)
+			status = startup_checkpoint_status(
+				ROOTLESS_SHUTDOWN_TEST_STARTUP_SESSION_PUBLISHED);
+		char go = status == 0 ? 1 : 0;
+		int command_status = write_exact(command[1], &go, sizeof(go));
+		if (command_status != 0 && status == 0)
+			status = -EPIPE;
+		else if (command_status == 0 && go == 1)
+			runtime_possible = 1;
+		close(command[1]);
+		if (status == 0)
+			status = startup_checkpoint_status(
+				ROOTLESS_SHUTDOWN_TEST_STARTUP_COMMAND_SENT);
+		if (status == 0) {
+			status = read_exact(runtime[0], &message, sizeof(message));
+			if (status == 0)
+				status = message.status;
+		} else if (runtime_possible) {
+			/* Keep the controller's report channel alive until it has either
+			 * published the runtime child or reported the fork failure. Closing
+			 * it here would let SIGPIPE kill the subreaper before rollback can
+			 * traverse the newly orphaned child. */
+			struct subreaper_start_message rollback_message = {0};
+			int report_status = read_exact(runtime[0], &rollback_message,
+				sizeof(rollback_message));
+			if (report_status != 0)
+				status = report_status;
+			else if (rollback_message.status != 0)
+				status = rollback_message.status;
+		}
+		if (status == 0)
+			status = startup_checkpoint_status(
+				ROOTLESS_SHUTDOWN_TEST_STARTUP_RUNTIME_REPORTED);
+		close(runtime[0]);
+		if (status != 0) {
+			int startup_status = status;
+			int rollback_status = rollback_subreaper_startup(
+				capability, controller, state_published, runtime_possible);
+			(void)sigprocmask(SIG_SETMASK, &previous_signals, NULL);
+			if (rollback_status != 0)
+				return shutdown_error(error, error_size, -rollback_status,
+					"cannot roll back pidfd subreaper startup: %s",
+					strerror(-rollback_status));
+			return shutdown_error(error, error_size, -startup_status,
+				"cannot start pidfd subreaper runtime: %s",
+				strerror(-startup_status));
+		}
+		if (sigprocmask(SIG_SETMASK, &previous_signals, NULL) != 0) {
+			status = -errno;
+			int rollback_status = rollback_subreaper_startup(
+				capability, controller, state_published, 1);
+			return shutdown_error(error, error_size,
+				rollback_status != 0 ? -rollback_status : -status,
+				"cannot restore startup transaction signal mask: %s",
+				strerror(rollback_status != 0 ? -rollback_status : -status));
+		}
+		return message.runtime_pid;
+	}
+	case ROOTLESS_SHUTDOWN_BACKEND_UNSUPPORTED:
+		return shutdown_error(error, error_size, EOPNOTSUPP,
+			"rootless shutdown is unsupported by this kernel environment");
+	}
+	return shutdown_error(error, error_size, EOPNOTSUPP,
+		"rootless shutdown backend is invalid");
 }
 
 int rootless_shutdown_enter_closure(
 	const struct rootless_shutdown_closure_capability* capability,
 	char* error, size_t error_size)
 {
-	if (capability == NULL || capability->membership_fd < 0)
+	if (capability != NULL &&
+		capability->backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		if (error != NULL && error_size != 0)
+			error[0] = '\0';
+		return 0;
+	}
+	if (capability == NULL ||
+		capability->backend != ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED ||
+		capability->membership_fd < 0)
 		return shutdown_error(error, error_size, EINVAL,
 			"rootless shutdown closure membership capability is invalid");
 	char pid[32];
@@ -1370,11 +2178,158 @@ static int cgroup_read_pids(int directory_fd, pid_t** output, size_t* count,
 	return status;
 }
 
+static int append_unique_pid(pid_t** pids, size_t* count, size_t* capacity,
+	pid_t pid, size_t budget)
+{
+	for (size_t index = 0; index < *count; ++index) {
+		if ((*pids)[index] == pid)
+			return 0;
+	}
+	if (*count >= budget)
+		return -EMFILE;
+	if (*count == *capacity) {
+		size_t grown = *capacity == 0 ? 16 : *capacity * 2;
+		if (grown < *capacity || grown > budget)
+			grown = budget;
+		if (grown <= *capacity || grown > SIZE_MAX / sizeof(**pids))
+			return -EMFILE;
+		pid_t* replacement = realloc(*pids, grown * sizeof(**pids));
+		if (replacement == NULL)
+			return -ENOMEM;
+		*pids = replacement;
+		*capacity = grown;
+	}
+	(*pids)[(*count)++] = pid;
+	return 0;
+}
+
+/* Read only the retained anchor's descendant edges. No global /proc walk is
+ * permitted: every path starts at a previously identity-bound PID and visits
+ * that process's thread children files. */
+static int proc_read_task_children(struct process_identity* parent,
+	pid_t** children, size_t* child_count, size_t* child_capacity,
+	size_t budget, unsigned long long deadline)
+{
+	if (parent == NULL || parent->proc_directory_fd < 0)
+		return -EINVAL;
+	if (parent->barrier == PROCESS_BARRIER_GONE)
+		return 0;
+	if (parent->barrier != PROCESS_BARRIER_STOPPED)
+		return -EAGAIN;
+	enum process_barrier_result verified = PROCESS_BARRIER_UNKNOWN;
+	int status = inspect_identity_barrier(parent, &verified);
+	if (status != 0)
+		return status;
+	parent->barrier = verified;
+	if (verified == PROCESS_BARRIER_GONE)
+		return 0;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (proc_children_checkpoint != NULL)
+		proc_children_checkpoint(parent->pid);
+#endif
+	int task_fd = openat(parent->proc_directory_fd, "task",
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (task_fd < 0) {
+		if (errno != ENOENT)
+			return -errno;
+		status = inspect_identity_barrier(parent, &verified);
+		if (status == 0 && verified == PROCESS_BARRIER_GONE) {
+			parent->barrier = verified;
+			return 0;
+		}
+		return status != 0 ? status : -EAGAIN;
+	}
+	DIR* tasks = fdopendir(task_fd);
+	if (tasks == NULL) {
+		int status = -errno;
+		close(task_fd);
+		return status;
+	}
+	status = 0;
+	for (;;) {
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			break;
+		errno = 0;
+		struct dirent* task = readdir(tasks);
+		if (task == NULL) {
+			status = errno == 0 ? 0 : -errno;
+			break;
+		}
+		char* end = NULL;
+		errno = 0;
+		long tid = strtol(task->d_name, &end, 10);
+		if (errno != 0 || *task->d_name == '\0' || *end != '\0' ||
+			tid <= 0 || (pid_t)tid != tid)
+			continue;
+		char relative[96];
+		int length = snprintf(relative, sizeof(relative), "%s/children",
+			task->d_name);
+		if (length < 0 || (size_t)length >= sizeof(relative)) {
+			status = -EOVERFLOW;
+			break;
+		}
+		int child_fd = openat(dirfd(tasks), relative,
+			O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+		if (child_fd < 0) {
+			if (errno == ENOENT)
+				continue;
+			status = -errno;
+			break;
+		}
+		FILE* stream = fdopen(child_fd, "r");
+		if (stream == NULL) {
+			status = -errno;
+			close(child_fd);
+			break;
+		}
+		for (;;) {
+			status = deadline_not_expired(deadline);
+			if (status != 0)
+				break;
+			long child;
+			int scanned = fscanf(stream, "%ld", &child);
+			if (scanned == EOF) {
+				status = ferror(stream) ? -EIO : 0;
+				break;
+			}
+			if (scanned != 1 || child <= 0 || (pid_t)child != child) {
+				status = -EPROTO;
+				break;
+			}
+			status = append_unique_pid(children, child_count,
+				child_capacity, (pid_t)child, budget);
+			if (status != 0)
+				break;
+		}
+		fclose(stream);
+		if (status != 0)
+			break;
+	}
+	closedir(tasks);
+	return status;
+}
+
+static int subreaper_contains(
+	const struct rootless_shutdown_closure_capability* capability,
+	pid_t wanted, size_t budget, unsigned long long deadline)
+{
+	struct process_ledger ledger = {0};
+	int status = acquire_subreaper_closure(capability, &ledger,
+		budget, deadline, default_policy.poll_interval_ms);
+	int found = status == 0 && ledger_find_pid(&ledger, wanted) != NULL;
+	int resume_status = resume_stopped_identities(&ledger);
+	ledger_release(&ledger);
+	if (status != 0)
+		return status;
+	return resume_status != 0 ? resume_status : found;
+}
+
 int rootless_shutdown_closure_contains(
 	const struct rootless_shutdown_closure_capability* capability, pid_t pid,
 	char* error, size_t error_size)
 {
-	if (capability == NULL || capability->directory_fd < 0 || pid <= 0)
+	if (capability == NULL || pid <= 0)
 		return shutdown_error(error, error_size, EINVAL,
 			"rootless shutdown closure lookup is invalid");
 	int identity_status = closure_named_identity(capability);
@@ -1388,12 +2343,23 @@ int rootless_shutdown_closure_contains(
 	unsigned long long now = 0;
 	if (status == 0)
 		status = monotonic_milliseconds(&now);
-	if (status == 0)
+	if (status == 0 &&
+		capability->backend == ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED)
 		status = cgroup_read_pids(capability->directory_fd, &members, &count,
 			budget, now + default_policy.acquisition_timeout_ms);
+	else if (status == 0 &&
+		capability->backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		status = subreaper_contains(capability, pid, budget,
+			now + default_policy.acquisition_timeout_ms);
+		if (status > 0) {
+			if (error != NULL && error_size != 0)
+				error[0] = '\0';
+			return 0;
+		}
+	}
 	if (status != 0)
 		return shutdown_error(error, error_size, -status,
-			"cannot read rootless shutdown cgroup: %s", strerror(-status));
+			"cannot read rootless shutdown backend: %s", strerror(-status));
 	int found = 0;
 	for (size_t index = 0; index < count; ++index)
 		found |= members[index] == pid;
@@ -1410,14 +2376,35 @@ int rootless_shutdown_cleanup_empty_closure(
 	struct rootless_shutdown_closure_capability* capability,
 	char* error, size_t error_size)
 {
-	if (capability == NULL || capability->parent_fd < 0 ||
-		capability->directory_fd < 0 || capability->leaf[0] == '\0')
+	if (capability == NULL)
 		return shutdown_error(error, error_size, EINVAL,
 			"rootless shutdown closure capability is invalid");
 	int status = closure_named_identity(capability);
 	if (status != 0)
 		return shutdown_error(error, error_size, -status,
-			"rootless shutdown cgroup identity changed");
+			"rootless shutdown backend identity changed");
+	if (capability->backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		int active = 0;
+		status = process_pidfd_active(capability->anchor_pidfd, &active);
+		if (status != 0 || active)
+			return shutdown_error(error, error_size,
+				status != 0 ? -status : EBUSY,
+				"rootless shutdown subreaper is not empty");
+		status = remove_owned_session_state(capability);
+		if (status != 0)
+			return shutdown_error(error, error_size, -status,
+				"cannot remove rootless shutdown session identity: %s",
+				strerror(-status));
+		rootless_shutdown_release_closure(capability);
+		if (error != NULL && error_size != 0)
+			error[0] = '\0';
+		return 0;
+	}
+	if (capability->backend != ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED ||
+		capability->parent_fd < 0 || capability->directory_fd < 0 ||
+		capability->leaf[0] == '\0')
+		return shutdown_error(error, error_size, EINVAL,
+			"rootless shutdown cgroup capability is invalid");
 	int populated = 1;
 	status = cgroup_populated_fd(capability->directory_fd, &populated);
 	if (status != 0 || populated)
@@ -1446,11 +2433,10 @@ int rootless_shutdown_cleanup_empty_closure(
 	return 0;
 }
 
-static int process_snapshot_for_pid(pid_t pid, struct process_snapshot* snapshot)
+static int process_snapshot_from_stat_fd(int fd,
+	struct process_snapshot* snapshot)
 {
-	char path[64];
 	char stat_line[4096];
-	int fd;
 	ssize_t length;
 	char* fields;
 	char* save = NULL;
@@ -1459,17 +2445,11 @@ static int process_snapshot_for_pid(pid_t pid, struct process_snapshot* snapshot
 	int found_session = 0;
 	int found_start_time = 0;
 
-	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-	fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
+	if (lseek(fd, 0, SEEK_SET) < 0)
 		return -errno;
 	length = read(fd, stat_line, sizeof(stat_line) - 1);
-	int saved_errno = errno;
-	close(fd);
 	if (length <= 0) {
-		if (length == 0)
-			saved_errno = EIO;
-		return -saved_errno;
+		return length == 0 ? -EIO : -errno;
 	}
 	stat_line[length] = '\0';
 	fields = strrchr(stat_line, ')');
@@ -1502,6 +2482,45 @@ static int process_snapshot_for_pid(pid_t pid, struct process_snapshot* snapshot
 		}
 	}
 	return found_session && found_start_time ? 0 : -EINVAL;
+}
+
+static int process_snapshot_for_directory_fd(int process_fd,
+	struct process_snapshot* snapshot)
+{
+	int stat_fd = openat(process_fd, "stat",
+		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (stat_fd < 0)
+		return -errno;
+	int status = process_snapshot_from_stat_fd(stat_fd, snapshot);
+	int saved_errno = errno;
+	close(stat_fd);
+	errno = saved_errno;
+	return status;
+}
+
+static int process_snapshot_for_pid_at(int proc_fd, pid_t pid,
+	struct process_snapshot* snapshot)
+{
+	char path[64];
+	if (proc_fd >= 0)
+		snprintf(path, sizeof(path), "%d/stat", pid);
+	else
+		snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	int fd = openat(proc_fd >= 0 ? proc_fd : AT_FDCWD, path,
+		O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -errno;
+	int status = process_snapshot_from_stat_fd(fd, snapshot);
+	int saved_errno = errno;
+	close(fd);
+	errno = saved_errno;
+	return status;
+}
+
+static int process_snapshot_for_pid(pid_t pid,
+	struct process_snapshot* snapshot)
+{
+	return process_snapshot_for_pid_at(-1, pid, snapshot);
 }
 
 static int process_is_active(const struct process_snapshot* snapshot)
@@ -1584,10 +2603,11 @@ void rootless_shutdown_test_set_pidfd_open_checkpoint(void (*checkpoint)(pid_t))
 #endif
 
 static int ledger_add(struct process_ledger* ledger, pid_t pid,
-	const struct process_snapshot* snapshot, int pidfd)
+	const struct process_snapshot* snapshot, int pidfd, int process_fd)
 {
 	if (ledger_find(ledger, pid, snapshot) != NULL) {
 		close(pidfd);
+		close(process_fd);
 		return 0;
 	}
 	if (ledger->count == ledger->capacity) {
@@ -1616,6 +2636,7 @@ static int ledger_add(struct process_ledger* ledger, pid_t pid,
 		.pid = pid,
 		.start_time = snapshot->start_time,
 		.pidfd = pidfd,
+		.proc_directory_fd = process_fd,
 	};
 	ledger->count++;
 	ledger->observed++;
@@ -1667,6 +2688,7 @@ static int ledger_compact(struct process_ledger* ledger,
 		if (!active || member == member_count ||
 			members[member] != identity.pid) {
 			close(identity.pidfd);
+			close(identity.proc_directory_fd);
 			continue;
 		}
 		ledger->identities[kept++] = identity;
@@ -1680,9 +2702,433 @@ static void ledger_release(struct process_ledger* ledger)
 	for (size_t index = 0; index < ledger->count; ++index) {
 		if (ledger->identities[index].pidfd >= 0)
 			close(ledger->identities[index].pidfd);
+		if (ledger->identities[index].proc_directory_fd >= 0)
+			close(ledger->identities[index].proc_directory_fd);
 	}
 	free(ledger->identities);
 	*ledger = (struct process_ledger){0};
+}
+
+static int ledger_compact_active(struct process_ledger* ledger,
+	unsigned long long deadline)
+{
+	size_t kept = 0;
+	for (size_t index = 0; index < ledger->count; ++index) {
+		int status = deadline_not_expired(deadline);
+		if (status != 0)
+			return status;
+		int active = 0;
+		status = process_pidfd_active(ledger->identities[index].pidfd, &active);
+		if (status != 0)
+			return status;
+		if (!active) {
+			close(ledger->identities[index].pidfd);
+			close(ledger->identities[index].proc_directory_fd);
+			continue;
+		}
+		ledger->identities[kept++] = ledger->identities[index];
+	}
+	ledger->count = kept;
+	return deadline_not_expired(deadline);
+}
+
+static struct process_identity* ledger_find_pid(
+	struct process_ledger* ledger, pid_t pid)
+{
+	for (size_t index = 0; index < ledger->count; ++index) {
+		if (ledger->identities[index].pid == pid)
+			return &ledger->identities[index];
+	}
+	return NULL;
+}
+
+static int inspect_identity_barrier(struct process_identity* identity,
+	enum process_barrier_result* result)
+{
+	int active = 0;
+	int status = process_pidfd_active(identity->pidfd, &active);
+	if (status != 0)
+		return status;
+	if (!active) {
+		*result = PROCESS_BARRIER_GONE;
+		return 0;
+	}
+	struct process_snapshot leader;
+	status = process_snapshot_for_directory_fd(
+		identity->proc_directory_fd, &leader);
+	if (status == -ENOENT || status == -ESRCH) {
+		status = process_pidfd_active(identity->pidfd, &active);
+		if (status != 0)
+			return status;
+		if (!active) {
+			*result = PROCESS_BARRIER_GONE;
+			return 0;
+		}
+		return -EAGAIN;
+	}
+	if (status != 0)
+		return status;
+	if (leader.start_time != identity->start_time)
+		return -ESTALE;
+	if (!process_is_active(&leader)) {
+		*result = PROCESS_BARRIER_GONE;
+		return 0;
+	}
+	if (leader.state != 'T' && leader.state != 't')
+		return -EAGAIN;
+	int task_fd = openat(identity->proc_directory_fd, "task",
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (task_fd < 0)
+		return errno == ENOENT ? -EAGAIN : -errno;
+	DIR* tasks = fdopendir(task_fd);
+	if (tasks == NULL) {
+		status = -errno;
+		close(task_fd);
+		return status;
+	}
+	for (;;) {
+		errno = 0;
+		struct dirent* task = readdir(tasks);
+		if (task == NULL) {
+			status = errno == 0 ? 0 : -errno;
+			break;
+		}
+		char* end = NULL;
+		errno = 0;
+		long tid = strtol(task->d_name, &end, 10);
+		if (errno != 0 || task->d_name[0] == '\0' || *end != '\0' ||
+			tid <= 0 || (pid_t)tid != tid)
+			continue;
+		char path[64];
+		int length = snprintf(path, sizeof(path), "%s/stat", task->d_name);
+		if (length < 0 || (size_t)length >= sizeof(path)) {
+			status = -EOVERFLOW;
+			break;
+		}
+		int stat_fd = openat(dirfd(tasks), path,
+			O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+		if (stat_fd < 0) {
+			if (errno == ENOENT)
+				continue;
+			status = -errno;
+			break;
+		}
+		struct process_snapshot thread;
+		status = process_snapshot_from_stat_fd(stat_fd, &thread);
+		close(stat_fd);
+		if (status != 0)
+			break;
+		if (thread.state != 'T' && thread.state != 't' &&
+			process_is_active(&thread)) {
+			status = -EAGAIN;
+			break;
+		}
+	}
+	closedir(tasks);
+	if (status != 0)
+		return status;
+	status = process_pidfd_active(identity->pidfd, &active);
+	if (status != 0)
+		return status;
+	*result = active ? PROCESS_BARRIER_STOPPED : PROCESS_BARRIER_GONE;
+	return 0;
+}
+
+static int wait_identity_stopped(struct process_identity* identity,
+	unsigned long long deadline, unsigned retry_interval_ms)
+{
+	for (;;) {
+		int status = deadline_not_expired(deadline);
+		if (status != 0)
+			return status;
+		enum process_barrier_result result = PROCESS_BARRIER_UNKNOWN;
+		status = inspect_identity_barrier(identity, &result);
+		if (status == 0) {
+			identity->barrier = result;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+			if (proc_barrier_checkpoint != NULL)
+				proc_barrier_checkpoint(identity->pid, (int)result);
+#endif
+			return 0;
+		}
+		if (status != -EAGAIN)
+			return status;
+		sleep_milliseconds(retry_interval_ms);
+	}
+}
+
+static int stop_identity(struct process_identity* identity,
+	unsigned long long deadline, unsigned retry_interval_ms)
+{
+	int active = 0;
+	int status = process_pidfd_active(identity->pidfd, &active);
+	if (status != 0)
+		return status;
+	if (!active) {
+		identity->barrier = PROCESS_BARRIER_GONE;
+		return 0;
+	}
+	struct process_snapshot snapshot;
+	status = process_snapshot_for_directory_fd(
+		identity->proc_directory_fd, &snapshot);
+	if (status == -ENOENT || status == -ESRCH)
+		return wait_identity_stopped(identity, deadline, retry_interval_ms);
+	if (status != 0 || snapshot.start_time != identity->start_time)
+		return status != 0 ? status : -ESTALE;
+	if (process_is_active(&snapshot) && snapshot.state != 'T' &&
+		snapshot.state != 't') {
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			return status;
+		status = signal_process_pidfd(identity->pidfd, SIGSTOP);
+		if (status != 0)
+			return status;
+		identity->stopped_by_us = 1;
+	}
+	return wait_identity_stopped(identity, deadline, retry_interval_ms);
+}
+
+static int resume_stopped_identities(struct process_ledger* ledger)
+{
+	int outcome = 0;
+	for (size_t index = 0; index < ledger->count; ++index) {
+		if (!ledger->identities[index].stopped_by_us)
+			continue;
+		int status = signal_process_pidfd(
+			ledger->identities[index].pidfd, SIGCONT);
+		if (status != 0 && outcome == 0)
+			outcome = status;
+		ledger->identities[index].stopped_by_us = 0;
+		ledger->identities[index].barrier = PROCESS_BARRIER_UNKNOWN;
+	}
+	return outcome;
+}
+
+static int pid_list_contains(const pid_t* pids, size_t count, pid_t pid)
+{
+	for (size_t index = 0; index < count; ++index) {
+		if (pids[index] == pid)
+			return 1;
+	}
+	return 0;
+}
+
+static void ledger_remove_new_pid(struct process_ledger* ledger, pid_t pid,
+	size_t old_count)
+{
+	if (ledger->count <= old_count)
+		return;
+	for (size_t index = 0; index < ledger->count; ++index) {
+		if (ledger->identities[index].pid != pid)
+			continue;
+		close(ledger->identities[index].pidfd);
+		close(ledger->identities[index].proc_directory_fd);
+		memmove(&ledger->identities[index], &ledger->identities[index + 1],
+			(ledger->count - index - 1) * sizeof(*ledger->identities));
+		ledger->count--;
+		return;
+	}
+}
+
+static int capture_anchored_child(
+	const struct rootless_shutdown_closure_capability* closure,
+	struct process_ledger* ledger, struct process_identity* parent, pid_t child,
+	size_t pidfd_budget, unsigned long long deadline)
+{
+	size_t old_count = ledger->count;
+	enum process_capture_result capture = PROCESS_CAPTURE_GONE;
+	int status = ledger_capture_member(ledger, closure->proc_fd,
+		child, pidfd_budget, &capture);
+	if (status != 0)
+		return status;
+	pid_t* confirmation = NULL;
+	size_t count = 0;
+	size_t capacity = 0;
+	status = proc_read_task_children(parent,
+		&confirmation, &count, &capacity, pidfd_budget, deadline);
+	int retained = status == 0 && pid_list_contains(confirmation, count, child);
+	free(confirmation);
+	if (status != 0)
+		return status;
+	if (!retained)
+		ledger_remove_new_pid(ledger, child, old_count);
+	else if (ledger_find_pid(ledger, child) == NULL &&
+		capture != PROCESS_CAPTURE_INACTIVE)
+		return -EAGAIN;
+	return 0;
+}
+
+static int acquire_subreaper_closure(
+	const struct rootless_shutdown_closure_capability* closure,
+	struct process_ledger* ledger, size_t pidfd_budget,
+	unsigned long long deadline, unsigned retry_interval_ms)
+{
+	int status = closure_named_identity(closure);
+	if (status != 0)
+		return status;
+	status = ledger_compact_active(ledger, deadline);
+	if (status != 0)
+		return status;
+	status = ledger_capture_member(ledger, closure->proc_fd,
+		closure->anchor_pid, pidfd_budget, NULL);
+	if (status != 0)
+		return status;
+	struct process_identity* anchor = ledger_find_pid(ledger,
+		closure->anchor_pid);
+	if (anchor == NULL || anchor->start_time != closure->anchor_start_time)
+		return -ESTALE;
+	pid_t* queue = NULL;
+	size_t count = 0;
+	size_t capacity = 0;
+	status = append_unique_pid(&queue, &count, &capacity,
+		closure->anchor_pid, pidfd_budget);
+	size_t processed = 0;
+	while (status == 0) {
+		while (processed < count && status == 0) {
+			pid_t parent = queue[processed++];
+			struct process_identity* identity = ledger_find_pid(ledger, parent);
+			if (identity == NULL)
+				continue;
+			status = stop_identity(identity,
+				deadline, retry_interval_ms);
+			if (status != 0)
+				break;
+			if (identity->barrier == PROCESS_BARRIER_GONE)
+				continue;
+			pid_t* children = NULL;
+			size_t child_count = 0;
+			size_t child_capacity = 0;
+			status = proc_read_task_children(identity,
+				&children, &child_count, &child_capacity,
+				pidfd_budget, deadline);
+			for (size_t child = 0; status == 0 && child < child_count; ++child) {
+				status = capture_anchored_child(closure, ledger, identity,
+					children[child], pidfd_budget, deadline);
+				if (status == 0 && ledger_find_pid(ledger, children[child]) != NULL)
+					status = append_unique_pid(&queue, &count, &capacity,
+						children[child], pidfd_budget);
+			}
+			free(children);
+		}
+		if (status != 0)
+			break;
+		/* Every retained identity is stopped. Rescan all anchored edges to
+		 * close the root-exit/reparent window; the generation is exact only
+		 * when a complete pass adds no identity. */
+		size_t stable_count = count;
+		for (size_t index = 0; status == 0 && index < stable_count; ++index) {
+			struct process_identity* identity =
+				ledger_find_pid(ledger, queue[index]);
+			if (identity == NULL ||
+				identity->barrier == PROCESS_BARRIER_GONE)
+				continue;
+			if (identity->barrier != PROCESS_BARRIER_STOPPED) {
+				status = -EAGAIN;
+				break;
+			}
+			pid_t* children = NULL;
+			size_t child_count = 0;
+			size_t child_capacity = 0;
+			status = proc_read_task_children(identity,
+				&children, &child_count, &child_capacity,
+				pidfd_budget, deadline);
+			for (size_t child = 0; status == 0 && child < child_count; ++child) {
+				status = capture_anchored_child(closure, ledger, identity,
+					children[child], pidfd_budget, deadline);
+				if (status == 0 && ledger_find_pid(ledger, children[child]) != NULL)
+					status = append_unique_pid(&queue, &count, &capacity,
+						children[child], pidfd_budget);
+			}
+			free(children);
+		}
+		if (status != 0 || count == stable_count)
+			break;
+	}
+	free(queue);
+	if (status != 0)
+		(void)resume_stopped_identities(ledger);
+	return status;
+}
+
+static int signal_subreaper_closure(pid_t init_process,
+	unsigned long long init_start_time,
+	const struct rootless_shutdown_closure_capability* closure,
+	struct process_ledger* ledger, int signal_number, size_t pidfd_budget,
+	unsigned long long deadline, unsigned retry_interval_ms,
+	unsigned* active)
+{
+	int anchor_active = 0;
+	int status = process_pidfd_active(closure->anchor_pidfd, &anchor_active);
+	if (status != 0)
+		return status;
+	if (!anchor_active) {
+		struct process_identity* prior = ledger_find_pid(ledger,
+			closure->anchor_pid);
+		if (prior == NULL || !prior->termination_requested)
+			return -ESTALE;
+		status = ledger_compact_active(ledger, deadline);
+		if (status == 0)
+			*active = 0;
+		return status;
+	}
+	status = acquire_subreaper_closure(closure, ledger, pidfd_budget,
+		deadline, retry_interval_ms);
+	if (status != 0)
+		return status;
+	struct process_identity* root = NULL;
+	struct process_identity* anchor = NULL;
+	unsigned other_descendants = 0;
+	*active = 0;
+	for (size_t index = 0; index < ledger->count; ++index) {
+		struct process_identity* identity = &ledger->identities[index];
+		int identity_active = 0;
+		status = process_pidfd_active(identity->pidfd, &identity_active);
+		if (status != 0)
+			goto unwind;
+		if (!identity_active)
+			continue;
+		(*active)++;
+		if (identity->pid == closure->anchor_pid &&
+			identity->start_time == closure->anchor_start_time) {
+			anchor = identity;
+			continue;
+		}
+		if (identity->pid == init_process && init_start_time != 0 &&
+			identity->start_time == init_start_time) {
+			root = identity;
+			continue;
+		}
+		other_descendants++;
+		if (signal_number != 0) {
+			status = deadline_not_expired(deadline);
+			if (status != 0)
+				goto unwind;
+			status = signal_process_pidfd(identity->pidfd, signal_number);
+			if (status != 0)
+				goto unwind;
+		}
+	}
+	if (signal_number != 0 && other_descendants == 0 && root != NULL) {
+		status = deadline_not_expired(deadline);
+		if (status == 0)
+			status = signal_process_pidfd(root->pidfd, signal_number);
+		if (status != 0)
+			goto unwind;
+	} else if (signal_number != 0 && other_descendants == 0 && root == NULL &&
+		anchor != NULL) {
+		status = deadline_not_expired(deadline);
+		if (status == 0)
+			status = signal_process_pidfd(anchor->pidfd, signal_number);
+		if (status == 0)
+			anchor->termination_requested = 1;
+		if (status != 0)
+			goto unwind;
+	}
+	status = resume_stopped_identities(ledger);
+	return status;
+unwind:
+	(void)resume_stopped_identities(ledger);
+	return status;
 }
 
 /*
@@ -1691,51 +3137,108 @@ static void ledger_release(struct process_ledger* ledger)
  * read proves that the exact numeric identity was still a member after the
  * pidfd became authoritative. Once retained, only pidfd_send_signal is used.
  */
-static int ledger_capture_member(struct process_ledger* ledger, pid_t pid,
-	size_t pidfd_budget)
+static int ledger_capture_member(struct process_ledger* ledger, int proc_fd,
+	pid_t pid, size_t pidfd_budget, enum process_capture_result* result)
 {
-	struct process_snapshot before;
-	int status = process_snapshot_for_pid(pid, &before);
-	if (status == -ENOENT || status == -ESRCH)
-		return 0;
-	if (status != 0)
+	if (result != NULL)
+		*result = PROCESS_CAPTURE_GONE;
+	char name[32];
+	int length = snprintf(name, sizeof(name), "%d", (int)pid);
+	if (length < 0 || (size_t)length >= sizeof(name))
+		return -EOVERFLOW;
+	int process_fd = openat(proc_fd, name,
+		O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (process_fd < 0)
+		return errno == ENOENT ? 0 : -errno;
+	struct stat opened_identity;
+	if (fstat(process_fd, &opened_identity) != 0) {
+		int status = -errno;
+		close(process_fd);
 		return status;
-	if (!process_is_active(&before))
+	}
+	struct process_snapshot before;
+	int status = process_snapshot_for_directory_fd(process_fd, &before);
+	if (status == -ENOENT || status == -ESRCH) {
+		close(process_fd);
 		return 0;
-	if (ledger_find(ledger, pid, &before) != NULL)
+	}
+	if (status != 0) {
+		close(process_fd);
+		return status;
+	}
+	if (!process_is_active(&before)) {
+		if (result != NULL)
+			*result = PROCESS_CAPTURE_INACTIVE;
+		close(process_fd);
 		return 0;
-	if (ledger->count >= pidfd_budget)
+	}
+	if (ledger_find(ledger, pid, &before) != NULL) {
+		if (result != NULL)
+			*result = PROCESS_CAPTURE_RETAINED;
+		close(process_fd);
+		return 0;
+	}
+	if (ledger->count >= pidfd_budget) {
+		close(process_fd);
 		return -EMFILE;
+	}
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
 	if (pidfd_open_checkpoint != NULL)
 		pidfd_open_checkpoint(pid);
 #endif
 	int pidfd = open_process_pidfd(pid);
-	if (pidfd == -ENOENT || pidfd == -ESRCH)
+	if (pidfd == -ENOENT || pidfd == -ESRCH) {
+		close(process_fd);
 		return 0;
-	if (pidfd < 0)
+	}
+	if (pidfd < 0) {
+		close(process_fd);
 		return pidfd;
+	}
 	struct process_snapshot after;
-	status = process_snapshot_for_pid(pid, &after);
+	status = process_snapshot_for_directory_fd(process_fd, &after);
 	if (status == -ENOENT || status == -ESRCH) {
 		close(pidfd);
+		close(process_fd);
 		return 0;
 	}
 	if (status != 0) {
 		close(pidfd);
+		close(process_fd);
+		return status;
+	}
+	struct stat named_identity;
+	if (fstatat(proc_fd, name, &named_identity, AT_SYMLINK_NOFOLLOW) != 0) {
+		status = errno == ENOENT ? -ESTALE : -errno;
+		close(pidfd);
+		close(process_fd);
 		return status;
 	}
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
 	if (snapshot_replacement_enabled && pid == snapshot_replacement_pid)
 		after.start_time++;
 #endif
-	if (after.start_time != before.start_time || !process_is_active(&after)) {
+	if (after.start_time != before.start_time ||
+		named_identity.st_dev != opened_identity.st_dev ||
+		named_identity.st_ino != opened_identity.st_ino) {
 		close(pidfd);
+		close(process_fd);
+		return -ESTALE;
+	}
+	if (!process_is_active(&after)) {
+		if (result != NULL)
+			*result = PROCESS_CAPTURE_INACTIVE;
+		close(pidfd);
+		close(process_fd);
 		return 0;
 	}
-	status = ledger_add(ledger, pid, &after, pidfd);
-	if (status != 0)
+	status = ledger_add(ledger, pid, &after, pidfd, process_fd);
+	if (status != 0) {
 		close(pidfd);
+		close(process_fd);
+	}
+	if (status == 0 && result != NULL)
+		*result = PROCESS_CAPTURE_RETAINED;
 	return status;
 }
 
@@ -1762,11 +3265,16 @@ static int derive_pidfd_budget(const struct rootless_shutdown_policy* policy,
 	closedir(directory);
 	if (read_error != 0)
 		return -read_error;
-	const rlim_t reserve = 16;
+	const rlim_t reserve = 8;
 	if (limit.rlim_cur <= reserve ||
 		limit.rlim_cur - reserve <= (rlim_t)open_count)
 		return -EMFILE;
 	rlim_t available = limit.rlim_cur - reserve - (rlim_t)open_count;
+	/* Every retained process identity owns both a pidfd and an O_PATH
+	 * capability for the exact /proc/PID inode. */
+	available /= 2;
+	if (available == 0)
+		return -EMFILE;
 	size_t derived = available > SIZE_MAX ? SIZE_MAX : (size_t)available;
 	*budget = policy->pidfd_budget != 0 && policy->pidfd_budget < derived
 		? policy->pidfd_budget : derived;
@@ -1845,7 +3353,8 @@ static int acquire_runtime_closure(
 					status = -ETIMEDOUT;
 				goto round_done;
 			}
-			status = ledger_capture_member(ledger, before[index], pidfd_budget);
+			status = ledger_capture_member(ledger, closure->proc_fd,
+				before[index], pidfd_budget, NULL);
 			if (status != 0)
 				goto round_done;
 		}
@@ -1909,7 +3418,7 @@ round_done:
  * by the root's final SIGTERM handler is accounted before the root disappears.
  * The ledger preserves every observed (pid,start_time) identity across scan
  * rounds. The host login session and guest process groups are deliberately not
- * authorities; launchd relies on ordinary kill(0) process-group semantics.
+ * authorities and are never signal targets.
  */
 static int signal_runtime_closure(pid_t init_process,
 	unsigned long long init_start_time,
@@ -1918,6 +3427,12 @@ static int signal_runtime_closure(pid_t init_process,
 	unsigned long long acquisition_deadline, unsigned retry_interval_ms,
 	unsigned* active)
 {
+	if (closure->backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER)
+		return signal_subreaper_closure(init_process, init_start_time,
+			closure, ledger, signal_number, pidfd_budget,
+			acquisition_deadline, retry_interval_ms, active);
+	if (closure->backend != ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED)
+		return -EOPNOTSUPP;
 	int status = acquire_runtime_closure(closure, ledger,
 		pidfd_budget, acquisition_deadline, retry_interval_ms);
 	if (status != 0)
@@ -2081,8 +3596,20 @@ static int bind_runtime_closure(const darling_runtime_prefix prefix,
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 	struct rootless_shutdown_session_state state;
 	int status = load_session_state(prefix, &local, &state);
-	if (status == 0)
-		status = open_recorded_cgroup(&state, &local);
+	if (status == 0) {
+		switch (state.backend) {
+		case ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED:
+			local.backend = state.backend;
+			status = open_recorded_cgroup(&state, &local);
+			break;
+		case ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER:
+			status = open_recorded_subreaper(&state, &local);
+			break;
+		case ROOTLESS_SHUTDOWN_BACKEND_UNSUPPORTED:
+			status = -EOPNOTSUPP;
+			break;
+		}
+	}
 	if (status != 0)
 		goto fail;
 	*capability = local;
@@ -2092,7 +3619,7 @@ static int bind_runtime_closure(const darling_runtime_prefix prefix,
 fail:
 	rootless_shutdown_release_closure(&local);
 	return shutdown_error(error, error_size, -status,
-		"cannot bind rootless shutdown cgroup: %s", strerror(-status));
+		"cannot bind rootless shutdown backend: %s", strerror(-status));
 }
 
 static int preflight_runtime_endpoints(const darling_runtime_prefix prefix,
@@ -2231,13 +3758,21 @@ int shutdown_rootless_runtime(pid_t session_member, pid_t init_process,
 		error, error_size);
 	if (status != 0)
 		return status;
+	local.backend = closure.backend;
+	local.anchor_pid = closure.anchor_pid;
+	local.anchor_start_time = closure.anchor_start_time;
 	struct stat closure_identity;
-	if (fstat(closure.directory_fd, &closure_identity) != 0) {
+	int evidence_fd = closure.backend ==
+		ROOTLESS_SHUTDOWN_BACKEND_CGROUP_DELEGATED
+		? closure.directory_fd : closure.proc_fd;
+	if (fstat(evidence_fd, &closure_identity) != 0) {
 		outcome = shutdown_error(error, error_size, errno,
-			"cannot inspect rootless shutdown cgroup: %s", strerror(errno));
+			"cannot inspect rootless shutdown capability: %s", strerror(errno));
 		goto finish;
 	}
 	local.closure_inode = closure_identity.st_ino;
+	local.capability_device = closure_identity.st_dev;
+	local.capability_inode = closure_identity.st_ino;
 	if ((init_present &&
 		 rootless_shutdown_closure_contains(&closure, init_process,
 			error, error_size) != 0) ||

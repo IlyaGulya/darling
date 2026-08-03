@@ -447,7 +447,8 @@ static struct session_fixture spawn_fixture(
 		(void)rootless_shutdown_cleanup_empty_closure(&closure, NULL, 0);
 		return fixture;
 	}
-	fixture.init = fork();
+	fixture.init = rootless_shutdown_fork_runtime(&closure,
+		error, sizeof(error));
 	if (fixture.init < 0) {
 		close(pipefd[0]);
 		close(pipefd[1]);
@@ -460,9 +461,6 @@ static struct session_fixture spawn_fixture(
 			close(churn_commands[1]);
 			close(churn_replies[0]);
 		}
-		if (rootless_shutdown_enter_closure(&closure,
-				error, sizeof(error)) != 0)
-			_exit(8);
 		rootless_shutdown_release_closure(&closure);
 		if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0)
 			_exit(9);
@@ -883,7 +881,8 @@ static int acquisition_failure_case(
 	churn_reply_fd = -1;
 	int all_survived = kill(fixture.init, 0) == 0 &&
 		kill(fixture.leader, 0) == 0 && kill(fixture.worker, 0) == 0;
-	int expected = pidfd_budget != 0 ? -EMFILE : -ETIMEDOUT;
+	int expected = replacement ? -ESTALE :
+		(pidfd_budget != 0 ? -EMFILE : -ETIMEDOUT);
 	if (rc != expected || result.phase != ROOTLESS_SHUTDOWN_CLOSURE_BOUND ||
 		!all_survived || (churn &&
 		 (churn_checkpoint_failed || churn_latest_pid <= 0))) {
@@ -1242,6 +1241,23 @@ int main(void)
 		fprintf(stderr, "open prefix failed: %s\n", error);
 		return 2;
 	}
+	struct rootless_shutdown_closure_capability backend_probe =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	if (rootless_shutdown_prepare_closure(prefix, &backend_probe,
+			error, sizeof(error)) != 0)
+		return 81;
+	if (backend_probe.backend == ROOTLESS_SHUTDOWN_BACKEND_PIDFD_SUBREAPER) {
+		rootless_shutdown_release_closure(&backend_probe);
+		darling_runtime_mode_close_prefix(prefix);
+		if (rmdir(prefix_path) != 0)
+			return 82;
+		puts("ROOTLESS_SHUTDOWN_LIFECYCLE_OK backend=PIDFD_SUBREAPER "
+			"cgroup_specific=NOT_APPLICABLE");
+		return 0;
+	}
+	if (rootless_shutdown_cleanup_empty_closure(&backend_probe,
+			error, sizeof(error)) != 0)
+		return 83;
 	if (preflight_before_mutation_case(prefix_path, prefix) != 0)
 		return 56;
 	if (cgroup_same_name_aba_case(prefix_path, prefix) != 0)

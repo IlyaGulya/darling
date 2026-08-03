@@ -46,14 +46,11 @@ int main(void)
 	if (rootless_shutdown_prepare_closure(prefix, &closure,
 			error, sizeof(error)) != 0 || pipe(pipefd) != 0)
 		return 1;
-	leader = fork();
+	leader = rootless_shutdown_fork_runtime(&closure, error, sizeof(error));
 	if (leader < 0)
 		return 1;
 	if (leader == 0) {
 		close(pipefd[0]);
-		if (rootless_shutdown_enter_closure(&closure,
-				error, sizeof(error)) != 0)
-			return 5;
 		rootless_shutdown_release_closure(&closure);
 		if (setsid() < 0)
 			return 2;

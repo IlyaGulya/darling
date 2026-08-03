@@ -3,7 +3,7 @@ project(darling-rootless-shutdown-contracts C)
 
 enable_testing()
 
-foreach(shutdown_test IN ITEMS session lifecycle shared_session)
+foreach(shutdown_test IN ITEMS session lifecycle shared_session backend)
 	set(shutdown_target "darling_rootless_shutdown_${shutdown_test}_test")
 	add_executable(${shutdown_target}
 		rootless_shutdown_${shutdown_test}_test.c
@@ -17,6 +17,12 @@ foreach(shutdown_test IN ITEMS session lifecycle shared_session)
 			DARLING_ROOTLESS_SHUTDOWN_TESTING)
 		target_link_options(${shutdown_target} PRIVATE
 			-Wl,--wrap=opendir)
+	endif()
+	if(shutdown_test STREQUAL "backend")
+		target_compile_definitions(${shutdown_target} PRIVATE
+			DARLING_ROOTLESS_SHUTDOWN_TESTING)
+		find_package(Threads REQUIRED)
+		target_link_libraries(${shutdown_target} PRIVATE Threads::Threads)
 	endif()
 	target_compile_options(${shutdown_target} PRIVATE
 		-Wall -Wextra -Werror -Wno-c23-extensions)
