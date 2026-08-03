@@ -60,8 +60,24 @@ static size_t membership_read_count;
 static size_t membership_read_advance_at;
 static unsigned snapshot_sorted_count;
 static unsigned snapshot_sorted_advance_at;
+static unsigned compact_checkpoint_snapshot;
+static size_t compact_checkpoint_index;
+static int containment_advance_deadline;
+static int signal_checkpoint_number;
+static size_t signal_checkpoint_count;
+static size_t signal_checkpoint_advance_at;
 static int publish_swap_prefix_fd = -1;
 static int publish_swap_performed;
+static int cgroup_checkpoint_parent_fd = -1;
+static char cgroup_checkpoint_leaf[NAME_MAX + 1];
+static int cgroup_swap_phase;
+static int cgroup_swap_performed;
+static dev_t cgroup_replacement_device;
+static ino_t cgroup_replacement_inode;
+static unsigned cgroup_event_churn_count;
+static unsigned cgroup_event_churn_generated;
+static size_t prebind_drain_event_count;
+static size_t prebind_drain_advance_at;
 
 extern DIR* __real_opendir(const char* path);
 
@@ -104,6 +120,98 @@ static void observe_snapshot_sorted(unsigned ordinal)
 	if (snapshot_sorted_advance_at != 0 &&
 		ordinal >= snapshot_sorted_advance_at)
 		test_monotonic_now += 2;
+}
+
+static void observe_ledger_compact(unsigned snapshot, size_t index)
+{
+	if (snapshot == compact_checkpoint_snapshot &&
+		index >= compact_checkpoint_index)
+		test_monotonic_now += 2;
+}
+
+static void observe_containment(void)
+{
+	if (containment_advance_deadline)
+		test_monotonic_now += 2;
+}
+
+static void observe_signal_iteration(int signal_number, size_t index)
+{
+	if (signal_number != signal_checkpoint_number)
+		return;
+	signal_checkpoint_count = index;
+	if (signal_checkpoint_advance_at != 0 &&
+		index >= signal_checkpoint_advance_at)
+		test_monotonic_now += 2;
+}
+
+static void capture_or_swap_created_cgroup(
+	unsigned phase, int parent_fd, const char* leaf)
+{
+	if (cgroup_checkpoint_parent_fd < 0)
+		cgroup_checkpoint_parent_fd = fcntl(
+			parent_fd, F_DUPFD_CLOEXEC, 3);
+	if (strlen(leaf) < sizeof(cgroup_checkpoint_leaf))
+		strcpy(cgroup_checkpoint_leaf, leaf);
+	if (phase == ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN &&
+		cgroup_event_churn_count != 0) {
+		for (unsigned index = 0; index < cgroup_event_churn_count; ++index) {
+			char noise[NAME_MAX + 1];
+			int length = snprintf(noise, sizeof(noise),
+				"darling-prebind-noise-%ld-%u", (long)getpid(), index);
+			if (length <= 0 || (size_t)length >= sizeof(noise) ||
+				mkdirat(parent_fd, noise, 0700) != 0)
+				break;
+			cgroup_event_churn_generated++;
+			if (unlinkat(parent_fd, noise, AT_REMOVEDIR) != 0)
+				break;
+			cgroup_event_churn_generated++;
+		}
+	}
+	if ((int)phase != cgroup_swap_phase || cgroup_swap_performed)
+		return;
+	if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) != 0 ||
+		mkdirat(parent_fd, leaf, 0700) != 0)
+		return;
+	struct stat replacement;
+	if (fstatat(parent_fd, leaf, &replacement,
+			AT_SYMLINK_NOFOLLOW) != 0)
+		return;
+	cgroup_replacement_device = replacement.st_dev;
+	cgroup_replacement_inode = replacement.st_ino;
+	cgroup_swap_performed = 1;
+}
+
+static void advance_prebind_drain(size_t event_count)
+{
+	prebind_drain_event_count = event_count;
+	if (prebind_drain_advance_at != 0 &&
+		event_count >= prebind_drain_advance_at)
+		test_monotonic_now += 1000;
+}
+
+static void reset_cgroup_create_fixture(void)
+{
+	rootless_shutdown_test_set_cgroup_create_checkpoint(NULL);
+	rootless_shutdown_test_set_cgroup_create_error(0, 0);
+	rootless_shutdown_test_set_prebind_event_budget(0);
+	rootless_shutdown_test_set_prebind_event_checkpoint(NULL);
+	if (cgroup_checkpoint_parent_fd >= 0) {
+		if (cgroup_checkpoint_leaf[0] != '\0')
+			(void)unlinkat(cgroup_checkpoint_parent_fd,
+				cgroup_checkpoint_leaf, AT_REMOVEDIR);
+		close(cgroup_checkpoint_parent_fd);
+	}
+	cgroup_checkpoint_parent_fd = -1;
+	cgroup_checkpoint_leaf[0] = '\0';
+	cgroup_swap_phase = 0;
+	cgroup_swap_performed = 0;
+	cgroup_replacement_device = 0;
+	cgroup_replacement_inode = 0;
+	cgroup_event_churn_count = 0;
+	cgroup_event_churn_generated = 0;
+	prebind_drain_event_count = 0;
+	prebind_drain_advance_at = 0;
 }
 
 static void replace_published_session_state(void)
@@ -875,26 +983,154 @@ static int session_publication_swap_case(
 	return 0;
 }
 
+static int cgroup_create_fault_case(
+	const char* prefix_path, darling_runtime_prefix prefix, unsigned phase)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	reset_cgroup_create_fixture();
+	rootless_shutdown_test_set_cgroup_create_checkpoint(
+		capture_or_swap_created_cgroup);
+	rootless_shutdown_test_set_cgroup_create_error(phase, EIO);
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	rootless_shutdown_test_set_cgroup_create_error(0, 0);
+	rootless_shutdown_test_set_cgroup_create_checkpoint(NULL);
+	struct stat remaining;
+	int cgroup_exists = cgroup_checkpoint_parent_fd >= 0 &&
+		cgroup_checkpoint_leaf[0] != '\0' &&
+		fstatat(cgroup_checkpoint_parent_fd, cgroup_checkpoint_leaf,
+			&remaining, AT_SYMLINK_NOFOLLOW) == 0;
+	int state_exists = endpoint_exists(prefix_path,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME);
+	rootless_shutdown_release_closure(&closure);
+	reset_cgroup_create_fixture();
+	if (rc != -EIO || cgroup_exists || state_exists) {
+		fprintf(stderr, "cgroup create fault contract failed phase=%u "
+			"rc=%d cgroup=%d state=%d error=%s\n", phase, rc,
+			cgroup_exists, state_exists, error);
+		return 1;
+	}
+	return 0;
+}
+
+static int cgroup_create_swap_case(
+	const char* prefix_path, darling_runtime_prefix prefix, unsigned phase)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	reset_cgroup_create_fixture();
+	cgroup_swap_phase = (int)phase;
+	rootless_shutdown_test_set_cgroup_create_checkpoint(
+		capture_or_swap_created_cgroup);
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	rootless_shutdown_test_set_cgroup_create_checkpoint(NULL);
+	struct stat replacement;
+	int replacement_survived = cgroup_checkpoint_parent_fd >= 0 &&
+		cgroup_checkpoint_leaf[0] != '\0' &&
+		fstatat(cgroup_checkpoint_parent_fd, cgroup_checkpoint_leaf,
+			&replacement, AT_SYMLINK_NOFOLLOW) == 0 &&
+		replacement.st_dev == cgroup_replacement_device &&
+		replacement.st_ino == cgroup_replacement_inode;
+	int state_exists = endpoint_exists(prefix_path,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME);
+	int swap_performed = cgroup_swap_performed;
+	rootless_shutdown_release_closure(&closure);
+	reset_cgroup_create_fixture();
+	if (rc != -ESTALE || !swap_performed ||
+		!replacement_survived || state_exists) {
+		fprintf(stderr, "cgroup create swap contract failed phase=%u "
+			"rc=%d swapped=%d survived=%d state=%d error=%s\n", phase,
+			rc, swap_performed, replacement_survived,
+			state_exists, error);
+		return 1;
+	}
+	return 0;
+}
+
+static int cgroup_prebind_drain_bound_case(
+	const char* prefix_path, darling_runtime_prefix prefix, int deadline)
+{
+	struct rootless_shutdown_closure_capability closure =
+		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
+	char error[512] = {0};
+	reset_cgroup_create_fixture();
+	rootless_shutdown_test_set_cgroup_create_checkpoint(
+		capture_or_swap_created_cgroup);
+	if (deadline) {
+		test_monotonic_now = 1000;
+		prebind_drain_advance_at = 1;
+		rootless_shutdown_test_set_monotonic_clock(test_monotonic_clock);
+		rootless_shutdown_test_set_prebind_event_checkpoint(
+			advance_prebind_drain);
+	} else {
+		cgroup_event_churn_count = 8;
+		rootless_shutdown_test_set_prebind_event_budget(4);
+	}
+	int rc = rootless_shutdown_prepare_closure(prefix, &closure,
+		error, sizeof(error));
+	rootless_shutdown_test_set_monotonic_clock(NULL);
+	rootless_shutdown_test_set_prebind_event_checkpoint(NULL);
+	rootless_shutdown_test_set_prebind_event_budget(0);
+	rootless_shutdown_test_set_cgroup_create_checkpoint(NULL);
+	struct stat remaining;
+	int cgroup_survived = cgroup_checkpoint_parent_fd >= 0 &&
+		cgroup_checkpoint_leaf[0] != '\0' &&
+		fstatat(cgroup_checkpoint_parent_fd, cgroup_checkpoint_leaf,
+			&remaining, AT_SYMLINK_NOFOLLOW) == 0;
+	int state_exists = endpoint_exists(prefix_path,
+		ROOTLESS_SHUTDOWN_SESSION_STATE_NAME);
+	unsigned generated = cgroup_event_churn_generated;
+	size_t drained = prebind_drain_event_count;
+	rootless_shutdown_release_closure(&closure);
+	reset_cgroup_create_fixture();
+	int expected = deadline ? -ETIMEDOUT : -EOVERFLOW;
+	if (rc != expected || !cgroup_survived || state_exists ||
+		(deadline ? drained < 1 : generated <= 4)) {
+		fprintf(stderr, "cgroup prebind drain bound failed deadline=%d "
+			"rc=%d survived=%d state=%d generated=%u drained=%zu error=%s\n",
+			deadline, rc, cgroup_survived, state_exists, generated,
+			drained, error);
+		return 1;
+	}
+	return 0;
+}
+
 static int bounded_acquisition_case(
 	const char* prefix_path, darling_runtime_prefix prefix,
 	size_t pidfd_budget, size_t deadline_after_read,
-	unsigned deadline_after_sorted, size_t maximum_reads)
+	unsigned deadline_after_sorted, size_t maximum_reads,
+	unsigned deadline_during_compact, size_t compact_index,
+	int deadline_after_containment)
 {
-	if (prepare_endpoints(prefix_path, 0) != 0)
+	int fd_baseline = count_open_fds();
+	if (fd_baseline < 0)
 		return 1;
+	if (prepare_endpoints(prefix_path, 0) != 0)
+		return 2;
 	struct session_fixture fixture = spawn_fixture(FIXTURE_GRACEFUL, prefix);
 	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
-		return 2;
+		return 3;
 	test_monotonic_now = 1000;
 	membership_read_count = 0;
 	membership_read_advance_at = deadline_after_read;
 	snapshot_sorted_count = 0;
 	snapshot_sorted_advance_at = deadline_after_sorted;
+	compact_checkpoint_snapshot = deadline_during_compact;
+	compact_checkpoint_index = compact_index;
+	containment_advance_deadline = deadline_after_containment;
 	rootless_shutdown_test_set_monotonic_clock(test_monotonic_clock);
 	rootless_shutdown_test_set_membership_read_checkpoint(
 		observe_membership_read);
 	rootless_shutdown_test_set_snapshot_sorted_checkpoint(
 		observe_snapshot_sorted);
+	rootless_shutdown_test_set_ledger_compact_checkpoint(
+		observe_ledger_compact);
+	rootless_shutdown_test_set_containment_checkpoint(
+		observe_containment);
 	const struct rootless_shutdown_policy policy = {
 		.acquisition_timeout_ms = 1,
 		.pidfd_budget = pidfd_budget,
@@ -907,10 +1143,15 @@ static int bounded_acquisition_case(
 	int rc = shutdown_rootless_runtime(fixture.leader, fixture.init,
 		prefix, &policy, &result, error, sizeof(error));
 	rootless_shutdown_test_set_snapshot_sorted_checkpoint(NULL);
+	rootless_shutdown_test_set_ledger_compact_checkpoint(NULL);
+	rootless_shutdown_test_set_containment_checkpoint(NULL);
 	rootless_shutdown_test_set_membership_read_checkpoint(NULL);
 	rootless_shutdown_test_set_monotonic_clock(NULL);
 	membership_read_advance_at = 0;
 	snapshot_sorted_advance_at = 0;
+	compact_checkpoint_snapshot = 0;
+	compact_checkpoint_index = 0;
+	containment_advance_deadline = 0;
 	int expected = pidfd_budget != 0 ? -EMFILE : -ETIMEDOUT;
 	int all_survived = kill(fixture.init, 0) == 0 &&
 		kill(fixture.leader, 0) == 0 && kill(fixture.worker, 0) == 0;
@@ -924,11 +1165,68 @@ static int bounded_acquisition_case(
 			pidfd_budget, rc, result.phase, membership_read_count,
 			snapshot_sorted_count, all_survived, error);
 		cleanup_fixture(&fixture);
+		return 4;
+	}
+	if (finish_fixture_after_failed_acquisition(
+			prefix_path, prefix, &fixture) != 0)
+		return 5;
+	int fd_post = count_open_fds();
+	if (fd_post != fd_baseline) {
+		fprintf(stderr, "bounded acquisition fd leak baseline=%d post=%d\n",
+			fd_baseline, fd_post);
+		return 6;
+	}
+	return 0;
+}
+
+static int signal_iteration_deadline_case(
+	const char* prefix_path, darling_runtime_prefix prefix)
+{
+	int fd_baseline = count_open_fds();
+	if (fd_baseline < 0 || prepare_endpoints(prefix_path, 0) != 0)
+		return 1;
+	struct session_fixture fixture = spawn_fixture(FIXTURE_STUBBORN, prefix);
+	if (fixture.init <= 0 || fixture.leader <= 0 || fixture.worker <= 0)
+		return 2;
+	test_monotonic_now = 1000;
+	signal_checkpoint_number = SIGTERM;
+	signal_checkpoint_count = 0;
+	signal_checkpoint_advance_at = 1;
+	rootless_shutdown_test_set_monotonic_clock(test_monotonic_clock);
+	rootless_shutdown_test_set_signal_checkpoint(observe_signal_iteration);
+	const struct rootless_shutdown_policy policy = {
+		.acquisition_timeout_ms = 1,
+		.term_timeout_ms = 1,
+		.kill_timeout_ms = 100,
+		.poll_interval_ms = 1,
+	};
+	struct rootless_shutdown_result result;
+	char error[512] = {0};
+	int rc = shutdown_rootless_runtime(fixture.leader, fixture.init,
+		prefix, &policy, &result, error, sizeof(error));
+	rootless_shutdown_test_set_signal_checkpoint(NULL);
+	rootless_shutdown_test_set_monotonic_clock(NULL);
+	signal_checkpoint_number = 0;
+	signal_checkpoint_advance_at = 0;
+	int all_survived = kill(fixture.init, 0) == 0 &&
+		kill(fixture.leader, 0) == 0 && kill(fixture.worker, 0) == 0;
+	if (rc != -ETIMEDOUT || result.phase != ROOTLESS_SHUTDOWN_TERM ||
+		signal_checkpoint_count != 1 || !all_survived) {
+		fprintf(stderr, "signal deadline contract failed rc=%d phase=%d "
+			"checkpoint=%zu survived=%d error=%s\n", rc, result.phase,
+			signal_checkpoint_count, all_survived, error);
+		cleanup_fixture(&fixture);
 		return 3;
 	}
 	if (finish_fixture_after_failed_acquisition(
 			prefix_path, prefix, &fixture) != 0)
 		return 4;
+	int fd_post = count_open_fds();
+	if (fd_post != fd_baseline) {
+		fprintf(stderr, "signal deadline fd leak baseline=%d post=%d\n",
+			fd_baseline, fd_post);
+		return 5;
+	}
 	return 0;
 }
 
@@ -954,12 +1252,45 @@ int main(void)
 		return 65;
 	if (session_publication_swap_case(prefix_path, prefix) != 0)
 		return 66;
-	if (bounded_acquisition_case(prefix_path, prefix, 2, 0, 0, 3) != 0)
+	if (cgroup_create_fault_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN) != 0)
+		return 75;
+	if (cgroup_create_swap_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN) != 0)
+		return 76;
+	if (cgroup_prebind_drain_bound_case(prefix_path, prefix, 0) != 0)
+		return 79;
+	if (cgroup_prebind_drain_bound_case(prefix_path, prefix, 1) != 0)
+		return 80;
+	if (cgroup_create_fault_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE) != 0)
+		return 70;
+	if (cgroup_create_fault_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN) != 0)
+		return 71;
+	if (cgroup_create_swap_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE) != 0)
+		return 72;
+	if (cgroup_create_swap_case(prefix_path, prefix,
+			ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN) != 0)
+		return 73;
+	if (bounded_acquisition_case(prefix_path, prefix, 2, 0, 0, 3,
+			0, 0, 0) != 0)
 		return 67;
-	if (bounded_acquisition_case(prefix_path, prefix, 0, 1, 0, 1) != 0)
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 1, 0, 1,
+			0, 0, 0) != 0)
 		return 68;
-	if (bounded_acquisition_case(prefix_path, prefix, 0, 0, 2, 0) != 0)
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 0, 2, 0,
+			0, 0, 0) != 0)
 		return 69;
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 0, 0, 0,
+			2, 1, 0) != 0)
+		return 74;
+	if (bounded_acquisition_case(prefix_path, prefix, 0, 0, 0, 0,
+			0, 0, 1) != 0)
+		return 77;
+	if (signal_iteration_deadline_case(prefix_path, prefix) != 0)
+		return 78;
 
 	for (int cycle = 0; cycle < 3; ++cycle) {
 		int rc = run_shutdown_case(
@@ -1160,7 +1491,10 @@ int main(void)
 		"init_enoent=PASS member_enoent=PASS pidfd_exit_race=PASS "
 		"pid_replacement=PASS cgroup_aba=PASS delegated_parent=BOUND "
 		"session_identity=REQUIRED pidfd_preflight=EARLY "
-		"low_rlimit=PASS churn=BOUNDED "
+		"low_rlimit=PASS churn=BOUNDED compaction_deadline=PASS "
+		"containment_deadline=PASS signal_deadline=PASS "
+		"cgroup_create_faults=PASS cgroup_create_swap=PASS "
+		"cgroup_prebind=PASS prebind_drain=BOUNDED empty_sort=PASS "
 		"proc_root_scan=ABSENT "
 		"timeout=PASS endpoints=5 "
 		"guest_endpoint_fail_closed=PASS");

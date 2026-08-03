@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -45,6 +46,14 @@ struct rootless_shutdown_session_state {
 	char cgroup_path[PATH_MAX];
 };
 
+#ifndef DARLING_ROOTLESS_SHUTDOWN_TESTING
+enum rootless_shutdown_cgroup_create_phase {
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN = 1,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE = 2,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN = 3,
+};
+#endif
+
 static const struct rootless_shutdown_policy default_policy = {
 	.acquisition_timeout_ms = 1000,
 	.pidfd_budget = 0,
@@ -62,8 +71,16 @@ static int snapshot_replacement_enabled;
 static void (*membership_checkpoint)(void);
 static void (*membership_read_checkpoint)(size_t);
 static void (*snapshot_sorted_checkpoint)(unsigned);
+static void (*ledger_compact_checkpoint)(unsigned, size_t);
+static void (*containment_checkpoint)(void);
+static void (*signal_checkpoint)(int, size_t);
 static int (*test_monotonic_clock)(unsigned long long*);
 static void (*session_publish_checkpoint)(void);
+static void (*cgroup_create_checkpoint)(unsigned, int, const char*);
+static unsigned cgroup_create_error_phase;
+static int cgroup_create_error_number;
+static size_t prebind_event_budget_override;
+static void (*prebind_event_checkpoint)(size_t);
 
 void rootless_shutdown_test_set_snapshot_replacement(pid_t pid, int enabled)
 {
@@ -108,6 +125,48 @@ void rootless_shutdown_test_set_session_publish_checkpoint(
 	void (*checkpoint)(void))
 {
 	session_publish_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_ledger_compact_checkpoint(
+	void (*checkpoint)(unsigned, size_t))
+{
+	ledger_compact_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_containment_checkpoint(
+	void (*checkpoint)(void))
+{
+	containment_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_signal_checkpoint(
+	void (*checkpoint)(int, size_t))
+{
+	signal_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_cgroup_create_checkpoint(
+	void (*checkpoint)(unsigned, int, const char*))
+{
+	cgroup_create_checkpoint = checkpoint;
+}
+
+void rootless_shutdown_test_set_cgroup_create_error(
+	unsigned phase, int error_number)
+{
+	cgroup_create_error_phase = phase;
+	cgroup_create_error_number = error_number;
+}
+
+void rootless_shutdown_test_set_prebind_event_budget(size_t budget)
+{
+	prebind_event_budget_override = budget;
+}
+
+void rootless_shutdown_test_set_prebind_event_checkpoint(
+	void (*checkpoint)(size_t))
+{
+	prebind_event_checkpoint = checkpoint;
 }
 #endif
 
@@ -693,6 +752,206 @@ static int closure_named_identity(
 	return 0;
 }
 
+struct cgroup_prebind_watch {
+	int fd;
+	int watch;
+};
+
+#define CGROUP_PREBIND_WATCH_INITIALIZER { .fd = -1, .watch = -1 }
+#define CGROUP_PREBIND_EVENT_BUDGET 4096U
+#define CGROUP_PREBIND_DRAIN_TIMEOUT_MS 250U
+
+static int monotonic_milliseconds(unsigned long long* milliseconds);
+
+static void cgroup_prebind_watch_release(struct cgroup_prebind_watch* watch)
+{
+	if (watch->watch >= 0 && watch->fd >= 0)
+		(void)inotify_rm_watch(watch->fd, watch->watch);
+	if (watch->fd >= 0)
+		close(watch->fd);
+	*watch = (struct cgroup_prebind_watch)
+		CGROUP_PREBIND_WATCH_INITIALIZER;
+}
+
+static int cgroup_prebind_watch_arm(int parent_fd,
+	struct cgroup_prebind_watch* watch)
+{
+	char proc_path[64];
+	int length = snprintf(proc_path, sizeof(proc_path),
+		"/proc/self/fd/%d", parent_fd);
+	if (length < 0 || (size_t)length >= sizeof(proc_path))
+		return -EOVERFLOW;
+	watch->fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+	if (watch->fd < 0)
+		return -errno;
+	watch->watch = inotify_add_watch(watch->fd, proc_path,
+		IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
+		IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR);
+	if (watch->watch < 0) {
+		int status = -errno;
+		cgroup_prebind_watch_release(watch);
+		return status;
+	}
+	return 0;
+}
+
+static int cgroup_prebind_watch_finish(struct cgroup_prebind_watch* watch,
+	const char* leaf)
+{
+	char buffer[4096]
+		__attribute__((aligned(__alignof__(struct inotify_event))));
+	unsigned creates = 0;
+	int conflict = 0;
+	int status = 0;
+	size_t event_count = 0;
+	size_t event_budget = CGROUP_PREBIND_EVENT_BUDGET;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (prebind_event_budget_override != 0)
+		event_budget = prebind_event_budget_override;
+#endif
+	unsigned long long now = 0;
+	status = monotonic_milliseconds(&now);
+	if (status != 0)
+		goto out;
+	unsigned long long deadline = now + CGROUP_PREBIND_DRAIN_TIMEOUT_MS;
+	int sealed_watch = watch->watch;
+	if (inotify_rm_watch(watch->fd, sealed_watch) != 0) {
+		status = -errno;
+		goto out;
+	}
+	watch->watch = -1;
+	int saw_ignored = 0;
+	for (;;) {
+		status = monotonic_milliseconds(&now);
+		if (status != 0)
+			break;
+		if (now >= deadline) {
+			status = -ETIMEDOUT;
+			break;
+		}
+		ssize_t length = read(watch->fd, buffer, sizeof(buffer));
+		if (length < 0 && errno == EINTR)
+			continue;
+		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			break;
+		if (length < 0) {
+			status = -errno;
+			break;
+		}
+		if (length == 0) {
+			status = -EIO;
+			break;
+		}
+		for (char* cursor = buffer; cursor < buffer + length;) {
+			struct inotify_event* event = (struct inotify_event*)cursor;
+			event_count++;
+			if (event_count > event_budget) {
+				status = -EOVERFLOW;
+				break;
+			}
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+			if (prebind_event_checkpoint != NULL)
+				prebind_event_checkpoint(event_count);
+#endif
+			status = monotonic_milliseconds(&now);
+			if (status != 0 || now >= deadline) {
+				if (status == 0)
+					status = -ETIMEDOUT;
+				break;
+			}
+			if ((event->mask & IN_Q_OVERFLOW) != 0)
+				conflict = 1;
+			if (event->wd == sealed_watch &&
+				(event->mask & IN_IGNORED) != 0)
+				saw_ignored = 1;
+			if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) != 0)
+				conflict = 1;
+			if (event->wd == sealed_watch && event->len != 0 &&
+				strcmp(event->name, leaf) == 0) {
+				if ((event->mask & (IN_CREATE | IN_ISDIR)) ==
+					(IN_CREATE | IN_ISDIR) &&
+					(event->mask & (IN_DELETE | IN_MOVED_FROM |
+					 IN_MOVED_TO)) == 0)
+					creates++;
+				else
+					conflict = 1;
+			}
+			cursor += sizeof(*event) + event->len;
+		}
+		if (status != 0)
+			break;
+	}
+out:
+	cgroup_prebind_watch_release(watch);
+	if (status != 0)
+		return status;
+	return !conflict && saw_ignored && creates == 1 ? 0 : -ESTALE;
+}
+
+static int named_directory_matches_fd(int parent_fd, const char* leaf,
+	int directory_fd, const struct stat* expected)
+{
+	struct stat opened;
+	struct stat named;
+	if (parent_fd < 0 || leaf == NULL || leaf[0] == '\0' ||
+		directory_fd < 0)
+		return -EINVAL;
+	if (fstat(directory_fd, &opened) != 0 ||
+		fstatat(parent_fd, leaf, &named, AT_SYMLINK_NOFOLLOW) != 0)
+		return -errno;
+	if (!S_ISDIR(opened.st_mode) || !S_ISDIR(named.st_mode) ||
+		opened.st_dev != named.st_dev || opened.st_ino != named.st_ino ||
+		(expected != NULL && (opened.st_dev != expected->st_dev ||
+		 opened.st_ino != expected->st_ino)))
+		return -ESTALE;
+	return 0;
+}
+
+static int chmod_directory_capability(int directory_fd, mode_t mode)
+{
+#ifdef SYS_fchmodat2
+	if (syscall(SYS_fchmodat2, directory_fd, "", mode, AT_EMPTY_PATH) == 0)
+		return 0;
+	if (errno != ENOSYS)
+		return -errno;
+#endif
+	char proc_path[64];
+	int length = snprintf(proc_path, sizeof(proc_path),
+		"/proc/self/fd/%d", directory_fd);
+	if (length < 0 || (size_t)length >= sizeof(proc_path))
+		return -EOVERFLOW;
+	return chmod(proc_path, mode) == 0 ? 0 : -errno;
+}
+
+static int cgroup_create_checkpoint_status(unsigned phase, int parent_fd,
+	const char* leaf)
+{
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	if (cgroup_create_checkpoint != NULL)
+		cgroup_create_checkpoint(phase, parent_fd, leaf);
+	if (cgroup_create_error_phase == phase &&
+		cgroup_create_error_number != 0)
+		return -cgroup_create_error_number;
+#else
+	(void)phase;
+	(void)parent_fd;
+	(void)leaf;
+#endif
+	return 0;
+}
+
+static int remove_created_cgroup_if_owned(int parent_fd, const char* leaf,
+	int directory_fd, const struct stat* expected)
+{
+	int status = named_directory_matches_fd(parent_fd, leaf,
+		directory_fd, expected);
+	if (status != 0)
+		return status;
+	if (unlinkat(parent_fd, leaf, AT_REMOVEDIR) != 0)
+		return -errno;
+	return 0;
+}
+
 static int remove_owned_session_state(
 	struct rootless_shutdown_closure_capability* capability)
 {
@@ -781,6 +1040,12 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	struct rootless_shutdown_closure_capability local =
 		ROOTLESS_SHUTDOWN_CLOSURE_CAPABILITY_INITIALIZER;
 	int created = 0;
+	int created_path_fd = -1;
+	int prebind_reserve_fd = -1;
+	struct stat created_identity = {0};
+	int created_identity_valid = 0;
+	struct cgroup_prebind_watch prebind_watch =
+		CGROUP_PREBIND_WATCH_INITIALIZER;
 	int state_published = 0;
 	int status = rootless_shutdown_pidfd_preflight();
 	if (status != 0)
@@ -798,13 +1063,87 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		parent_path, sizeof(parent_path));
 	if (status != 0)
 		goto fail;
+	/* Reserve one descriptor before mutation. If the first O_PATH acquisition
+	 * hits the descriptor limit, releasing this reserve makes the recovery
+	 * acquisition deterministic instead of leaving an unbound directory. */
+	prebind_reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (prebind_reserve_fd < 0) {
+		status = -errno;
+		goto fail;
+	}
+	status = cgroup_prebind_watch_arm(local.parent_fd, &prebind_watch);
+	if (status != 0)
+		goto fail;
 	if (mkdirat(local.parent_fd, local.leaf, 0700) != 0) {
 		status = -errno;
 		goto fail;
 	}
 	created = 1;
-	if (fchmodat(local.parent_fd, local.leaf, 0700, 0) != 0) {
+	int prebind_status = cgroup_create_checkpoint_status(
+		ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN,
+		local.parent_fd, local.leaf);
+	if (prebind_status == 0) {
+		created_path_fd = openat(local.parent_fd, local.leaf,
+			O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (created_path_fd < 0)
+			prebind_status = -errno;
+	}
+	/* A failed primary acquisition still gets one recovery acquisition while
+	 * the parent event watch is authoritative. This allows exact rollback of
+	 * the directory created by mkdirat without ever deleting a replacement. */
+	close(prebind_reserve_fd);
+	prebind_reserve_fd = -1;
+	if (created_path_fd < 0)
+		created_path_fd = openat(local.parent_fd, local.leaf,
+			O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	int watch_status = cgroup_prebind_watch_finish(
+		&prebind_watch, local.leaf);
+	if (watch_status != 0) {
+		status = watch_status;
+		goto fail;
+	}
+	if (created_path_fd < 0) {
+		status = prebind_status != 0 ? prebind_status : -errno;
+		goto fail;
+	}
+	if (fstat(created_path_fd, &created_identity) != 0) {
 		status = -errno;
+		goto fail;
+	}
+	if (!S_ISDIR(created_identity.st_mode) ||
+		created_identity.st_uid != geteuid()) {
+		status = -EPERM;
+		goto fail;
+	}
+	created_identity_valid = 1;
+	status = named_directory_matches_fd(local.parent_fd, local.leaf,
+		created_path_fd, &created_identity);
+	if (status != 0)
+		goto fail;
+	if (prebind_status != 0) {
+		status = prebind_status;
+		goto fail;
+	}
+	status = cgroup_create_checkpoint_status(
+		ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE,
+		local.parent_fd, local.leaf);
+	if (status != 0)
+		goto fail;
+	status = chmod_directory_capability(created_path_fd, 0700);
+	if (status != 0)
+		goto fail;
+	status = named_directory_matches_fd(local.parent_fd, local.leaf,
+		created_path_fd, &created_identity);
+	if (status != 0)
+		goto fail;
+	struct stat mode_identity;
+	if (fstat(created_path_fd, &mode_identity) != 0) {
+		status = -errno;
+		goto fail;
+	}
+	if ((mode_identity.st_mode & 0777) != 0700 ||
+		mode_identity.st_uid != geteuid()) {
+		status = -EPERM;
 		goto fail;
 	}
 	int length = snprintf(local.path, sizeof(local.path), "%s/%s",
@@ -813,6 +1152,15 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 		status = -ENAMETOOLONG;
 		goto fail;
 	}
+	status = cgroup_create_checkpoint_status(
+		ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN,
+		local.parent_fd, local.leaf);
+	if (status != 0)
+		goto fail;
+	status = named_directory_matches_fd(local.parent_fd, local.leaf,
+		created_path_fd, &created_identity);
+	if (status != 0)
+		goto fail;
 	local.directory_fd = openat(local.parent_fd, local.leaf,
 		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (local.directory_fd < 0) {
@@ -832,6 +1180,14 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	if (fstat(local.prefix_fd, &prefix_identity) != 0 ||
 		fstat(local.directory_fd, &cgroup_identity) != 0) {
 		status = -errno;
+		goto fail;
+	}
+	status = named_directory_matches_fd(local.parent_fd, local.leaf,
+		local.directory_fd, &created_identity);
+	if (status != 0 || cgroup_identity.st_dev != mode_identity.st_dev ||
+		cgroup_identity.st_ino != mode_identity.st_ino) {
+		if (status == 0)
+			status = -ESTALE;
 		goto fail;
 	}
 	if ((cgroup_identity.st_mode & 0777) != 0700 ||
@@ -862,20 +1218,36 @@ int rootless_shutdown_prepare_closure(const darling_runtime_prefix prefix,
 	if (status != 0)
 		goto fail;
 	state_published = 1;
+	close(created_path_fd);
+	created_path_fd = -1;
 	*capability = local;
 	if (error != NULL && error_size != 0)
 		error[0] = '\0';
 	return 0;
 fail:
+	cgroup_prebind_watch_release(&prebind_watch);
+	if (prebind_reserve_fd >= 0)
+		close(prebind_reserve_fd);
 	if (state_published)
 		(void)remove_owned_session_state(&local);
-	if (created && local.directory_fd >= 0) {
-		int populated = 1;
-		if (cgroup_populated_fd(local.directory_fd, &populated) == 0 &&
-			!populated && local.parent_fd >= 0 &&
-			closure_named_identity(&local) == 0)
-			(void)unlinkat(local.parent_fd, local.leaf, AT_REMOVEDIR);
+	if (created && local.parent_fd >= 0) {
+		int cleanup_fd = local.directory_fd >= 0
+			? local.directory_fd : created_path_fd;
+		if (cleanup_fd >= 0 && created_identity_valid &&
+			named_directory_matches_fd(local.parent_fd, local.leaf,
+				cleanup_fd, &created_identity) == 0) {
+			int populated = 0;
+			if (local.directory_fd >= 0 &&
+				cgroup_populated_fd(local.directory_fd, &populated) != 0)
+				populated = 1;
+			if (!populated)
+				(void)remove_created_cgroup_if_owned(local.parent_fd,
+					local.leaf, cleanup_fd,
+					created_identity_valid ? &created_identity : NULL);
+		}
 	}
+	if (created_path_fd >= 0)
+		close(created_path_fd);
 	rootless_shutdown_release_closure(&local);
 	return shutdown_error(error, error_size, -status,
 		"cannot prepare rootless shutdown cgroup: %s", strerror(-status));
@@ -1190,7 +1562,8 @@ static int compare_pids(const void* left, const void* right)
 
 static void sort_pid_list(pid_t* members, size_t count)
 {
-	qsort(members, count, sizeof(*members), compare_pids);
+	if (count >= 2)
+		qsort(members, count, sizeof(*members), compare_pids);
 }
 
 static int pid_lists_equal(const pid_t* left, size_t left_count,
@@ -1250,18 +1623,47 @@ static int ledger_add(struct process_ledger* ledger, pid_t pid,
 }
 
 static int ledger_compact(struct process_ledger* ledger,
-	const pid_t* members, size_t member_count)
+	const pid_t* members, size_t member_count,
+	unsigned long long deadline, unsigned snapshot_ordinal)
 {
 	size_t kept = 0;
 	size_t member = 0;
+	size_t original_count = ledger->count;
 	for (size_t index = 0; index < ledger->count; ++index) {
+		int status = deadline_not_expired(deadline);
+		if (status != 0) {
+			memmove(&ledger->identities[kept],
+				&ledger->identities[index],
+				(original_count - index) * sizeof(*ledger->identities));
+			ledger->count = kept + original_count - index;
+			return status;
+		}
 		struct process_identity identity = ledger->identities[index];
 		while (member < member_count && members[member] < identity.pid)
 			member++;
 		int active = 0;
-		int status = process_pidfd_active(identity.pidfd, &active);
-		if (status != 0)
+		status = process_pidfd_active(identity.pidfd, &active);
+		if (status != 0) {
+			memmove(&ledger->identities[kept],
+				&ledger->identities[index],
+				(original_count - index) * sizeof(*ledger->identities));
+			ledger->count = kept + original_count - index;
 			return status;
+		}
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (ledger_compact_checkpoint != NULL)
+			ledger_compact_checkpoint(snapshot_ordinal, index + 1);
+#else
+		(void)snapshot_ordinal;
+#endif
+		status = deadline_not_expired(deadline);
+		if (status != 0) {
+			memmove(&ledger->identities[kept],
+				&ledger->identities[index],
+				(original_count - index) * sizeof(*ledger->identities));
+			ledger->count = kept + original_count - index;
+			return status;
+		}
 		if (!active || member == member_count ||
 			members[member] != identity.pid) {
 			close(identity.pidfd);
@@ -1270,7 +1672,7 @@ static int ledger_compact(struct process_ledger* ledger,
 		ledger->identities[kept++] = identity;
 	}
 	ledger->count = kept;
-	return 0;
+	return deadline_not_expired(deadline);
 }
 
 static void ledger_release(struct process_ledger* ledger)
@@ -1425,7 +1827,11 @@ static int acquire_runtime_closure(
 		status = deadline_not_expired(deadline);
 		if (status != 0)
 			goto round_done;
-		status = ledger_compact(ledger, before, before_count);
+		status = ledger_compact(ledger, before, before_count,
+			deadline, 1);
+		if (status != 0)
+			goto round_done;
+		status = deadline_not_expired(deadline);
 		if (status != 0)
 			goto round_done;
 		if (before_count > pidfd_budget) {
@@ -1455,11 +1861,24 @@ static int acquire_runtime_closure(
 		status = deadline_not_expired(deadline);
 		if (status != 0)
 			goto round_done;
-		status = ledger_compact(ledger, after, after_count);
+		status = ledger_compact(ledger, after, after_count,
+			deadline, 2);
 		if (status != 0)
 			goto round_done;
-		if (pid_lists_equal(before, before_count, after, after_count) &&
-			ledger_contains_all_members(ledger, after, after_count)) {
+		status = deadline_not_expired(deadline);
+		if (status != 0)
+			goto round_done;
+		int complete = pid_lists_equal(before, before_count,
+			after, after_count) &&
+			ledger_contains_all_members(ledger, after, after_count);
+		if (complete) {
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+			if (containment_checkpoint != NULL)
+				containment_checkpoint();
+#endif
+			status = deadline_not_expired(deadline);
+			if (status != 0)
+				goto round_done;
 			status = 0;
 			free(before);
 			free(after);
@@ -1505,6 +1924,9 @@ static int signal_runtime_closure(pid_t init_process,
 		return status;
 	unsigned descendants = 0;
 	struct process_identity* root = NULL;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+	size_t signal_ordinal = 0;
+#endif
 	*active = 0;
 	for (size_t index = 0; index < ledger->count; ++index) {
 		struct process_identity* identity = &ledger->identities[index];
@@ -1521,11 +1943,28 @@ static int signal_runtime_closure(pid_t init_process,
 			continue;
 		}
 		descendants++;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (signal_checkpoint != NULL)
+			signal_checkpoint(signal_number, signal_ordinal + 1);
+#endif
+		status = deadline_not_expired(acquisition_deadline);
+		if (status != 0)
+			return status;
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		signal_ordinal++;
+#endif
 		status = signal_process_pidfd(identity->pidfd, signal_number);
 		if (status != 0)
 			return status;
 	}
 	if (descendants == 0 && root != NULL) {
+#ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+		if (signal_checkpoint != NULL)
+			signal_checkpoint(signal_number, signal_ordinal + 1);
+#endif
+		status = deadline_not_expired(acquisition_deadline);
+		if (status != 0)
+			return status;
 		status = signal_process_pidfd(root->pidfd, signal_number);
 		if (status != 0)
 			return status;

@@ -103,6 +103,12 @@ int shutdown_rootless_runtime(
 );
 
 #ifdef DARLING_ROOTLESS_SHUTDOWN_TESTING
+enum rootless_shutdown_test_cgroup_create_phase {
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_CAPABILITY_OPEN = 1,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_MODE = 2,
+	ROOTLESS_SHUTDOWN_TEST_CGROUP_BEFORE_READABLE_OPEN = 3,
+};
+
 void rootless_shutdown_test_set_pidfd_open_checkpoint(
 	void (*checkpoint)(pid_t)
 );
@@ -121,6 +127,26 @@ void rootless_shutdown_test_set_monotonic_clock(
 );
 void rootless_shutdown_test_set_session_publish_checkpoint(
 	void (*checkpoint)(void)
+);
+void rootless_shutdown_test_set_ledger_compact_checkpoint(
+	void (*checkpoint)(unsigned, size_t)
+);
+void rootless_shutdown_test_set_containment_checkpoint(
+	void (*checkpoint)(void)
+);
+void rootless_shutdown_test_set_signal_checkpoint(
+	void (*checkpoint)(int, size_t)
+);
+void rootless_shutdown_test_set_cgroup_create_checkpoint(
+	void (*checkpoint)(unsigned, int, const char*)
+);
+void rootless_shutdown_test_set_cgroup_create_error(
+	unsigned phase,
+	int error_number
+);
+void rootless_shutdown_test_set_prebind_event_budget(size_t budget);
+void rootless_shutdown_test_set_prebind_event_checkpoint(
+	void (*checkpoint)(size_t)
 );
 #endif
 
