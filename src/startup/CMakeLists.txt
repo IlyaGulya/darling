@@ -25,6 +25,10 @@ target_compile_definitions(darling PRIVATE
 	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
 )
 
+if(DARLING_LIFECYCLE_COHORT_V1)
+	target_compile_definitions(darling PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+endif()
+
 target_link_libraries(darling -lutil)
 
 add_executable(darling_rootless_shutdown_session_test EXCLUDE_FROM_ALL

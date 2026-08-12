@@ -52,6 +52,9 @@
 #include "launchd.h"
 #include "runtime.h"
 #include "core.h"
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include "../../lifecycle/lifecycle_cohort_client.h"
+#endif
 
 extern char **environ;
 
@@ -65,6 +68,14 @@ static void ipc_readmsg(launch_data_t msg, void *context);
 static void ipc_listen_callback(void *obj __attribute__((unused)), struct kevent *kev);
 
 static kq_callback kqipc_listen_callback = ipc_listen_callback;
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+static int
+lifecycle_activate_launchd_endpoint(int endpoint_fd, void *context __attribute__((unused)))
+{
+	return kevent_mod(endpoint_fd, EVFILT_READ, EV_ADD, 0, 0, &kqipc_listen_callback);
+}
+#endif
 
 static pid_t ipc_self = 0;
 
@@ -80,6 +91,15 @@ ipc_clean_up(void)
 		return;
 	}
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (darling_lifecycle_cohort_enabled()) {
+		if (darling_lifecycle_retire_endpoint(DARLING_LIFECYCLE_ENDPOINT_LAUNCHD) != 0) {
+			launchd_syslog(LOG_WARNING, "Rust lifecycle controller refused launchd endpoint retirement");
+		}
+		return;
+	}
+#endif
+
 	if (-1 == unlink(sockpath)) {
 		launchd_syslog(LOG_WARNING, "unlink(\"%s\"): %s", sockpath, strerror(errno));
 	} else if (-1 == rmdir(sockdir)) {
@@ -94,6 +114,7 @@ ipc_server_init(void)
 	mode_t oldmask;
 	int r, fd = -1;
 	char ourdir[1024];
+	bool endpoint_registered = false;
 
 	if (ipc_inited) {
 		return;
@@ -101,6 +122,28 @@ ipc_server_init(void)
 
 	memset(&sun, 0, sizeof(sun));
 	sun.sun_family = AF_UNIX;
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (darling_lifecycle_cohort_enabled()) {
+		if (!pid1_magic) {
+			launchd_syslog(LOG_ERR, "Rust lifecycle cohort v1 does not authorize per-user launchd endpoints");
+			goto out_bad;
+		}
+		strcpy(ourdir, LAUNCHD_SOCK_PREFIX);
+		strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
+		fd = darling_lifecycle_publish_and_activate_endpoint(
+			DARLING_LIFECYCLE_ENDPOINT_LAUNCHD,
+			&lifecycle_activate_launchd_endpoint,
+			NULL
+		);
+		if (fd < 0) {
+			launchd_syslog(LOG_ERR, "Rust lifecycle controller refused launchd endpoint publication/activation");
+			goto out_bad;
+		}
+		endpoint_registered = true;
+		goto endpoint_ready;
+	}
+#endif
 
 	if (pid1_magic) {
 		strcpy(ourdir, LAUNCHD_SOCK_PREFIX);
@@ -159,7 +202,9 @@ ipc_server_init(void)
 		goto out_bad;
 	}
 
-	if (kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &kqipc_listen_callback) == -1) {
+endpoint_ready:
+
+	if (!endpoint_registered && kevent_mod(fd, EVFILT_READ, EV_ADD, 0, 0, &kqipc_listen_callback) == -1) {
 		launchd_syslog(LOG_ERR, "kevent_mod(\"thesocket\", EVFILT_READ): %s", strerror(errno));
 		goto out_bad;
 	}
@@ -257,6 +302,14 @@ ipc_callback(void *obj, struct kevent *kev)
 static void 
 set_user_env(launch_data_t obj, const char *key, void *context __attribute__((unused)))
 {
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (!strcmp(key, "DARLING_LIFECYCLE_COHORT_V1") ||
+			!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NAME") ||
+			!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NONCE")) {
+		launchd_syslog(LOG_WARNING, "Refusing to mutate reserved lifecycle environment key: %s", key);
+		return;
+	}
+#endif
 	const char *v = launch_data_get_string(obj);
 	if (v) {
 		setenv(key, v, 1);
@@ -264,6 +317,24 @@ set_user_env(launch_data_t obj, const char *key, void *context __attribute__((un
 		launchd_syslog(LOG_WARNING, "Attempt to set NULL environment variable: %s (type = %d)", key, launch_data_get_type(obj));
 	}
 }
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+static bool
+lifecycle_reserved_environment_key(const char *key)
+{
+	return !strcmp(key, "DARLING_LIFECYCLE_COHORT_V1") ||
+		!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NAME") ||
+		!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NONCE");
+}
+
+static void
+find_reserved_lifecycle_environment_key(launch_data_t obj __attribute__((unused)), const char *key, void *context)
+{
+	if (lifecycle_reserved_environment_key(key)) {
+		*(bool *)context = true;
+	}
+}
+#endif
 
 void
 ipc_close_all_with_job(job_t j)
@@ -430,11 +501,28 @@ ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 					resp = launch_data_new_errno(errno);
 				}
 			} else if (!strcmp(cmd, LAUNCH_KEY_UNSETUSERENVIRONMENT)) {
-				unsetenv(launch_data_get_string(data));
-				resp = launch_data_new_errno(0);
+				const char *key = launch_data_get_string(data);
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+				if (key && lifecycle_reserved_environment_key(key)) {
+					resp = launch_data_new_errno(EACCES);
+				} else
+#endif
+				{
+					unsetenv(key);
+					resp = launch_data_new_errno(0);
+				}
 			} else if (!strcmp(cmd, LAUNCH_KEY_SETUSERENVIRONMENT)) {
-				launch_data_dict_iterate(data, set_user_env, NULL);
-				resp = launch_data_new_errno(0);
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+				bool reserved = false;
+				launch_data_dict_iterate(data, find_reserved_lifecycle_environment_key, &reserved);
+				if (reserved) {
+					resp = launch_data_new_errno(EACCES);
+				} else
+#endif
+				{
+					launch_data_dict_iterate(data, set_user_env, NULL);
+					resp = launch_data_new_errno(0);
+				}
 			} else if (!strcmp(cmd, LAUNCH_KEY_SETRESOURCELIMITS)) {
 				resp = adjust_rlimits(data);
 			} else if (!strcmp(cmd, LAUNCH_KEY_GETJOB)) {

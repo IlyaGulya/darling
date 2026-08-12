@@ -139,6 +139,13 @@ option(TARGET_x86_64 "Enable x86_64 slices" ON)
 option(DEBIAN_PACKAGING "Packaging for Debian" OFF)
 option(ENABLE_TESTS "Install in-prefix unit tests" OFF)
 option(REGENERATE_SDK "Regenerate Header Files For Open Source SDK" OFF)
+option(DARLING_LIFECYCLE_COHORT_V1 "Build the opt-in Rust lifecycle endpoint cohort" OFF)
+set(
+	DARLING_LIFECYCLE_CONTROLLER_CRATE
+	"${CMAKE_SOURCE_DIR}/../darling-workspace/lifecycle/operation-boundary"
+	CACHE PATH
+	"Path to the Rust lifecycle operation-boundary crate"
+)
 
 if (DEBIAN_PACKAGING)
 	set(COMPONENTS_DEFAULT "all")

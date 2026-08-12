@@ -61,6 +61,16 @@ static enum darling_runtime_mode g_runtimeMode = DARLING_RUNTIME_MODE_INVALID;
 static darling_runtime_prefix g_runtimePrefix =
 	DARLING_RUNTIME_PREFIX_INITIALIZER;
 
+static bool lifecycleCohortEnabled(void)
+{
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	const char* enabled = getenv("DARLING_LIFECYCLE_COHORT_V1");
+	return enabled && strcmp(enabled, "1") == 0;
+#else
+	return false;
+#endif
+}
+
 static void closeRuntimePrefix(void)
 {
 	darling_runtime_mode_close_prefix(g_runtimePrefix);
@@ -103,6 +113,21 @@ static void removeRuntimeStateFiles(void)
 				entries[index], 0, true, error, sizeof(error)) != 0) {
 			fprintf(stderr, "Cannot remove Darling runtime state %s: %s\n",
 				entries[index], error);
+			exit(1);
+		}
+	}
+}
+
+static void retireStaleInitPid(void)
+{
+	// In the routed cohort, only the Rust controller may mutate `.init.pid`.
+	// A stale observation is returned to the boot path; controller acquisition
+	// performs the exact lease-scoped replacement.
+	if (!lifecycleCohortEnabled()) {
+		char error[512] = {0};
+		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
+				".init.pid", 0, false, error, sizeof(error)) != 0) {
+			fprintf(stderr, "Cannot remove stale prefix init PID: %s\n", error);
 			exit(1);
 		}
 	}
@@ -357,7 +382,7 @@ int main(int argc, char ** argv)
 	// If prefix's init is not running, start it up
 	if (pidInit == 0)
 	{
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
+		if (!lifecycleCohortEnabled() && darling_runtime_mode_unlink_relative(g_runtimePrefix,
 				"var/run/shellspawn.sock", 0, true,
 				runtimeModeError, sizeof(runtimeModeError)) != 0) {
 			fprintf(stderr, "Cannot clear stale shellspawn socket: %s\n",
@@ -366,7 +391,8 @@ int main(int argc, char ** argv)
 		}
 		setupWorkdir();
 		pidInit = spawnInitProcess();
-		putInitPid(pidInit);
+		if (!lifecycleCohortEnabled())
+			putInitPid(pidInit);
 		if (!rootless)
 		{
 			// The namespace-based launcher keeps its existing bounded startup wait.
@@ -1183,8 +1209,16 @@ pid_t spawnInitProcess(void)
 
 	// Wait for the child to drop UID/GIDs and unshare stuff
 	close(pipefd[1]);
-	read(pipefd[0], buffer, 1);
+	ssize_t readyCount;
+	do {
+		readyCount = read(pipefd[0], buffer, 1);
+	} while (readyCount < 0 && errno == EINTR);
 	close(pipefd[0]);
+	if (readyCount != 1 || buffer[0] != '.')
+	{
+		fprintf(stderr, "Darlingserver failed before lifecycle readiness\n");
+		exit(1);
+	}
 
 	/*
 	snprintf(idmap, sizeof(idmap), "/proc/%d/uid_map", pid);
@@ -1351,12 +1385,7 @@ pid_t getInitProcess()
 		close(pidFD) != 0) {
 		int saved_errno = errno;
 		close(pidFD);
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove invalid prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		errno = saved_errno;
 		return 0;
 	}
@@ -1367,12 +1396,7 @@ pid_t getInitProcess()
 		pidEnd++;
 	if (errno != 0 || pidEnd == pidBuffer || pidEnd == NULL ||
 		*pidEnd != '\0' || parsed_pid <= 0 || (pid_t)parsed_pid != parsed_pid) {
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove malformed prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		return 0;
 	}
 	pid = (pid_t)parsed_pid;
@@ -1380,12 +1404,7 @@ pid_t getInitProcess()
 	// Does the process exist?
 	if (kill(pid, 0) == -1)
 	{
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove stale prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		return 0;
 	}
 
@@ -1394,36 +1413,21 @@ pid_t getInitProcess()
 	fp = fopen(procBuf, "r");
 	if (fp == NULL)
 	{
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove unverifiable prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		return 0;
 	}
 
 	if (fscanf(fp, "%ms", &exeBuf) != 1)
 	{
 		fclose(fp);
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove unreadable prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		return 0;
 	}
 	fclose(fp);
 
 	if (strcmp(exeBuf, "darlingserver") != 0)
 	{
-		if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-				".init.pid", 0, false, error, sizeof(error)) != 0) {
-			fprintf(stderr, "Cannot remove foreign prefix init PID: %s\n",
-				error);
-			exit(1);
-		}
+		retireStaleInitPid();
 		return 0;
 	}
 	free(exeBuf);
@@ -1435,14 +1439,7 @@ pid_t getInitProcess()
 		fp = fopen(procBuf, "r");
 		if (fp == NULL)
 		{
-			if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-					".init.pid", 0, false,
-					error, sizeof(error)) != 0) {
-				fprintf(stderr,
-					"Cannot remove unowned prefix init PID: %s\n",
-					error);
-				exit(1);
-			}
+			retireStaleInitPid();
 			return 0;
 		}
 
@@ -1475,14 +1472,7 @@ pid_t getInitProcess()
 
 		if (!uidMatch || !gidMatch)
 		{
-			if (darling_runtime_mode_unlink_relative(g_runtimePrefix,
-					".init.pid", 0, false,
-					error, sizeof(error)) != 0) {
-				fprintf(stderr,
-					"Cannot remove mismatched prefix init PID: %s\n",
-					error);
-				exit(1);
-			}
+			retireStaleInitPid();
 			return 0;
 		}
 	}
