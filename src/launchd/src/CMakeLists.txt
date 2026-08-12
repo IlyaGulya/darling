@@ -51,9 +51,15 @@ set(launchd_sources
 	#${CMAKE_CURRENT_BINARY_DIR}/job_typesUser.c
 )
 
+if(DARLING_LIFECYCLE_COHORT_V1)
+	list(APPEND launchd_sources ../../lifecycle/lifecycle_cohort_client.c)
+endif()
+
 include(darling_exe)
 add_darling_executable(launchd ${launchd_sources})
+if(DARLING_LIFECYCLE_COHORT_V1)
+	target_compile_definitions(launchd PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+endif()
 target_link_libraries(launchd bsm.0)
 
 install(TARGETS launchd DESTINATION libexec/darling/sbin)
-

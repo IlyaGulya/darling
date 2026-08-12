@@ -154,6 +154,16 @@ extern int gL1CacheEnabled;
 
 extern char **environ;
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+static bool
+lifecycle_reserved_environment_key(const char *key)
+{
+	return !strcmp(key, "DARLING_LIFECYCLE_COHORT_V1") ||
+		!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NAME") ||
+		!strcmp(key, "DARLING_LIFECYCLE_CONTROL_NONCE");
+}
+#endif
+
 struct waiting_for_removal {
 	SLIST_ENTRY(waiting_for_removal) sle;
 	mach_port_t reply_port;
@@ -4748,6 +4758,17 @@ job_start_child(job_t j)
 		file2exec = j->prog ? j->prog : argv[0];
 	}
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	// The controller nonce is an endpoint capability, not part of the global
+	// guest environment. Only the first-cohort shellspawn daemon receives it;
+	// Rust additionally binds requests to kernel PID/starttime ancestry.
+	if (!j->label || strcmp(j->label, "org.darlinghq.shellspawn") != 0) {
+		unsetenv("DARLING_LIFECYCLE_COHORT_V1");
+		unsetenv("DARLING_LIFECYCLE_CONTROL_NAME");
+		unsetenv("DARLING_LIFECYCLE_CONTROL_NONCE");
+	}
+#endif
+
 	errno = psf(NULL, file2exec, NULL, &spattr, (char *const *)argv, environ);
 
 #if HAVE_SANDBOX && !TARGET_OS_EMBEDDED
@@ -4769,16 +4790,26 @@ jobmgr_export_env_from_other_jobs(jobmgr_t jm, launch_data_t dict)
 		char **tmpenviron = environ;
 		for (; *tmpenviron; tmpenviron++) {
 			char envkey[1024];
-			launch_data_t s = launch_data_alloc(LAUNCH_DATA_STRING);
-			launch_data_set_string(s, strchr(*tmpenviron, '=') + 1);
 			strncpy(envkey, *tmpenviron, sizeof(envkey));
 			*(strchr(envkey, '=')) = '\0';
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+			if (lifecycle_reserved_environment_key(envkey)) {
+				continue;
+			}
+#endif
+			launch_data_t s = launch_data_alloc(LAUNCH_DATA_STRING);
+			launch_data_set_string(s, strchr(*tmpenviron, '=') + 1);
 			launch_data_dict_insert(dict, s, envkey);
 		}
 	}
 
 	LIST_FOREACH(ji, &jm->jobs, sle) {
 		SLIST_FOREACH(ei, &ji->global_env, sle) {
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+			if (lifecycle_reserved_environment_key(ei->key)) {
+				continue;
+			}
+#endif
 			if ((tmp = launch_data_new_string(ei->value))) {
 				launch_data_dict_insert(dict, tmp, ei->key);
 			}
@@ -5976,7 +6007,11 @@ envitem_setup(launch_data_t obj, const char *key, void *context)
 		return;
 	}
 
-	if (strncmp(LAUNCHD_TRUSTED_FD_ENV, key, sizeof(LAUNCHD_TRUSTED_FD_ENV) - 1) != 0) {
+	if (strncmp(LAUNCHD_TRUSTED_FD_ENV, key, sizeof(LAUNCHD_TRUSTED_FD_ENV) - 1) != 0
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+			&& !lifecycle_reserved_environment_key(key)
+#endif
+	) {
 		envitem_new(j, key, launch_data_get_string(obj), j->importing_global_env);
 	} else {
 		job_log(j, LOG_DEBUG, "Ignoring reserved environmental variable: %s", key);

@@ -35,6 +35,9 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <signal.h>
 #include "shellspawn.h"
 #include "duct_signals.h"
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include "../lifecycle/lifecycle_cohort_client.h"
+#endif
 
 #define DBG 0
 
@@ -58,6 +61,13 @@ int main(int argc, const char** argv)
 	setupSocket();
 	listenForConnections();
 
+	#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (darling_lifecycle_cohort_enabled() &&
+		darling_lifecycle_retire_endpoint(DARLING_LIFECYCLE_ENDPOINT_SHELLSPAWN) != 0) {
+		fprintf(stderr, "Rust lifecycle controller refused shellspawn endpoint retirement\n");
+		return EXIT_FAILURE;
+	}
+	#endif
 	if (g_serverSocket != -1)
 		close(g_serverSocket);
 	return 0;
@@ -65,6 +75,16 @@ int main(int argc, const char** argv)
 
 void setupSocket(void)
 {
+	#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (darling_lifecycle_cohort_enabled()) {
+		g_serverSocket = darling_lifecycle_publish_endpoint(DARLING_LIFECYCLE_ENDPOINT_SHELLSPAWN);
+		if (g_serverSocket < 0) {
+			fprintf(stderr, "Rust lifecycle controller refused shellspawn endpoint publication\n");
+			exit(EXIT_FAILURE);
+		}
+		return;
+	}
+	#endif
 	struct sockaddr_un addr = {
 		.sun_family = AF_UNIX,
 		.sun_path = SHELLSPAWN_SOCKPATH

@@ -51,6 +51,25 @@ uid_t g_originalUid, g_originalGid;
 bool g_fixPermissions = false;
 char g_workingDirectory[4096];
 
+static bool lifecycleCohortEnabled(void)
+{
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	const char* enabled = getenv("DARLING_LIFECYCLE_COHORT_V1");
+	return enabled && strcmp(enabled, "1") == 0;
+#else
+	return false;
+#endif
+}
+
+static void retireStaleInitPid(const char* pidPath)
+{
+	// In the routed cohort, only the Rust controller may mutate `.init.pid`.
+	// A stale observation is returned to the boot path; controller acquisition
+	// performs the exact lease-scoped replacement.
+	if (!lifecycleCohortEnabled())
+		unlink(pidPath);
+}
+
 int main(int argc, char ** argv)
 {
 	pid_t pidInit;
@@ -171,11 +190,13 @@ int main(int argc, char ** argv)
 		
 		snprintf(socketPath, sizeof(socketPath), "%s"  SHELLSPAWN_SOCKPATH, prefix);
 		
-		unlink(socketPath);
+		if (!lifecycleCohortEnabled())
+			unlink(socketPath);
 		
 		setupWorkdir();
 		pidInit = spawnInitProcess();
-		putInitPid(pidInit);
+		if (!lifecycleCohortEnabled())
+			putInitPid(pidInit);
 		
 		// Wait until shellspawn starts
 		for (int i = 0; i < 15; i++)
@@ -825,8 +846,16 @@ pid_t spawnInitProcess(void)
 
 	// Wait for the child to drop UID/GIDs and unshare stuff
 	close(pipefd[1]);
-	read(pipefd[0], buffer, 1);
+	ssize_t readyCount;
+	do {
+		readyCount = read(pipefd[0], buffer, 1);
+	} while (readyCount < 0 && errno == EINTR);
 	close(pipefd[0]);
+	if (readyCount != 1 || buffer[0] != '.')
+	{
+		fprintf(stderr, "Darlingserver failed before lifecycle readiness\n");
+		exit(1);
+	}
 
 	/*
 	snprintf(idmap, sizeof(idmap), "/proc/%d/uid_map", pid);
@@ -1106,7 +1135,7 @@ pid_t getInitProcess()
 	if (fscanf(fp, "%d", &pid_i) != 1)
 	{
 		fclose(fp);
-		unlink(pidPath);
+		retireStaleInitPid(pidPath);
 		return 0;
 	}
 	fclose(fp);
@@ -1115,7 +1144,7 @@ pid_t getInitProcess()
 	// Does the process exist?
 	if (kill(pid, 0) == -1)
 	{
-		unlink(pidPath);
+		retireStaleInitPid(pidPath);
 		return 0;
 	}
 
@@ -1124,21 +1153,21 @@ pid_t getInitProcess()
 	fp = fopen(procBuf, "r");
 	if (fp == NULL)
 	{
-		unlink(pidPath);
+		retireStaleInitPid(pidPath);
 		return 0;
 	}
 
 	if (fscanf(fp, "%ms", &exeBuf) != 1)
 	{
 		fclose(fp);
-		unlink(pidPath);
+		retireStaleInitPid(pidPath);
 		return 0;
 	}
 	fclose(fp);
 
 	if (strcmp(exeBuf, "darlingserver") != 0)
 	{
-		unlink(pidPath);
+		retireStaleInitPid(pidPath);
 		return 0;
 	}
 	free(exeBuf);
@@ -1150,7 +1179,7 @@ pid_t getInitProcess()
 		fp = fopen(procBuf, "r");
 		if (fp == NULL)
 		{
-			unlink(pidPath);
+			retireStaleInitPid(pidPath);
 			return 0;
 		}
 
@@ -1183,7 +1212,7 @@ pid_t getInitProcess()
 
 		if (!uidMatch || !gidMatch)
 		{
-			unlink(pidPath);
+			retireStaleInitPid(pidPath);
 			return 0;
 		}
 	}

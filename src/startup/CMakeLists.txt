@@ -16,6 +16,10 @@ add_definitions(-DINSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}" -D_GNU_SOURCE -DMLDR_
 
 add_executable(darling darling.c)
 
+if(DARLING_LIFECYCLE_COHORT_V1)
+	target_compile_definitions(darling PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+endif()
+
 target_link_libraries(darling -lutil)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_BINARY_DIR}/src/external/darlingserver/include ${CMAKE_SOURCE_DIR}/src/external/darlingserver/include)
