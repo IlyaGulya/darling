@@ -299,8 +299,13 @@ void listenForConnections(void)
 	while (true)
 	{
 		sock = accept(g_serverSocket, (struct sockaddr*) &addr, &len);
+		if (sock == -1 && errno == EINTR)
+			continue;
 		if (sock == -1)
+		{
+			perror("Accepting shellspawn connection");
 			break;
+		}
 
 		if (fork() == 0)
 		{

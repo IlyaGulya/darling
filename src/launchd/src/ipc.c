@@ -73,7 +73,7 @@ static kq_callback kqipc_listen_callback = ipc_listen_callback;
 static int
 lifecycle_activate_launchd_endpoint(int endpoint_fd, void *context __attribute__((unused)))
 {
-	return kevent_mod(endpoint_fd, EVFILT_READ, EV_ADD, 0, 0, &kqipc_listen_callback);
+	return kevent_mod(endpoint_fd, EVFILT_READ, EV_ADD, 0, 0, &kqipc_listen_callback) == -1 ? -1 : 0;
 }
 #endif
 
