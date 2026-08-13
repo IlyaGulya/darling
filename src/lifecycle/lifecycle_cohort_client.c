@@ -17,6 +17,12 @@
 #define CONTROL_NAME_CAPACITY 80
 #define NONCE_BYTES 32
 #define PROTOCOL_VERSION 1
+#define SHELLSPAWN_LISTEN_BACKLOG 16384
+#define IMPORTED_ENDPOINT_FD_MIN 256
+#define OPERATION_PUBLISH 1
+#define OPERATION_RETIRE 2
+#define OPERATION_COMMIT 3
+#define OPERATION_ABORT 4
 
 static const uint8_t protocol_magic[8] = {'D', 'L', 'C', 'O', 'H', 'R', '1', 0};
 
@@ -37,6 +43,12 @@ struct wire_response {
 	uint16_t has_fd;
 	uint64_t device;
 	uint64_t inode;
+};
+
+struct pending_publication {
+	int control;
+	enum darling_lifecycle_endpoint_kind kind;
+	uint8_t nonce[NONCE_BYTES];
 };
 
 static int decode_nibble(char value) {
@@ -71,15 +83,10 @@ int darling_lifecycle_cohort_enabled(void) {
 	return enabled && strcmp(enabled, "1") == 0;
 }
 
-static int connect_controller(void) {
-	char name[CONTROL_NAME_CAPACITY];
+static int connect_controller(const char* name, size_t name_length) {
 #ifdef DARLING_LIFECYCLE_COHORT_TESTING
 	char test_name[4096];
 #endif
-	uint8_t ignored_nonce[NONCE_BYTES];
-	size_t name_length;
-	if (load_envelope(name, &name_length, ignored_nonce) != 0)
-		return -1;
 	const char* connect_name = name;
 	size_t connect_name_length = name_length;
 #ifdef DARLING_LIFECYCLE_COHORT_TESTING
@@ -126,19 +133,23 @@ static int connect_controller(void) {
 	return fd;
 }
 
-static int transact(enum darling_lifecycle_endpoint_kind kind, uint16_t operation) {
-	char ignored_name[CONTROL_NAME_CAPACITY];
-	size_t ignored_name_length;
+static int begin_transaction(
+	enum darling_lifecycle_endpoint_kind kind,
+	uint16_t operation,
+	struct pending_publication* pending
+) {
+	char control_name[CONTROL_NAME_CAPACITY];
+	size_t control_name_length;
 	struct wire_request request;
 	memset(&request, 0, sizeof(request));
-	if (load_envelope(ignored_name, &ignored_name_length, request.nonce) != 0)
+	if (load_envelope(control_name, &control_name_length, request.nonce) != 0)
 		return -1;
 	memcpy(request.magic, protocol_magic, sizeof(protocol_magic));
 	request.version = PROTOCOL_VERSION;
 	request.operation = operation;
 	request.endpoint = (uint16_t)kind;
 
-	int control = connect_controller();
+	int control = connect_controller(control_name, control_name_length);
 	if (control < 0)
 		return -1;
 	if (send(control, &request, sizeof(request), MSG_NOSIGNAL) != (ssize_t)sizeof(request)) {
@@ -162,7 +173,6 @@ static int transact(enum darling_lifecycle_endpoint_kind kind, uint16_t operatio
 	// starts jobs or shellspawn accepts/forks, and set FD_CLOEXEC below before
 	// exposing the descriptor to either event loop.
 	ssize_t received = recvmsg(control, &message, 0);
-	close(control);
 	int received_fd = -1;
 	int ancillary_valid = 1;
 	for (struct cmsghdr* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
@@ -192,9 +202,10 @@ static int transact(enum darling_lifecycle_endpoint_kind kind, uint16_t operatio
 		response.endpoint != (uint16_t)kind) {
 		if (received_fd >= 0)
 			close(received_fd);
+		close(control);
 		return -1;
 	}
-	if (operation == 1) {
+	if (operation == OPERATION_PUBLISH) {
 		struct stat status;
 		int socket_type = 0;
 		int accepting = 0;
@@ -209,24 +220,140 @@ static int transact(enum darling_lifecycle_endpoint_kind kind, uint16_t operatio
 			fcntl(received_fd, F_SETFD, FD_CLOEXEC) != 0) {
 			if (received_fd >= 0)
 				close(received_fd);
+			close(control);
 			return -1;
 		}
+		/* Avoid a stale libkqueue knote keyed by a low descriptor number that
+		 * was used and closed during launchd bootstrap before SCM_RIGHTS chose
+		 * the same number for this imported capability. */
+		#ifdef DARLING_LIFECYCLE_COHORT_TESTING
+		const char* adoption_fault = getenv("DARLING_LIFECYCLE_COHORT_TEST_ADOPTION_FAULT");
+		if (adoption_fault && strcmp(adoption_fault, "dup") == 0) {
+			close(received_fd);
+			close(control);
+			errno = EMFILE;
+			return -1;
+		}
+		#endif
+		int imported_fd = fcntl(received_fd, F_DUPFD_CLOEXEC, IMPORTED_ENDPOINT_FD_MIN);
+		if (imported_fd < 0) {
+			close(received_fd);
+			close(control);
+			return -1;
+		}
+		close(received_fd);
+		received_fd = imported_fd;
+		/*
+		 * The Rust controller creates and listens on the Linux socket before
+		 * transferring it. Darling's guest libkqueue listen registry is
+		 * process-local, so adopt the already-listening descriptor with an
+		 * idempotent listen(2) before a consumer registers EVFILT_READ. This
+		 * performs no namespace mutation and preserves the endpoint-specific
+		 * production backlog.
+		 */
+		int backlog = kind == DARLING_LIFECYCLE_ENDPOINT_SHELLSPAWN
+			? SHELLSPAWN_LISTEN_BACKLOG : SOMAXCONN;
+		#ifdef DARLING_LIFECYCLE_COHORT_TESTING
+		if (adoption_fault && strcmp(adoption_fault, "listen") == 0) {
+			close(received_fd);
+			close(control);
+			errno = EIO;
+			return -1;
+		}
+		#endif
+		if (listen(received_fd, backlog) != 0) {
+			close(received_fd);
+			close(control);
+			return -1;
+		}
+		if (!pending) {
+			close(received_fd);
+			close(control);
+			return -1;
+		}
+		pending->control = control;
+		pending->kind = kind;
+		memcpy(pending->nonce, request.nonce, sizeof(pending->nonce));
 		return received_fd;
 	}
 	if (response.has_fd != 0 || received_fd >= 0 || response.device != 0 || response.inode != 0) {
 		if (received_fd >= 0)
 			close(received_fd);
+		close(control);
 		return -1;
 	}
+	close(control);
 	return 0;
 }
 
+static int finish_publication(
+	struct pending_publication* pending,
+	uint16_t operation
+) {
+	struct wire_request decision;
+	memset(&decision, 0, sizeof(decision));
+	if ((operation != OPERATION_COMMIT && operation != OPERATION_ABORT) ||
+		!pending || pending->control < 0) {
+		if (pending && pending->control >= 0) {
+			close(pending->control);
+			pending->control = -1;
+		}
+		return -1;
+	}
+	int control = pending->control;
+	pending->control = -1;
+	memcpy(decision.magic, protocol_magic, sizeof(protocol_magic));
+	decision.version = PROTOCOL_VERSION;
+	decision.operation = operation;
+	decision.endpoint = (uint16_t)pending->kind;
+	memcpy(decision.nonce, pending->nonce, sizeof(decision.nonce));
+	if (send(control, &decision, sizeof(decision), MSG_NOSIGNAL) !=
+		(ssize_t)sizeof(decision)) {
+		close(control);
+		return -1;
+	}
+
+	/* A complete COMMIT message is the point of no return. The controller
+	 * records ownership before attempting this diagnostic acknowledgement, so
+	 * a lost, interrupted, or timed-out ACK must not make the client close its
+	 * already adopted endpoint and leave a live owner without a listener. */
+	int skip_ack = 0;
+	#ifdef DARLING_LIFECYCLE_COHORT_TESTING
+	const char* final_ack_fault = getenv("DARLING_LIFECYCLE_COHORT_TEST_FINAL_ACK_FAULT");
+	skip_ack = operation == OPERATION_COMMIT && final_ack_fault &&
+		strcmp(final_ack_fault, "lost") == 0;
+	#endif
+	struct wire_response response;
+	memset(&response, 0, sizeof(response));
+	ssize_t received = -1;
+	if (!skip_ack) {
+		do {
+			received = recv(control, &response, sizeof(response), 0);
+		} while (received < 0 && errno == EINTR);
+	}
+	int acknowledged = received == (ssize_t)sizeof(response) &&
+		memcmp(response.magic, protocol_magic, sizeof(protocol_magic)) == 0 &&
+		response.version == PROTOCOL_VERSION && response.status == 0 &&
+		response.endpoint == (uint16_t)pending->kind && response.has_fd == 0 &&
+		response.device == 0 && response.inode == 0;
+	close(control);
+	return operation == OPERATION_COMMIT ? 0 : (acknowledged ? 0 : -1);
+}
+
 int darling_lifecycle_publish_endpoint(enum darling_lifecycle_endpoint_kind kind) {
-	return transact(kind, 1);
+	struct pending_publication pending = {.control = -1, .kind = kind};
+	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending);
+	if (endpoint < 0)
+		return -1;
+	if (finish_publication(&pending, OPERATION_COMMIT) != 0) {
+		close(endpoint);
+		return -1;
+	}
+	return endpoint;
 }
 
 int darling_lifecycle_retire_endpoint(enum darling_lifecycle_endpoint_kind kind) {
-	return transact(kind, 2);
+	return begin_transaction(kind, OPERATION_RETIRE, NULL);
 }
 
 int darling_lifecycle_publish_and_activate_endpoint(
@@ -236,16 +363,21 @@ int darling_lifecycle_publish_and_activate_endpoint(
 ) {
 	if (!activate)
 		return -1;
-	int endpoint = darling_lifecycle_publish_endpoint(kind);
+	struct pending_publication pending = {.control = -1, .kind = kind};
+	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending);
 	if (endpoint < 0)
 		return -1;
-	if (activate(endpoint, context) == 0)
+	if (activate(endpoint, context) == 0) {
+		if (finish_publication(&pending, OPERATION_COMMIT) != 0) {
+			close(endpoint);
+			return -1;
+		}
 		return endpoint;
+	}
 
 	int activation_errno = errno;
+	(void)finish_publication(&pending, OPERATION_ABORT);
 	close(endpoint);
-	if (darling_lifecycle_retire_endpoint(kind) != 0)
-		return -1;
 	errno = activation_errno;
 	return -1;
 }
