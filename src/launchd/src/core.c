@@ -4766,10 +4766,18 @@ job_start_child(job_t j)
 	}
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (j->per_user) {
+		setenv("DARLING_LAUNCHD_PER_USER_CONTEXT", "1", 1);
+	} else {
+		unsetenv("DARLING_LAUNCHD_PER_USER_CONTEXT");
+	}
+
 	// The controller nonce is an endpoint capability, not part of the global
-	// guest environment. Only the first-cohort shellspawn daemon receives it;
+	// guest environment. Only cohort endpoint owners receive it;
 	// Rust additionally binds requests to kernel PID/starttime ancestry.
-	if (!j->label || strcmp(j->label, "org.darlinghq.shellspawn") != 0) {
+	if (!j->label || (strcmp(j->label, "org.darlinghq.shellspawn") != 0 &&
+		strncmp(j->label, "com.apple.launchd.peruser.",
+			sizeof("com.apple.launchd.peruser.") - 1) != 0)) {
 		unsetenv("DARLING_LIFECYCLE_COHORT_V1");
 		unsetenv("DARLING_LIFECYCLE_CONTROL_NAME");
 		unsetenv("DARLING_LIFECYCLE_CONTROL_NONCE");

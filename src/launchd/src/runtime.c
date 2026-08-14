@@ -1426,6 +1426,9 @@ do_file_init(void)
 	if (getpid() == 1 || darling_rootless) {
 		pid1_magic = true;
 	}
+	if (getenv("DARLING_LAUNCHD_PER_USER_CONTEXT") != NULL) {
+		pid1_magic = false;
+	}
 
 	if (stat("/AppleInternal", &sb) == 0 && stat("/var/db/disableAppleInternal", &sb) == -1) {
 		launchd_apple_internal = true;

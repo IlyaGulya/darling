@@ -19,6 +19,7 @@
 #define PROTOCOL_VERSION 1
 #define SHELLSPAWN_LISTEN_BACKLOG 16384
 #define IMPORTED_ENDPOINT_FD_MIN 256
+#define DYNAMIC_PATH_CAPACITY 96
 #define OPERATION_PUBLISH 1
 #define OPERATION_RETIRE 2
 #define OPERATION_COMMIT 3
@@ -43,6 +44,9 @@ struct wire_response {
 	uint16_t has_fd;
 	uint64_t device;
 	uint64_t inode;
+	uint16_t path_len;
+	uint16_t reserved;
+	uint8_t path[DYNAMIC_PATH_CAPACITY];
 };
 
 struct pending_publication {
@@ -57,6 +61,31 @@ static int decode_nibble(char value) {
 	if (value >= 'a' && value <= 'f')
 		return value - 'a' + 10;
 	return -1;
+}
+
+static int validate_dynamic_path(const uint8_t* path, size_t length) {
+	static const char prefix[] = "/private/var/tmp/launchd-";
+	static const char suffix[] = "/sock";
+	const size_t prefix_length = sizeof(prefix) - 1;
+	const size_t suffix_length = sizeof(suffix) - 1;
+	if (length <= prefix_length + 1 + 8 + suffix_length ||
+		memcmp(path, prefix, sizeof(prefix) - 1) != 0 ||
+		memcmp(path + length - suffix_length, suffix, suffix_length) != 0)
+		return -1;
+	size_t index = prefix_length;
+	if (path[index] < '1' || path[index] > '9')
+		return -1;
+	while (index < length - suffix_length && path[index] >= '0' && path[index] <= '9')
+		++index;
+	if (index >= length - suffix_length || path[index++] != '-' ||
+		length - suffix_length - index != 8)
+		return -1;
+	for (; index < length - suffix_length; ++index) {
+		uint8_t value = path[index];
+		if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')))
+			return -1;
+	}
+	return 0;
 }
 
 static int load_envelope(char* name, size_t* name_length, uint8_t nonce[NONCE_BYTES]) {
@@ -136,7 +165,9 @@ static int connect_controller(const char* name, size_t name_length) {
 static int begin_transaction(
 	enum darling_lifecycle_endpoint_kind kind,
 	uint16_t operation,
-	struct pending_publication* pending
+	struct pending_publication* pending,
+	char* dynamic_path,
+	size_t dynamic_path_capacity
 ) {
 	char control_name[CONTROL_NAME_CAPACITY];
 	size_t control_name_length;
@@ -206,6 +237,17 @@ static int begin_transaction(
 		return -1;
 	}
 	if (operation == OPERATION_PUBLISH) {
+		int dynamic = kind == DARLING_LIFECYCLE_ENDPOINT_PER_USER_LAUNCHD;
+		if (response.reserved != 0 || response.path_len >= DYNAMIC_PATH_CAPACITY ||
+			(dynamic && (!dynamic_path || dynamic_path_capacity <= response.path_len ||
+				response.path_len == 0 || response.path[response.path_len] != 0 ||
+				validate_dynamic_path(response.path, response.path_len) != 0)) ||
+			(!dynamic && (response.path_len != 0 || response.path[0] != 0))) {
+			if (received_fd >= 0)
+				close(received_fd);
+			close(control);
+			return -1;
+		}
 		struct stat status;
 		int socket_type = 0;
 		int accepting = 0;
@@ -274,9 +316,15 @@ static int begin_transaction(
 		pending->control = control;
 		pending->kind = kind;
 		memcpy(pending->nonce, request.nonce, sizeof(pending->nonce));
+		if (dynamic) {
+			memcpy(dynamic_path, response.path, response.path_len);
+			dynamic_path[response.path_len] = 0;
+		}
 		return received_fd;
 	}
-	if (response.has_fd != 0 || received_fd >= 0 || response.device != 0 || response.inode != 0) {
+	if (response.has_fd != 0 || received_fd >= 0 || response.device != 0 ||
+		response.inode != 0 || response.path_len != 0 || response.reserved != 0 ||
+		response.path[0] != 0) {
 		if (received_fd >= 0)
 			close(received_fd);
 		close(control);
@@ -335,14 +383,15 @@ static int finish_publication(
 		memcmp(response.magic, protocol_magic, sizeof(protocol_magic)) == 0 &&
 		response.version == PROTOCOL_VERSION && response.status == 0 &&
 		response.endpoint == (uint16_t)pending->kind && response.has_fd == 0 &&
-		response.device == 0 && response.inode == 0;
+		response.device == 0 && response.inode == 0 && response.path_len == 0 &&
+		response.reserved == 0 && response.path[0] == 0;
 	close(control);
 	return operation == OPERATION_COMMIT ? 0 : (acknowledged ? 0 : -1);
 }
 
 int darling_lifecycle_publish_endpoint(enum darling_lifecycle_endpoint_kind kind) {
 	struct pending_publication pending = {.control = -1, .kind = kind};
-	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending);
+	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending, NULL, 0);
 	if (endpoint < 0)
 		return -1;
 	if (finish_publication(&pending, OPERATION_COMMIT) != 0) {
@@ -353,7 +402,7 @@ int darling_lifecycle_publish_endpoint(enum darling_lifecycle_endpoint_kind kind
 }
 
 int darling_lifecycle_retire_endpoint(enum darling_lifecycle_endpoint_kind kind) {
-	return begin_transaction(kind, OPERATION_RETIRE, NULL);
+	return begin_transaction(kind, OPERATION_RETIRE, NULL, NULL, 0);
 }
 
 int darling_lifecycle_publish_and_activate_endpoint(
@@ -364,7 +413,7 @@ int darling_lifecycle_publish_and_activate_endpoint(
 	if (!activate)
 		return -1;
 	struct pending_publication pending = {.control = -1, .kind = kind};
-	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending);
+	int endpoint = begin_transaction(kind, OPERATION_PUBLISH, &pending, NULL, 0);
 	if (endpoint < 0)
 		return -1;
 	if (activate(endpoint, context) == 0) {
@@ -378,6 +427,37 @@ int darling_lifecycle_publish_and_activate_endpoint(
 	int activation_errno = errno;
 	(void)finish_publication(&pending, OPERATION_ABORT);
 	close(endpoint);
+	errno = activation_errno;
+	return -1;
+}
+
+int darling_lifecycle_publish_and_activate_dynamic_endpoint(
+	enum darling_lifecycle_endpoint_kind kind,
+	char* endpoint_path,
+	size_t endpoint_path_capacity,
+	darling_lifecycle_endpoint_activate_fn activate,
+	void* context
+) {
+	if (kind != DARLING_LIFECYCLE_ENDPOINT_PER_USER_LAUNCHD || !endpoint_path ||
+		endpoint_path_capacity == 0 || !activate)
+		return -1;
+	struct pending_publication pending = {.control = -1, .kind = kind};
+	int endpoint = begin_transaction(
+		kind, OPERATION_PUBLISH, &pending, endpoint_path, endpoint_path_capacity
+	);
+	if (endpoint < 0)
+		return -1;
+	if (activate(endpoint, context) == 0) {
+		if (finish_publication(&pending, OPERATION_COMMIT) != 0) {
+			close(endpoint);
+			return -1;
+		}
+		return endpoint;
+	}
+	int activation_errno = errno;
+	(void)finish_publication(&pending, OPERATION_ABORT);
+	close(endpoint);
+	endpoint_path[0] = 0;
 	errno = activation_errno;
 	return -1;
 }

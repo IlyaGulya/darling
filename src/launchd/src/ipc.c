@@ -78,6 +78,9 @@ lifecycle_activate_launchd_endpoint(int endpoint_fd, void *context __attribute__
 #endif
 
 static pid_t ipc_self = 0;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+static enum darling_lifecycle_endpoint_kind ipc_lifecycle_kind;
+#endif
 
 char *sockpath = NULL;
 static char *sockdir = NULL;
@@ -93,7 +96,7 @@ ipc_clean_up(void)
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (darling_lifecycle_cohort_enabled()) {
-		if (darling_lifecycle_retire_endpoint(DARLING_LIFECYCLE_ENDPOINT_LAUNCHD) != 0) {
+		if (darling_lifecycle_retire_endpoint(ipc_lifecycle_kind) != 0) {
 			launchd_syslog(LOG_WARNING, "Rust lifecycle controller refused launchd endpoint retirement");
 		}
 		return;
@@ -125,17 +128,43 @@ ipc_server_init(void)
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	if (darling_lifecycle_cohort_enabled()) {
-		if (!pid1_magic) {
-			launchd_syslog(LOG_ERR, "Rust lifecycle cohort v1 does not authorize per-user launchd endpoints");
-			goto out_bad;
+		if (pid1_magic) {
+			ipc_lifecycle_kind = DARLING_LIFECYCLE_ENDPOINT_LAUNCHD;
+			strcpy(ourdir, LAUNCHD_SOCK_PREFIX);
+			strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
+			fd = darling_lifecycle_publish_and_activate_endpoint(
+				ipc_lifecycle_kind,
+				&lifecycle_activate_launchd_endpoint,
+				NULL
+			);
+		} else {
+			ipc_lifecycle_kind = DARLING_LIFECYCLE_ENDPOINT_PER_USER_LAUNCHD;
+			fd = darling_lifecycle_publish_and_activate_dynamic_endpoint(
+				ipc_lifecycle_kind,
+				sun.sun_path,
+				sizeof(sun.sun_path),
+				&lifecycle_activate_launchd_endpoint,
+				NULL
+			);
+			if (fd >= 0) {
+				char *separator = strrchr(sun.sun_path, '/');
+				if (!separator || separator == sun.sun_path || strcmp(separator, "/sock")) {
+					(void)darling_lifecycle_retire_endpoint(ipc_lifecycle_kind);
+					(void)runtime_close(fd);
+					fd = -1;
+				} else {
+					size_t directory_length = (size_t)(separator - sun.sun_path);
+					if (directory_length >= sizeof(ourdir)) {
+						(void)darling_lifecycle_retire_endpoint(ipc_lifecycle_kind);
+						(void)runtime_close(fd);
+						fd = -1;
+					} else {
+						memcpy(ourdir, sun.sun_path, directory_length);
+						ourdir[directory_length] = 0;
+					}
+				}
+			}
 		}
-		strcpy(ourdir, LAUNCHD_SOCK_PREFIX);
-		strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
-		fd = darling_lifecycle_publish_and_activate_endpoint(
-			DARLING_LIFECYCLE_ENDPOINT_LAUNCHD,
-			&lifecycle_activate_launchd_endpoint,
-			NULL
-		);
 		if (fd < 0) {
 			launchd_syslog(LOG_ERR, "Rust lifecycle controller refused launchd endpoint publication/activation");
 			goto out_bad;
