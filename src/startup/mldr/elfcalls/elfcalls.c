@@ -68,6 +68,7 @@ extern void __mldr_close_rpc_socket(int socket);
 extern int __mldr_create_process_lifetime_pipe(int* fds);
 extern void __mldr_close_process_lifetime_pipe(int fd);
 extern int __dserver_process_lifetime_pipe_fd;
+extern int __mldr_guest_namespace_capability_fd(unsigned int index);
 
 static int __dserver_get_process_lifetime_pipe() {
 	return __dserver_process_lifetime_pipe_fd;
@@ -129,4 +130,5 @@ void elfcalls_make(struct elf_calls* calls)
 	calls->dserver_get_process_lifetime_pipe = __dserver_get_process_lifetime_pipe;
 	calls->dserver_process_lifetime_pipe_refresh = __dserver_process_lifetime_pipe_refresh;
 	calls->dserver_close_process_lifetime_pipe = __mldr_close_process_lifetime_pipe;
+	calls->guest_namespace_capability_fd = __mldr_guest_namespace_capability_fd;
 }
