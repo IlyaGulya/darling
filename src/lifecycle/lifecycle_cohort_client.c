@@ -16,7 +16,7 @@
 
 #define CONTROL_NAME_CAPACITY 80
 #define NONCE_BYTES 32
-#define PROTOCOL_VERSION 1
+#define PROTOCOL_VERSION 2
 #define SHELLSPAWN_LISTEN_BACKLOG 16384
 #define IMPORTED_ENDPOINT_FD_MIN 256
 #define DYNAMIC_PATH_CAPACITY 96
@@ -24,6 +24,19 @@
 #define OPERATION_RETIRE 2
 #define OPERATION_COMMIT 3
 #define OPERATION_ABORT 4
+#define RESPONSE_PHASE_REQUEST 1
+#define RESPONSE_PHASE_PUBLISH 2
+#define RESPONSE_PHASE_COMMIT 3
+#define RESPONSE_PHASE_ABORT 4
+#define RESPONSE_PHASE_RETIRE 5
+#define RESPONSE_ERROR_NONE 0
+#define RESPONSE_ERROR_IO 1
+#define RESPONSE_ERROR_IDENTITY 2
+#define RESPONSE_ERROR_LOCK_BUSY 3
+#define RESPONSE_ERROR_PROTOCOL 4
+#define RESPONSE_ERROR_ENDPOINT_EXISTS 5
+#define RESPONSE_ERROR_ENDPOINT_MISSING 6
+#define RESPONSE_ERROR_PROCESS 7
 
 static const uint8_t protocol_magic[8] = {'D', 'L', 'C', 'O', 'H', 'R', '1', 0};
 
@@ -42,10 +55,12 @@ struct wire_response {
 	int16_t status;
 	uint16_t endpoint;
 	uint16_t has_fd;
+	uint16_t phase;
+	uint16_t reserved;
+	int32_t error;
 	uint64_t device;
 	uint64_t inode;
 	uint16_t path_len;
-	uint16_t reserved;
 	uint8_t path[DYNAMIC_PATH_CAPACITY];
 };
 
@@ -54,6 +69,27 @@ struct pending_publication {
 	enum darling_lifecycle_endpoint_kind kind;
 	uint8_t nonce[NONCE_BYTES];
 };
+
+static int response_error_to_errno(int32_t error) {
+	switch (error) {
+	case RESPONSE_ERROR_IO:
+		return EIO;
+	case RESPONSE_ERROR_IDENTITY:
+		return ESTALE;
+	case RESPONSE_ERROR_LOCK_BUSY:
+		return EBUSY;
+	case RESPONSE_ERROR_PROTOCOL:
+		return EPROTO;
+	case RESPONSE_ERROR_ENDPOINT_EXISTS:
+		return EEXIST;
+	case RESPONSE_ERROR_ENDPOINT_MISSING:
+		return ENOENT;
+	case RESPONSE_ERROR_PROCESS:
+		return ECHILD;
+	default:
+		return EPROTO;
+	}
+}
 
 static int decode_nibble(char value) {
 	if (value >= '0' && value <= '9')
@@ -229,16 +265,33 @@ static int begin_transaction(
 		(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
 		!ancillary_valid ||
 		memcmp(response.magic, protocol_magic, sizeof(protocol_magic)) != 0 ||
-		response.version != PROTOCOL_VERSION || response.status != 0 ||
+		response.version != PROTOCOL_VERSION ||
 		response.endpoint != (uint16_t)kind) {
 		if (received_fd >= 0)
 			close(received_fd);
 		close(control);
 		return -1;
 	}
+	uint16_t expected_phase = operation == OPERATION_PUBLISH
+		? RESPONSE_PHASE_PUBLISH : RESPONSE_PHASE_RETIRE;
+	if (response.phase != expected_phase || response.reserved != 0 ||
+		(response.status == 0 ? response.error != RESPONSE_ERROR_NONE : response.error == RESPONSE_ERROR_NONE)) {
+		if (received_fd >= 0)
+			close(received_fd);
+		close(control);
+		errno = EPROTO;
+		return -1;
+	}
+	if (response.status != 0) {
+		if (received_fd >= 0)
+			close(received_fd);
+		close(control);
+		errno = response_error_to_errno(response.error);
+		return -1;
+	}
 	if (operation == OPERATION_PUBLISH) {
 		int dynamic = kind == DARLING_LIFECYCLE_ENDPOINT_PER_USER_LAUNCHD;
-		if (response.reserved != 0 || response.path_len >= DYNAMIC_PATH_CAPACITY ||
+		if (response.path_len >= DYNAMIC_PATH_CAPACITY ||
 			(dynamic && (!dynamic_path || dynamic_path_capacity <= response.path_len ||
 				response.path_len == 0 || response.path[response.path_len] != 0 ||
 				validate_dynamic_path(response.path, response.path_len) != 0)) ||
@@ -383,6 +436,8 @@ static int finish_publication(
 		memcmp(response.magic, protocol_magic, sizeof(protocol_magic)) == 0 &&
 		response.version == PROTOCOL_VERSION && response.status == 0 &&
 		response.endpoint == (uint16_t)pending->kind && response.has_fd == 0 &&
+		response.phase == (operation == OPERATION_COMMIT ? RESPONSE_PHASE_COMMIT : RESPONSE_PHASE_ABORT) &&
+		response.error == RESPONSE_ERROR_NONE &&
 		response.device == 0 && response.inode == 0 && response.path_len == 0 &&
 		response.reserved == 0 && response.path[0] == 0;
 	close(control);

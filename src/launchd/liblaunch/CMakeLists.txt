@@ -17,6 +17,7 @@ mig(helper.defs)
 
 set(launch_sources
 	libbootstrap.c
+	launch_client_init_error.c
 	liblaunch.c
 	libvproc.c
 	${CMAKE_CURRENT_BINARY_DIR}/jobUser.c
@@ -40,4 +41,3 @@ add_circular(launch FAT
 )
 
 install(TARGETS launch DESTINATION libexec/darling/usr/lib/system)
-

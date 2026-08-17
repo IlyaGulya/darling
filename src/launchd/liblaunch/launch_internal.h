@@ -39,6 +39,7 @@ typedef struct _launch *launch_t;
 struct launch_globals_s {
 	// liblaunch.c
 	pthread_once_t lc_once;
+	int lc_init_errno;
 	pthread_mutex_t lc_mtx;
 	launch_t l;
 	launch_data_t async_resp;

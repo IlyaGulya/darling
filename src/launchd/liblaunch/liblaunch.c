@@ -22,6 +22,7 @@
 #include "launch.h"
 #include "launch_priv.h"
 #include "launch_internal.h"
+#include "launch_client_init_error.h"
 #include "ktrace.h"
 
 #include <mach/mach.h>
@@ -192,6 +193,7 @@ struct _launch {
 static launch_data_t launch_data_array_pop_first(launch_data_t where);
 static int _fd(int fd);
 static void launch_client_init(void);
+static bool launch_client_is_connected(void *context);
 static void launch_msg_getmsgs(launch_data_t m, void *context);
 static launch_data_t launch_msg_internal(launch_data_t d);
 static void launch_mach_checkin_service(launch_data_t obj, const char *key, void *context);
@@ -201,6 +203,7 @@ _launch_init_globals(launch_globals_t globals)
 {
 	pthread_once_t once = PTHREAD_ONCE_INIT;
 	globals->lc_once = once;
+	globals->lc_init_errno = 0;
 	pthread_mutex_init(&globals->lc_mtx, NULL);
 }
 
@@ -230,7 +233,11 @@ launch_client_init(void)
 	char *where = getenv(LAUNCHD_SOCKET_ENV);
 	char *_launchd_fd = getenv(LAUNCHD_TRUSTED_FD_ENV);
 	int dfd, lfd = -1, cifd = -1;
+	int saved_errno = 0;
+	kern_return_t getsocket_result = KERN_SUCCESS;
 	name_t spath;
+	launch_globals_t globals = _launch_globals();
+	memset(spath, 0, sizeof(spath));
 
 	if (_launchd_fd) {
 		cifd = strtol(_launchd_fd, NULL, 10);
@@ -255,7 +262,10 @@ launch_client_init(void)
 	if (where && where[0] != '\0') {
 		strncpy(sun.sun_path, where, sizeof(sun.sun_path));
 	} else {
-		if (_vprocmgr_getsocket(spath) == 0) {
+		getsocket_result = _vprocmgr_getsocket(spath);
+		globals->lc_init_errno = launch_client_getsocket_errno(
+			getsocket_result, spath[0] != '\0');
+		if (launch_client_init_allows_connect(globals->lc_init_errno)) {
 			if ((getenv("SUDO_COMMAND") || getenv("__USE_SYSTEM_LAUNCHD")) && geteuid() == 0) {
 				/* Talk to the system launchd. */
 				strncpy(sun.sun_path, LAUNCHD_SOCK_PREFIX "/sock", sizeof(sun.sun_path));
@@ -267,10 +277,17 @@ launch_client_init(void)
 
 				strncpy(sun.sun_path, spath, min_len);
 			}
+		} else {
+			/* A failed lookup has no usable endpoint. Do not turn an empty
+			 * result into an AF_UNIX connect attempt or substitute another
+			 * authority channel.
+			 */
+			saved_errno = globals->lc_init_errno;
+			errno = saved_errno;
+			goto out_bad;
 		}
 	}
 
-	launch_globals_t globals = _launch_globals();
 	if ((lfd = _fd(socket(AF_UNIX, SOCK_STREAM, 0))) == -1) {
 		goto out_bad;
 	}
@@ -302,6 +319,11 @@ launch_client_init(void)
 
 	return;
 out_bad:
+	if (saved_errno == 0) {
+		saved_errno = errno;
+	}
+	globals->lc_init_errno = launch_client_preserve_init_errno(
+		globals->lc_init_errno, saved_errno);
 	if (globals->l) {
 		launchd_close(globals->l, close);
 		globals->l = NULL;
@@ -311,6 +333,14 @@ out_bad:
 	if (cifd != -1) {
 		close(cifd);
 	}
+	errno = saved_errno;
+}
+
+static bool
+launch_client_is_connected(void *context)
+{
+	launch_globals_t globals = context;
+	return globals->l != NULL;
 }
 
 launch_data_t
@@ -991,10 +1021,12 @@ int
 launch_get_fd(void)
 {
 	launch_globals_t globals = _launch_globals();
-	pthread_once(&globals->lc_once, launch_client_init);
-
-	if (!globals->l) {
-		errno = ENOTCONN;
+	if (launch_client_require_connection(
+			&globals->lc_once,
+			launch_client_init,
+			&globals->lc_init_errno,
+			launch_client_is_connected,
+			globals) == -1) {
 		return -1;
 	}
 
@@ -1080,9 +1112,12 @@ launch_msg_internal(launch_data_t d)
 	}
 
 	launch_globals_t globals = _launch_globals();
-	pthread_once(&globals->lc_once, launch_client_init);
-	if (!globals->l) {
-		errno = ENOTCONN;
+	if (launch_client_require_connection(
+			&globals->lc_once,
+			launch_client_init,
+			&globals->lc_init_errno,
+			launch_client_is_connected,
+			globals) == -1) {
 		return NULL;
 	}
 

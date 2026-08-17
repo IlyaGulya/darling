@@ -16,4 +16,10 @@ if(DARLING_LIFECYCLE_COHORT_V1)
 endif()
 
 install(TARGETS shellspawn DESTINATION libexec/darling/usr/libexec)
+install(DIRECTORY DESTINATION libexec/darling/System/Library/LaunchDaemons
+	DIRECTORY_PERMISSIONS
+		OWNER_READ OWNER_WRITE OWNER_EXECUTE
+		GROUP_READ GROUP_EXECUTE
+		WORLD_READ WORLD_EXECUTE
+)
 install(FILES org.darlinghq.shellspawn.plist DESTINATION libexec/darling/System/Library/LaunchDaemons)
