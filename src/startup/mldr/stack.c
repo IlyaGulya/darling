@@ -156,7 +156,9 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 	#define POINTER_FORMAT "%x"
 #endif
 
-	snprintf(elfcalls, sizeof(elfcalls), "elf_calls=" POINTER_FORMAT, (unsigned long)(uintptr_t)&_elfcalls);
+	snprintf(elfcalls, sizeof(elfcalls), "elf_calls=" POINTER_FORMAT,
+		(user_long_t)(uintptr_t)&_elfcalls);
+	#undef POINTER_FORMAT
 	elfcalls_user = kernfd_user - sizeof(elfcalls);
 	memcpy(elfcalls_user, elfcalls, sizeof(elfcalls));
 	if (lr->vchroot_fd < 0 ||
@@ -201,7 +203,7 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 			lr->argc = i;
 			break;
 		}
-		if (__put_user((user_long_t) lr->argv[i], argv++))
+		if (__put_user((user_long_t)(uintptr_t)lr->argv[i], argv++))
 		{
 			fprintf(stderr, "Failed to copy an argument pointer to stack\n");
 			exit(1);
@@ -222,14 +224,14 @@ void FUNCTION_NAME(const char* filepath, struct load_results* lr)
 			break;
 		}
 
-		if (__put_user((user_long_t) lr->envp[i], envp++))
+		if (__put_user((user_long_t)(uintptr_t)lr->envp[i], envp++))
 		{
 			fprintf(stderr, "Failed to copy an environment variable pointer to stack\n");
 			exit(1);
 		}
 	}
 	if (runtime_mode_envc != 0) {
-		if (__put_user((user_long_t) runtime_mode_env_user, envp++)) {
+		if (__put_user((user_long_t)(uintptr_t)runtime_mode_env_user, envp++)) {
 			fprintf(stderr,
 				"Failed to add the typed runtime mode to the stack\n");
 			exit(1);

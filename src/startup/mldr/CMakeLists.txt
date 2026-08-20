@@ -30,6 +30,10 @@ add_executable(mldr ${mldr_sources})
 target_compile_definitions(mldr PRIVATE
 	DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
 )
+if(DARLING_LIFECYCLE_COHORT_V1)
+	target_compile_definitions(mldr PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+	target_include_directories(mldr PRIVATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include")
+endif()
 
 target_compile_options(mldr PRIVATE -pthread)
 target_link_options(mldr PRIVATE -pthread)
@@ -54,6 +58,10 @@ if (BUILD_TARGET_32BIT)
 	target_compile_definitions(mldr32 PRIVATE
 		DARLING_RUNTIME_EUNION_CAPABLE=$<BOOL:${DARLING_EUNION}>
 	)
+	if(DARLING_LIFECYCLE_COHORT_V1)
+		target_compile_definitions(mldr32 PRIVATE DARLING_LIFECYCLE_COHORT_V1=1)
+		target_include_directories(mldr32 PRIVATE "${DARLING_LIFECYCLE_CONTROLLER_CRATE}/include")
+	endif()
 	target_compile_options(mldr32 PRIVATE -m32)
 	target_link_options(mldr32 PRIVATE -m32)
 	target_compile_options(mldr32 PRIVATE -pthread)

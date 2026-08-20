@@ -74,6 +74,8 @@ struct elf_calls
 	int (*dserver_get_process_lifetime_pipe)(void);
 	int (*dserver_process_lifetime_pipe_refresh)(void);
 	void (*dserver_close_process_lifetime_pipe)(int fd);
+
+	int (*guest_namespace_capability_fd)(unsigned int index);
 };
 
 #endif

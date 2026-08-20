@@ -107,7 +107,7 @@ static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_
 		// a genuinely slow reply we fall through to a real blocking recvmsg quickly
 		// and never busy-wait unboundedly (the perf #1 starvation we already fixed).
 		for (int i = 0; i < spin; ++i) {
-			ret = recvmsg(socket, out_message, MSG_DONTWAIT);
+			ret = recvmsg(socket, out_message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
 			if (ret >= 0) {
 				goto got_message;
 			}
@@ -124,7 +124,7 @@ static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_
 		}
 	}
 
-	ret = recvmsg(socket, out_message, 0);
+	ret = recvmsg(socket, out_message, MSG_CMSG_CLOEXEC);
 	if (ret < 0) {
 		return -errno;
 	}

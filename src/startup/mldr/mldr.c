@@ -45,6 +45,9 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/ptrace.h>
 #include <pthread.h>
 #include <sys/utsname.h>
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#include <darling_lifecycle_cohort.h>
+#endif
 
 #ifndef PAGE_SIZE
 #	define PAGE_SIZE	4096
@@ -60,6 +63,114 @@ struct sockaddr_un __dserver_socket_address_data = {
 
 int __dserver_main_thread_socket_fd = -1;
 int __dserver_process_lifetime_pipe_fd = -1;
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#define DARLING_GUEST_NAMESPACE_FD_BASE 1008
+static const unsigned char guest_namespace_magic[8] = {'D','L','G','N','S','A','2','\0'};
+static int guest_namespace_capabilities[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT] = {
+	DARLING_GUEST_NAMESPACE_FD_BASE,
+	DARLING_GUEST_NAMESPACE_FD_BASE + 1,
+	DARLING_GUEST_NAMESPACE_FD_BASE + 2,
+	DARLING_GUEST_NAMESPACE_FD_BASE + 3,
+	DARLING_GUEST_NAMESPACE_FD_BASE + 4,
+};
+
+int __mldr_guest_namespace_capability_fd(unsigned int index) {
+	if (index >= DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT)
+		return -1;
+	const int descriptor = index < DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT
+		? guest_namespace_capabilities[index]
+		: DARLING_GUEST_NAMESPACE_VCHROOT_FD;
+	return fcntl(descriptor, F_GETFD) >= 0 ? descriptor : -1;
+}
+
+static bool guest_namespace_capabilities_present(void) {
+	for (unsigned int index = 0; index < DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT; ++index)
+		if (__mldr_guest_namespace_capability_fd(index) < 0)
+			return false;
+	return true;
+}
+
+static void receive_guest_namespace_bootstrap(void) {
+	if (guest_namespace_capabilities_present())
+		return;
+	if (fcntl(DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD, F_GETFD) < 0) {
+		fprintf(stderr, "Required Rust guest namespace bootstrap is missing\n");
+		exit(1);
+	}
+	struct darling_guest_namespace_bootstrap envelope = {};
+	struct iovec vector = {.iov_base = &envelope, .iov_len = sizeof(envelope)};
+	char ancillary[CMSG_SPACE(sizeof(int) * DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT)] = {};
+	struct msghdr message = {};
+	message.msg_iov = &vector;
+	message.msg_iovlen = 1;
+	message.msg_control = ancillary;
+	message.msg_controllen = sizeof(ancillary);
+	ssize_t received;
+	do {
+		received = recvmsg(DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD, &message, MSG_CMSG_CLOEXEC);
+	} while (received < 0 && errno == EINTR);
+	struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+	if (received != sizeof(envelope) ||
+		(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
+		memcmp(envelope.magic, guest_namespace_magic, sizeof(guest_namespace_magic)) != 0 ||
+		envelope.version != 2 || envelope.required != 1 || envelope.generation == 0 ||
+		envelope.descriptor_count != DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT ||
+		envelope.reserved != 0 || !header || CMSG_NXTHDR(&message, header) ||
+		header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+		header->cmsg_len != CMSG_LEN(sizeof(int) * DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT)) {
+		fprintf(stderr, "Malformed required Rust guest namespace bootstrap\n");
+		exit(1);
+	}
+	int received_fds[DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT];
+	int retained_fds[DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT];
+	memcpy(received_fds, CMSG_DATA(header), sizeof(received_fds));
+	for (unsigned int index = 0; index < DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT; ++index) {
+		retained_fds[index] = fcntl(received_fds[index], F_DUPFD_CLOEXEC,
+			DARLING_GUEST_NAMESPACE_FD_BASE + DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT);
+		if (retained_fds[index] < 0) {
+			fprintf(stderr, "Cannot isolate required guest namespace capability: %s\n", strerror(errno));
+			exit(1);
+		}
+	}
+	for (unsigned int index = 0; index < DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT; ++index)
+		close(received_fds[index]);
+	for (unsigned int index = 0; index < DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT; ++index) {
+		if (dup2(retained_fds[index], guest_namespace_capabilities[index]) < 0) {
+			fprintf(stderr, "Cannot retain required guest namespace capability: %s\n", strerror(errno));
+			exit(1);
+		}
+		close(retained_fds[index]);
+		int flags = fcntl(guest_namespace_capabilities[index], F_GETFD);
+		if (flags < 0 || fcntl(guest_namespace_capabilities[index], F_SETFD,
+			flags & ~FD_CLOEXEC) < 0) {
+			fprintf(stderr, "Cannot preserve guest namespace capability across exec: %s\n", strerror(errno));
+			exit(1);
+		}
+	}
+	if (dup2(retained_fds[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT],
+		DARLING_GUEST_NAMESPACE_VCHROOT_FD) < 0) {
+		fprintf(stderr, "Cannot retain required vchroot directory: %s\n", strerror(errno));
+		exit(1);
+	}
+	close(retained_fds[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT]);
+	int vchroot_flags = fcntl(DARLING_GUEST_NAMESPACE_VCHROOT_FD, F_GETFD);
+	struct stat vchroot_stat;
+	if (vchroot_flags < 0 || fstat(DARLING_GUEST_NAMESPACE_VCHROOT_FD, &vchroot_stat) != 0 ||
+		!S_ISDIR(vchroot_stat.st_mode) ||
+		fcntl(DARLING_GUEST_NAMESPACE_VCHROOT_FD, F_SETFD,
+			vchroot_flags & ~FD_CLOEXEC) < 0) {
+		fprintf(stderr, "Required retained vchroot directory is invalid\n");
+		exit(1);
+	}
+	close(DARLING_GUEST_NAMESPACE_BOOTSTRAP_FD);
+}
+#else
+int __mldr_guest_namespace_capability_fd(unsigned int index) {
+	(void)index;
+	return -1;
+}
+#endif
 
 // The idea of mldr is to load dyld_path into memory and set up the stack
 // as described in dyldStartup.S.
@@ -124,6 +235,11 @@ int main(int argc, char** argv, char** envp)
 	mldr_load_results.vchroot_fd = -1;
 	mldr_load_results.argc = argc;
 	mldr_load_results.argv = argv;
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	receive_guest_namespace_bootstrap();
+	mldr_load_results.vchroot_fd = DARLING_GUEST_NAMESPACE_VCHROOT_FD;
+#endif
 
 	// Locate glibc's loader/stack-cache locks while still single-threaded, so the
 	// fork child can reset them and avoid an inherited-held-lock deadlock (dar-gwn.5).
