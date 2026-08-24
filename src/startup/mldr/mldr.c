@@ -66,21 +66,20 @@ int __dserver_process_lifetime_pipe_fd = -1;
 
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 #define DARLING_GUEST_NAMESPACE_FD_BASE 1008
-static const unsigned char guest_namespace_magic[8] = {'D','L','G','N','S','A','2','\0'};
+static const unsigned char guest_namespace_magic[8] = {'D','L','G','N','S','A','3','\0'};
 static int guest_namespace_capabilities[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT] = {
 	DARLING_GUEST_NAMESPACE_FD_BASE,
 	DARLING_GUEST_NAMESPACE_FD_BASE + 1,
 	DARLING_GUEST_NAMESPACE_FD_BASE + 2,
 	DARLING_GUEST_NAMESPACE_FD_BASE + 3,
 	DARLING_GUEST_NAMESPACE_FD_BASE + 4,
+	DARLING_GUEST_NAMESPACE_FD_BASE + 5,
 };
 
 int __mldr_guest_namespace_capability_fd(unsigned int index) {
 	if (index >= DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT)
 		return -1;
-	const int descriptor = index < DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT
-		? guest_namespace_capabilities[index]
-		: DARLING_GUEST_NAMESPACE_VCHROOT_FD;
+	const int descriptor = guest_namespace_capabilities[index];
 	return fcntl(descriptor, F_GETFD) >= 0 ? descriptor : -1;
 }
 
@@ -114,7 +113,7 @@ static void receive_guest_namespace_bootstrap(void) {
 	if (received != sizeof(envelope) ||
 		(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0 ||
 		memcmp(envelope.magic, guest_namespace_magic, sizeof(guest_namespace_magic)) != 0 ||
-		envelope.version != 2 || envelope.required != 1 || envelope.generation == 0 ||
+		envelope.version != 3 || envelope.required != 1 || envelope.generation == 0 ||
 		envelope.descriptor_count != DARLING_GUEST_NAMESPACE_DESCRIPTOR_COUNT ||
 		envelope.reserved != 0 || !header || CMSG_NXTHDR(&message, header) ||
 		header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
@@ -148,12 +147,6 @@ static void receive_guest_namespace_bootstrap(void) {
 			exit(1);
 		}
 	}
-	if (dup2(retained_fds[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT],
-		DARLING_GUEST_NAMESPACE_VCHROOT_FD) < 0) {
-		fprintf(stderr, "Cannot retain required vchroot directory: %s\n", strerror(errno));
-		exit(1);
-	}
-	close(retained_fds[DARLING_GUEST_NAMESPACE_AUTHORITY_DESCRIPTOR_COUNT]);
 	int vchroot_flags = fcntl(DARLING_GUEST_NAMESPACE_VCHROOT_FD, F_GETFD);
 	struct stat vchroot_stat;
 	if (vchroot_flags < 0 || fstat(DARLING_GUEST_NAMESPACE_VCHROOT_FD, &vchroot_stat) != 0 ||
@@ -239,6 +232,14 @@ int main(int argc, char** argv, char** envp)
 #ifdef DARLING_LIFECYCLE_COHORT_V1
 	receive_guest_namespace_bootstrap();
 	mldr_load_results.vchroot_fd = DARLING_GUEST_NAMESPACE_VCHROOT_FD;
+	static char retained_lower_root[64];
+	if (snprintf(retained_lower_root, sizeof(retained_lower_root),
+		"/proc/self/fd/%d", DARLING_GUEST_NAMESPACE_LOWER_FD) <= 0) {
+		fprintf(stderr, "Cannot encode retained runtime lower capability\n");
+		return 1;
+	}
+	mldr_load_results.root_path = retained_lower_root;
+	mldr_load_results.root_path_length = strlen(retained_lower_root);
 #endif
 
 	// Locate glibc's loader/stack-cache locks while still single-threaded, so the

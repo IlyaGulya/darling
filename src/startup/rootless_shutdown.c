@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/syscall.h>
 
 static int session_for_pid(pid_t pid, pid_t* session)
 {
@@ -81,4 +83,28 @@ int shutdown_rootless_process_session(pid_t member)
 	usleep(100000);
 	result = signal_session_members(session, SIGKILL);
 	return result < 0 ? result : 0;
+}
+
+int shutdown_rootless_lifecycle_controller(int controller_pidfd, int timeout_ms)
+{
+	if (controller_pidfd < 0 || timeout_ms <= 0)
+		return -EINVAL;
+#if defined(SYS_pidfd_send_signal)
+	if (syscall(SYS_pidfd_send_signal, controller_pidfd, SIGTERM, NULL, 0) != 0) {
+		int error = errno;
+		return -error;
+	}
+	struct pollfd wait = {.fd = controller_pidfd, .events = POLLIN};
+	int result;
+	do {
+		result = poll(&wait, 1, timeout_ms);
+	} while (result < 0 && errno == EINTR);
+	int error = result > 0 && (wait.revents & POLLIN)
+		? 0 : result == 0 ? ETIMEDOUT : errno ? errno : EIO;
+	return -error;
+#else
+	(void)controller_pidfd;
+	(void)timeout_ms;
+	return -ENOTSUP;
+#endif
 }

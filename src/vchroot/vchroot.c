@@ -31,16 +31,6 @@ int main(int argc, const char** argv)
 	}
 	int dfd = (int)parsed_fd;
 
-	const char* target = argv[2];
-	while (*target == '/')
-		target++;
-	if (*target == '\0' || faccessat(dfd, target, F_OK, 0) != 0)
-	{
-		fprintf(stderr, "Target executable not found below retained prefix: %s\n",
-			argv[2]);
-		return 5;
-	}
-
 	if (fchdir(dfd) == -1)
 	{
 		perror("fchdir");

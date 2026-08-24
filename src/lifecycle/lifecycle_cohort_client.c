@@ -144,8 +144,11 @@ static int load_envelope(char* name, size_t* name_length, uint8_t nonce[NONCE_BY
 }
 
 int darling_lifecycle_cohort_enabled(void) {
-	const char* enabled = getenv("DARLING_LIFECYCLE_COHORT_V1");
-	return enabled && strcmp(enabled, "1") == 0;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	return 1;
+#else
+	return 0;
+#endif
 }
 
 static int connect_controller(const char* name, size_t name_length) {

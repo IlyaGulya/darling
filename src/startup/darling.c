@@ -33,6 +33,7 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <termios.h>
 #include <pty.h>
@@ -60,12 +61,12 @@ char g_workingDirectory[4096];
 static enum darling_runtime_mode g_runtimeMode = DARLING_RUNTIME_MODE_INVALID;
 static darling_runtime_prefix g_runtimePrefix =
 	DARLING_RUNTIME_PREFIX_INITIALIZER;
+static int g_initProcessPidfd = -1;
 
 static bool lifecycleCohortEnabled(void)
 {
 #ifdef DARLING_LIFECYCLE_COHORT_V1
-	const char* enabled = getenv("DARLING_LIFECYCLE_COHORT_V1");
-	return enabled && strcmp(enabled, "1") == 0;
+	return true;
 #else
 	return false;
 #endif
@@ -120,6 +121,10 @@ static void removeRuntimeStateFiles(void)
 
 static void retireStaleInitPid(void)
 {
+	if (g_initProcessPidfd >= 0) {
+		close(g_initProcessPidfd);
+		g_initProcessPidfd = -1;
+	}
 	// In the routed cohort, only the Rust controller may mutate `.init.pid`.
 	// A stale observation is returned to the boot path; controller acquisition
 	// performs the exact lease-scoped replacement.
@@ -131,6 +136,54 @@ static void retireStaleInitPid(void)
 			exit(1);
 		}
 	}
+}
+
+static int readProcessStarttime(pid_t pid, unsigned long long* output)
+{
+	char path[64];
+	char content[4096];
+	int length = snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	if (length <= 0 || (size_t)length >= sizeof(path))
+		return -EINVAL;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	ssize_t count;
+	do {
+		count = read(fd, content, sizeof(content) - 1);
+	} while (count < 0 && errno == EINTR);
+	int saved = errno;
+	close(fd);
+	if (count <= 0 || count >= (ssize_t)sizeof(content))
+		return count < 0 ? -saved : -EPROTO;
+	content[count] = '\0';
+	char* cursor = strrchr(content, ')');
+	if (cursor == NULL)
+		return -EPROTO;
+	cursor++;
+	for (int field = 3; field <= 22; field++) {
+		while (*cursor == ' ')
+			cursor++;
+		if (*cursor == '\0')
+			return -EPROTO;
+		char* end = cursor;
+		while (*end != '\0' && *end != ' ')
+			end++;
+		if (field == 22) {
+			char saved_byte = *end;
+			*end = '\0';
+			errno = 0;
+			char* parsed_end = NULL;
+			unsigned long long value = strtoull(cursor, &parsed_end, 10);
+			*end = saved_byte;
+			if (errno != 0 || parsed_end != end || value == 0)
+				return -EPROTO;
+			*output = value;
+			return 0;
+		}
+		cursor = end;
+	}
+	return -EPROTO;
 }
 
 int main(int argc, char ** argv)
@@ -171,6 +224,7 @@ int main(int argc, char ** argv)
 	}
 	const bool recreatePrefix =
 		strcmp(argv[cli.command_index], "recreate-prefix") == 0;
+	const int commandIndex = cli.command_index;
 	if (recreatePrefix != cli.confirm_prefix_recreate) {
 		fprintf(stderr,
 			recreatePrefix
@@ -283,8 +337,26 @@ int main(int argc, char ** argv)
 			return 1;
 		}
 	}
-	struct darling_runtime_prefix_lifecycle_result lifecycle;
-	int lifecycle_result = recreatePrefix
+	struct darling_runtime_prefix_lifecycle_result lifecycle = {0};
+	bool attachRunningCohort = false;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	if (rootless && lifecycleCohortEnabled() &&
+		(strcmp(argv[commandIndex], "shell") == 0 ||
+		 strcmp(argv[commandIndex], "shutdown") == 0)) {
+		char attachError[512] = {0};
+		struct darling_runtime_prefix_state attachState;
+		if (darling_runtime_prefix_read_state(
+				g_runtimePrefix, g_runtimeMode, g_originalUid, g_originalGid,
+				&attachState, attachError, sizeof(attachError)) == 0 &&
+			getInitProcess() > 0) {
+			attachRunningCohort = true;
+			lifecycle.state = attachState;
+		}
+	}
+#endif
+	int lifecycle_result = attachRunningCohort
+		? 0
+		: recreatePrefix
 		? darling_runtime_prefix_recreate(
 			g_runtimePrefix,
 			g_runtimeMode,
@@ -329,13 +401,11 @@ int main(int argc, char ** argv)
 			(unsigned long long)lifecycle.state.generation);
 		return 0;
 	}
-	g_fixPermissions =
+	g_fixPermissions = !attachRunningCohort && (
 		lifecycle.action == DARLING_RUNTIME_PREFIX_CREATED ||
 		lifecycle.action == DARLING_RUNTIME_PREFIX_REPAIRED ||
-		lifecycle.action == DARLING_RUNTIME_PREFIX_RECREATED;
+		lifecycle.action == DARLING_RUNTIME_PREFIX_RECREATED);
 	checkPrefixOwner();
-
-	const int commandIndex = cli.command_index;
 
 	pidInit = getInitProcess();
 
@@ -345,6 +415,21 @@ int main(int argc, char ** argv)
 		{
 			fprintf(stderr, "Darling container is not running\n");
 			return 1;
+		}
+
+		if (rootless) {
+		#ifdef DARLING_LIFECYCLE_COHORT_V1
+			if (lifecycleCohortEnabled()) {
+				int shutdown_result = shutdown_rootless_lifecycle_controller(
+					g_initProcessPidfd, 30000);
+				if (shutdown_result != 0) {
+					fprintf(stderr, "Failed to stop Rust-owned Darling lifecycle: %s\n",
+						strerror(-shutdown_result));
+					return 1;
+				}
+				return 0;
+			}
+		#endif
 		}
 
 		// TODO: when we have a working launchd,
@@ -1117,6 +1202,16 @@ pid_t spawnInitProcess(void)
 	int pipefd[2];
 	char buffer[1];
 	char error[512] = {0};
+	int deploymentPrefixFD = -1;
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	deploymentPrefixFD = open(INSTALL_PREFIX,
+		O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (deploymentPrefixFD < 0) {
+		fprintf(stderr, "Cannot retain Darling deployment prefix: %s\n",
+			strerror(errno));
+		exit(1);
+	}
+#endif
 
 	if (darling_runtime_mode_verify_prefix_name(g_runtimePrefix,
 			error, sizeof(error)) != 0 ||
@@ -1148,6 +1243,8 @@ pid_t spawnInitProcess(void)
 
 	if (pid < 0)
 	{
+		if (deploymentPrefixFD >= 0)
+			close(deploymentPrefixFD);
 		fprintf(stderr, "Cannot fork() to create darling-init: %s\n", strerror(errno));
 		exit(1);
 	}
@@ -1164,6 +1261,9 @@ pid_t spawnInitProcess(void)
 		char workdirfd_str[21];
 		char sidecarfd_str[21];
 		char lockfd_str[21];
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		char deploymentfd_str[21];
+#endif
 
 		snprintf(uid_str, sizeof(uid_str), "%d", g_originalUid);
 		snprintf(gid_str, sizeof(gid_str), "%d", g_originalGid);
@@ -1178,6 +1278,10 @@ pid_t spawnInitProcess(void)
 			g_runtimePrefix->sidecar_fd);
 		snprintf(lockfd_str, sizeof(lockfd_str), "%d",
 			g_runtimePrefix->lifecycle_lock_fd);
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		snprintf(deploymentfd_str, sizeof(deploymentfd_str), "%d",
+			deploymentPrefixFD);
+#endif
 
 		close(pipefd[0]);
 		if (darling_runtime_mode_make_fd_inheritable(
@@ -1190,18 +1294,33 @@ pid_t spawnInitProcess(void)
 				g_runtimePrefix->sidecar_fd, error, sizeof(error)) != 0 ||
 			darling_runtime_mode_make_lock_fd_inheritable(
 				g_runtimePrefix->lifecycle_lock_fd,
-				error, sizeof(error)) != 0) {
+				error, sizeof(error)) != 0
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+			||
+			darling_runtime_mode_make_fd_inheritable(
+				deploymentPrefixFD, error, sizeof(error)) != 0
+#endif
+			) {
 			fprintf(stderr,
 				"Cannot preserve Darling prefix descriptors for darlingserver: %s\n",
 				error);
 			_exit(1);
 		}
 
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+		execl(INSTALL_PREFIX "/bin/darlingserver", "darlingserver",
+			prefixfd_str, parentfd_str, g_runtimePrefix->leaf,
+			workdirfd_str, sidecarfd_str, lockfd_str,
+			deploymentfd_str,
+			uid_str, gid_str, pipefd_str,
+			g_fixPermissions ? "1" : "0", NULL);
+#else
 		execl(INSTALL_PREFIX "/bin/darlingserver", "darlingserver",
 			prefixfd_str, parentfd_str, g_runtimePrefix->leaf,
 			workdirfd_str, sidecarfd_str, lockfd_str,
 			uid_str, gid_str, pipefd_str,
 			g_fixPermissions ? "1" : "0", NULL);
+#endif
 
 		fprintf(stderr, "Failed to start darlingserver\n");
 		exit(1);
@@ -1209,6 +1328,8 @@ pid_t spawnInitProcess(void)
 
 	// Wait for the child to drop UID/GIDs and unshare stuff
 	close(pipefd[1]);
+	if (deploymentPrefixFD >= 0)
+		close(deploymentPrefixFD);
 	ssize_t readyCount;
 	do {
 		readyCount = read(pipefd[0], buffer, 1);
@@ -1357,8 +1478,11 @@ pid_t getInitProcess()
 {
 	pid_t pid;
 	long parsed_pid;
+	unsigned long long recorded_starttime = 0;
 	char pidBuffer[64];
+#ifndef DARLING_LIFECYCLE_COHORT_V1
 	char* pidEnd = NULL;
+#endif
 	char error[512] = {0};
 	char procBuf[100];
 	FILE *fp;
@@ -1390,6 +1514,16 @@ pid_t getInitProcess()
 		return 0;
 	}
 	pidBuffer[pidLength] = '\0';
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+	char trailing = '\0';
+	if (sscanf(pidBuffer, "%ld %llu %c", &parsed_pid,
+			&recorded_starttime, &trailing) != 2 ||
+		parsed_pid <= 0 || (pid_t)parsed_pid != parsed_pid ||
+		recorded_starttime == 0) {
+		retireStaleInitPid();
+		return 0;
+	}
+#else
 	errno = 0;
 	parsed_pid = strtol(pidBuffer, &pidEnd, 10);
 	while (pidEnd != NULL && (*pidEnd == '\n' || *pidEnd == '\r'))
@@ -1399,7 +1533,31 @@ pid_t getInitProcess()
 		retireStaleInitPid();
 		return 0;
 	}
+#endif
 	pid = (pid_t)parsed_pid;
+
+#ifdef DARLING_LIFECYCLE_COHORT_V1
+#if defined(SYS_pidfd_open)
+	if (g_initProcessPidfd >= 0)
+		close(g_initProcessPidfd);
+	g_initProcessPidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+	unsigned long long observed_starttime = 0;
+	struct pollfd identity_poll = {
+		.fd = g_initProcessPidfd,
+		.events = POLLIN,
+	};
+	if (g_initProcessPidfd < 0 ||
+		readProcessStarttime(pid, &observed_starttime) != 0 ||
+		observed_starttime != recorded_starttime ||
+		poll(&identity_poll, 1, 0) != 0) {
+		retireStaleInitPid();
+		return 0;
+	}
+#else
+	retireStaleInitPid();
+	return 0;
+#endif
+#endif
 
 	// Does the process exist?
 	if (kill(pid, 0) == -1)
