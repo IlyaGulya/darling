@@ -1,6 +1,7 @@
 # Extend the toolchain component only for the explicit Homebrew product fixture.
 # Targets and guest paths follow the source repositories' normal install rules.
 foreach(_homebrew_command IN ITEMS
+	"bash|/bin/sh" "stty|/bin/stty"
 	"cat|/bin/cat" "chmod|/bin/chmod" "cp|/bin/cp" "date|/bin/date"
 	"echo|/bin/echo" "expr|/bin/expr" "kill|/bin/kill" "ln|/bin/ln"
 	"ls|/bin/ls" "mkdir|/bin/mkdir" "mv|/bin/mv" "pwd|/bin/pwd"
