@@ -33,6 +33,8 @@ foreach(_homebrew_command IN ITEMS
 endforeach()
 
 set(_homebrew_resources
+	"src/frameworks/CoreServices/SystemVersion.plist|/System/Library/CoreServices/SystemVersion.plist"
+	"src/frameworks/CoreServices/SystemVersionCompat.plist|/System/Library/CoreServices/SystemVersionCompat.plist"
 	"src/sandbox/sandbox-exec.sh|/usr/bin/sandbox-exec"
 	"src/external/libressl-2.8.3/apps/openssl/cert.pem|/private/etc/ssl/cert.pem")
 set(_homebrew_locale_source "src/external/libc/darling/assets/locale")
