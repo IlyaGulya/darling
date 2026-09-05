@@ -340,6 +340,11 @@ file(GENERATE
 # this manifest so West never has to duplicate install rules by hand.
 option(DARLING_ROOTLESS_TOOLCHAIN
 	"Build the source-owned rootless guest-toolchain component" OFF)
+option(DARLING_ROOTLESS_HOMEBREW
+	"Include the Homebrew userland in the rootless guest-toolchain component" OFF)
+if(DARLING_ROOTLESS_HOMEBREW AND NOT DARLING_ROOTLESS_TOOLCHAIN)
+	message(FATAL_ERROR "DARLING_ROOTLESS_HOMEBREW requires DARLING_ROOTLESS_TOOLCHAIN")
+endif()
 set(DARLING_ROOTLESS_TOOLCHAIN_TARGETS
 	installer
 	perl
@@ -378,6 +383,11 @@ if(DARLING_ROOTLESS_TOOLCHAIN)
 		"${_rootless_toolchain_resource_dir}/usr/bin/c2ph"
 		COPYONLY
 	)
+	set(_rootless_toolchain_extra_entrypoints "")
+	set(_rootless_toolchain_extra_resources "")
+	if(DARLING_ROOTLESS_HOMEBREW)
+		include(cmake/RootlessHomebrew.cmake)
+	endif()
 	file(GENERATE
 		OUTPUT "${CMAKE_BINARY_DIR}/darling-rootless-toolchain.json"
 		CONTENT
@@ -388,11 +398,11 @@ if(DARLING_ROOTLESS_TOOLCHAIN)
     {\"target\": \"perl\", \"guest_path\": \"/usr/bin/perl\", \"host_path\": \"$<TARGET_FILE:perl>\"},
     {\"target\": \"perl5.18\", \"guest_path\": \"/usr/bin/perl5.18\", \"host_path\": \"$<TARGET_FILE:perl5.18>\"},
     {\"target\": \"perl5.28\", \"guest_path\": \"/usr/bin/perl5.28\", \"host_path\": \"$<TARGET_FILE:perl5.28>\"},
-    {\"target\": \"security\", \"guest_path\": \"/usr/bin/security\", \"host_path\": \"$<TARGET_FILE:securitytool_macos>\"}
+    {\"target\": \"security\", \"guest_path\": \"/usr/bin/security\", \"host_path\": \"$<TARGET_FILE:securitytool_macos>\"}${_rootless_toolchain_extra_entrypoints}
   ],
   \"resources\": [
     {\"target\": \"installer_man\", \"guest_path\": \"/usr/share/man/man8/installer.8\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/share/man/man8/installer.8\"},
-    {\"target\": \"perl_c2ph\", \"guest_path\": \"/usr/bin/c2ph\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/bin/c2ph\"}
+    {\"target\": \"perl_c2ph\", \"guest_path\": \"/usr/bin/c2ph\", \"host_path\": \"${_rootless_toolchain_resource_dir}/usr/bin/c2ph\"}${_rootless_toolchain_extra_resources}
   ]
 }
 "

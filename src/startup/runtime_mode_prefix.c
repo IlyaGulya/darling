@@ -957,6 +957,17 @@ int darling_runtime_mode_setup_prefix(
 		close(fd);
 	}
 
+	/* Match the ordinary install's device namespace without mounts. */
+	if (symlinkat("/Volumes/SystemRoot/dev",
+			handle->directory_fd, "dev") != 0)
+		return prefix_error(error, error_size,
+			"cannot create prefix device namespace: %s",
+			strerror(errno));
+	if (symlinkat("private/etc", handle->directory_fd, "etc") != 0)
+		return prefix_error(error, error_size,
+			"cannot create prefix configuration namespace: %s",
+			strerror(errno));
+
 	int etc_fd = open_relative_directory(handle->directory_fd,
 		"private/etc", false, error, error_size);
 	if (etc_fd < 0)
