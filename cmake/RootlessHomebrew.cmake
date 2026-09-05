@@ -36,6 +36,7 @@ foreach(_homebrew_command IN ITEMS
 endforeach()
 
 set(_homebrew_resources
+	"etc/resolv.conf|/private/etc/resolv.conf"
 	"src/frameworks/CoreServices/SystemVersion.plist|/System/Library/CoreServices/SystemVersion.plist"
 	"src/frameworks/CoreServices/SystemVersionCompat.plist|/System/Library/CoreServices/SystemVersionCompat.plist"
 	"src/sandbox/sandbox-exec.sh|/usr/bin/sandbox-exec"
